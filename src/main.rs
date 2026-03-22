@@ -33,7 +33,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let result = scan::scan(&args.path, args.files, args.all)?;
+    let result = scan::scan(&args.path, args.files, args.all, args.top)?;
 
     let mut entries: Vec<(PathBuf, u64)> = if args.files {
         result.file_entries
@@ -41,12 +41,7 @@ fn main() -> Result<()> {
         result.dir_sizes.into_iter().collect()
     };
 
-    let n = args.top.min(entries.len());
-    if n > 0 {
-        entries.select_nth_unstable_by(n - 1, |a, b| b.1.cmp(&a.1));
-        entries.truncate(n);
-        entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    }
+    entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
     let formatted: Vec<(String, &PathBuf)> = entries
         .iter()
