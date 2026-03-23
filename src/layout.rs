@@ -97,14 +97,7 @@ impl DirTree {
 
     pub fn insert_file(&mut self, parent: u64, name: &str, size: u64) {
         let hue = self.cached_extension_hue(name);
-        let node = self.nodes.entry(parent).or_insert_with(|| DirNode {
-            parent: 0,
-            name: String::new(),
-            direct_size: 0,
-            children: Vec::new(),
-            files: Vec::new(),
-            hue: 0,
-        });
+        let node = self.nodes.entry(parent).or_default();
         node.files.push(FileEntry {
             name: name.to_string(),
             size,
@@ -167,24 +160,17 @@ impl DirTree {
         let root_id = self.root_id.unwrap_or(0);
         let mut path = Vec::new();
         let mut cur = view_root;
-        loop {
-            if let Some(node) = self.nodes.get(&cur) {
-                let name = if node.name.is_empty() {
-                    self.scan_path.clone()
-                } else {
-                    node.name.clone()
-                };
-                path.push(BreadcrumbEntry { id: cur, name });
-                if cur == root_id {
-                    break;
-                }
-                if node.parent == 0 {
-                    break;
-                }
-                cur = node.parent;
+        while let Some(node) = self.nodes.get(&cur) {
+            let name = if node.name.is_empty() {
+                self.scan_path.clone()
             } else {
+                node.name.clone()
+            };
+            path.push(BreadcrumbEntry { id: cur, name });
+            if cur == root_id || node.parent == 0 {
                 break;
             }
+            cur = node.parent;
         }
         path.reverse();
         path
@@ -220,7 +206,11 @@ pub fn hash_name(name: &str) -> u16 {
     for c in name.encode_utf16() {
         h = h.wrapping_shl(5).wrapping_sub(h).wrapping_add(c as i32);
     }
-    (((h % 360) + 360) % 360) as u16
+    h.rem_euclid(360) as u16
+}
+
+fn hash_id_to_hue(id: u64) -> u16 {
+    ((id.wrapping_mul(2654435761) >> 16) % 360) as u16
 }
 
 fn hue_for_ext(ext: &str) -> u16 {
@@ -293,6 +283,7 @@ enum ItemKind<'a> {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layout_node(
     tree: &DirTree,
     node_id: u64,
@@ -374,7 +365,7 @@ fn layout_node(
     if residual > 0 {
         let id = *file_id;
         *file_id -= 1;
-        let hue = ((node_id.wrapping_mul(2654435761) >> 16) % 360) as u16;
+        let hue = hash_id_to_hue(node_id);
         layout_items.push(LayoutItem {
             id,
             size: residual as f64,
@@ -496,6 +487,7 @@ fn squarify(items: &[(i64, f64)], x: f64, y: f64, w: f64, h: f64, out: &mut Vec<
     squarify_slice(items, 0, items.len(), x, y, w, h, total, out);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn squarify_slice(
     items: &[(i64, f64)],
     lo: usize,
@@ -569,17 +561,18 @@ fn squarify_slice(
     }
     let row_frac = row_area / area_left;
 
+    let row_items = &items[lo..split];
     if vertical {
         let row_w = w * row_frac;
         let mut cy = y;
-        for k in lo..split {
-            let item_h = if k == split - 1 {
+        for (i, item) in row_items.iter().enumerate() {
+            let item_h = if i == row_items.len() - 1 {
                 y + h - cy
             } else {
-                (items[k].1 / row_area) * h
+                (item.1 / row_area) * h
             };
             out.push(RawRect {
-                id: items[k].0,
+                id: item.0,
                 x,
                 y: cy,
                 w: row_w,
@@ -591,14 +584,14 @@ fn squarify_slice(
     } else {
         let row_h = h * row_frac;
         let mut cx = x;
-        for k in lo..split {
-            let item_w = if k == split - 1 {
+        for (i, item) in row_items.iter().enumerate() {
+            let item_w = if i == row_items.len() - 1 {
                 x + w - cx
             } else {
-                (items[k].1 / row_area) * w
+                (item.1 / row_area) * w
             };
             out.push(RawRect {
-                id: items[k].0,
+                id: item.0,
                 x: cx,
                 y,
                 w: item_w,

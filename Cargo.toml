@@ -7,12 +7,14 @@ edition = "2024"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+humansize = "2"
+libc = "0.2"
+mime = "0.3"
+mime_guess = "2"
+mimalloc = "0.1"
 open = "5"
-bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "parking_lot"] }
-mimalloc = "0.1.48"
-mime_guess = "2.0.5"
-mime = "0.3.17"
 
 [profile.release]
 opt-level = 3

@@ -610,17 +610,13 @@
                     }
                 }
 
+                function hitTest(r, mx, my) {
+                    return mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h;
+                }
+
                 function findRect(mx, my) {
                     for (var i = layoutRects.length - 1; i >= 0; i--) {
-                        var r = layoutRects[i];
-                        if (
-                            mx >= r.x &&
-                            mx < r.x + r.w &&
-                            my >= r.y &&
-                            my < r.y + r.h
-                        ) {
-                            return r;
-                        }
+                        if (hitTest(layoutRects[i], mx, my)) return layoutRects[i];
                     }
                     return null;
                 }
@@ -640,10 +636,7 @@
                             if (
                                 r !== found &&
                                 r.isContainer &&
-                                found.x >= r.x &&
-                                found.y >= r.y &&
-                                found.x < r.x + r.w &&
-                                found.y < r.y + r.h
+                                hitTest(r, found.x, found.y)
                             ) {
                                 hoveredAncestors.push(r);
                             }
@@ -721,10 +714,7 @@
                     for (var i = 0; i < layoutRects.length; i++) {
                         var r = layoutRects[i];
                         if (
-                            mx >= r.x &&
-                            mx < r.x + r.w &&
-                            my >= r.y &&
-                            my < r.y + r.h &&
+                            hitTest(r, mx, my) &&
                             !r.isFiles &&
                             !r.isFile &&
                             r.id > 0n &&

@@ -191,7 +191,7 @@ pub async fn run_streaming(
                 None => continue,
             };
             let mut view_root = layout_state.view_root.lock().unwrap().unwrap_or(root_id);
-            if tree.nodes.get(&view_root).is_none() {
+            if !tree.nodes.contains_key(&view_root) {
                 view_root = root_id;
             }
             let rects = layout::compute_layout(&tree, view_root, vw, vh);
@@ -261,10 +261,10 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ServerState>) {
     state.had_connection.store(true, Ordering::Relaxed);
 
     let last = state.last_layout.lock().unwrap().clone();
-    if let Some(msg) = last {
-        if socket.send(Message::Binary(msg.into())).await.is_err() {
-            return;
-        }
+    if let Some(msg) = last
+        && socket.send(Message::Binary(msg.into())).await.is_err()
+    {
+        return;
     }
 
     let mut layout_rx = state.layout_tx.subscribe();

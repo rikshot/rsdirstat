@@ -1,7 +1,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod format;
 mod layout;
 mod scan;
 mod server;
@@ -10,8 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-
-use crate::format::human_size;
+use humansize::{BINARY, format_size};
 
 #[derive(Parser)]
 #[command(name = "rsdirstat", about = "Blazing fast disk usage scanner for macOS")]
@@ -74,7 +72,10 @@ fn main() -> Result<()> {
 
     entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
-    let formatted: Vec<(String, &PathBuf)> = entries.iter().map(|(path, size)| (human_size(*size), path)).collect();
+    let formatted: Vec<(String, &PathBuf)> = entries
+        .iter()
+        .map(|(path, size)| (format_size(*size, BINARY), path))
+        .collect();
 
     let max_width = formatted.iter().map(|(s, _)| s.len()).max().unwrap_or(0);
 

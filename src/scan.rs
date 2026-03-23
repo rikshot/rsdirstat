@@ -1,82 +1,43 @@
-use std::collections::{HashMap, HashSet};
-use std::ffi::{CStr, CString, c_int, c_void};
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result};
-
-const ATTR_BIT_MAP_COUNT: u16 = 5;
-const ATTR_CMN_RETURNED_ATTRS: u32 = 0x80000000;
-const ATTR_CMN_NAME: u32 = 0x00000001;
-const ATTR_CMN_DEVID: u32 = 0x00000002;
-const ATTR_CMN_OBJTYPE: u32 = 0x00000008;
-const ATTR_CMN_FILEID: u32 = 0x02000000;
-const ATTR_FILE_TOTALSIZE: u32 = 0x00000002;
+use dashmap::DashSet;
 
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
 
-const FSOPT_NOFOLLOW: u32 = 0x00000001;
-const O_RDONLY: c_int = 0x0000;
-const O_DIRECTORY: c_int = 0x00100000;
-
 const BUF_SIZE: usize = 1024 * 1024;
 
-#[repr(C)]
-struct AttrList {
-    bitmapcount: u16,
-    reserved: u16,
-    commonattr: u32,
-    volattr: u32,
-    dirattr: u32,
-    fileattr: u32,
-    forkattr: u32,
-}
-
-static SCAN_ATTRS: AttrList = AttrList {
-    bitmapcount: ATTR_BIT_MAP_COUNT,
+static SCAN_ATTRS: libc::attrlist = libc::attrlist {
+    bitmapcount: libc::ATTR_BIT_MAP_COUNT,
     reserved: 0,
-    commonattr: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FILEID,
+    commonattr: libc::ATTR_CMN_RETURNED_ATTRS
+        | libc::ATTR_CMN_NAME
+        | libc::ATTR_CMN_DEVID
+        | libc::ATTR_CMN_OBJTYPE
+        | libc::ATTR_CMN_FILEID,
     volattr: 0,
     dirattr: 0,
-    fileattr: ATTR_FILE_TOTALSIZE,
+    fileattr: libc::ATTR_FILE_TOTALSIZE,
     forkattr: 0,
 };
 
-static NAME_ATTRS: AttrList = AttrList {
-    bitmapcount: ATTR_BIT_MAP_COUNT,
+static NAME_ATTRS: libc::attrlist = libc::attrlist {
+    bitmapcount: libc::ATTR_BIT_MAP_COUNT,
     reserved: 0,
-    commonattr: ATTR_CMN_NAME,
+    commonattr: libc::ATTR_CMN_NAME,
     volattr: 0,
     dirattr: 0,
     fileattr: 0,
     forkattr: 0,
 };
-
-unsafe extern "C" {
-    fn getattrlistbulk(
-        dirfd: c_int,
-        alist: *const AttrList,
-        attribute_buffer: *mut c_void,
-        buffer_size: usize,
-        options: u64,
-    ) -> c_int;
-
-    fn open(path: *const i8, oflag: c_int, ...) -> c_int;
-    fn openat(dirfd: c_int, path: *const i8, oflag: c_int, ...) -> c_int;
-    fn close(fd: c_int) -> c_int;
-
-    fn getattrlist(
-        path: *const i8,
-        attr_list: *const AttrList,
-        attr_buf: *mut c_void,
-        attr_buf_size: usize,
-        options: u32,
-    ) -> c_int;
-}
 
 pub struct ScanResult {
     pub dir_sizes: HashMap<PathBuf, u64>,
@@ -102,7 +63,7 @@ pub enum ScanEvent {
 }
 
 struct WorkItem {
-    fd: c_int,
+    fd: OwnedFd,
     file_id: u64,
     parent_id: u64,
     name: String,
@@ -186,23 +147,12 @@ struct ThreadResult {
     file_entries: Vec<(u64, u64, u64)>,
 }
 
-const RLIMIT_NOFILE: c_int = 8;
-
 fn raise_fd_limit() {
-    #[repr(C)]
-    struct Rlimit {
-        rlim_cur: u64,
-        rlim_max: u64,
-    }
-    unsafe extern "C" {
-        fn getrlimit(resource: c_int, rlim: *mut Rlimit) -> c_int;
-        fn setrlimit(resource: c_int, rlim: *const Rlimit) -> c_int;
-    }
     unsafe {
-        let mut rlim: Rlimit = std::mem::zeroed();
-        getrlimit(RLIMIT_NOFILE, &mut rlim);
+        let mut rlim: libc::rlimit = std::mem::zeroed();
+        libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim);
         rlim.rlim_cur = rlim.rlim_max;
-        setrlimit(RLIMIT_NOFILE, &rlim);
+        libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
     }
 }
 
@@ -211,7 +161,7 @@ struct RootInfo {
     ino: u64,
     dev: u64,
     name: String,
-    fd: c_int,
+    fd: OwnedFd,
 }
 
 fn open_root(root: &Path) -> Result<RootInfo> {
@@ -225,10 +175,11 @@ fn open_root(root: &Path) -> Result<RootInfo> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
     let c_path = CString::new(path.as_os_str().as_bytes()).context("path contains null byte")?;
-    let fd = unsafe { open(c_path.as_ptr(), O_RDONLY | O_DIRECTORY) };
-    if fd < 0 {
+    let raw_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    if raw_fd < 0 {
         anyhow::bail!("failed to open root directory");
     }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     Ok(RootInfo {
         path,
         ino,
@@ -252,7 +203,11 @@ fn scan_raw(root: &Path, collect_files: bool, cross_filesystems: bool) -> Result
 
     let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
-    let visited = Arc::new(Mutex::new(HashSet::from([ri.ino])));
+    let visited = {
+        let set = DashSet::new();
+        set.insert(ri.ino);
+        Arc::new(set)
+    };
 
     let work = Arc::new(WorkQueue::new());
     work.push(vec![WorkItem {
@@ -394,7 +349,11 @@ pub fn scan_tree_streaming(root: &Path, cross_filesystems: bool, tx: std::sync::
 
     let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
-    let visited = Arc::new(Mutex::new(HashSet::from([ri.ino])));
+    let visited = {
+        let set = DashSet::new();
+        set.insert(ri.ino);
+        Arc::new(set)
+    };
 
     let work = Arc::new(WorkQueue::new());
     work.push(vec![WorkItem {
@@ -479,7 +438,7 @@ pub fn scan_tree_streaming(root: &Path, cross_filesystems: bool, tx: std::sync::
 
 #[allow(clippy::too_many_arguments)]
 fn scan_directory(
-    fd: c_int,
+    fd: OwnedFd,
     dir_file_id: u64,
     parent_id: u64,
     dir_name: &str,
@@ -490,7 +449,7 @@ fn scan_directory(
     work: &WorkQueue,
     result: &mut ThreadResult,
     tx: Option<&std::sync::mpsc::Sender<ScanEvent>>,
-    visited: &Mutex<HashSet<u64>>,
+    visited: &DashSet<u64>,
     dir_path: &str,
 ) {
     let mut new_work = Vec::new();
@@ -498,12 +457,12 @@ fn scan_directory(
 
     loop {
         let count = unsafe {
-            getattrlistbulk(
-                fd,
-                &SCAN_ATTRS,
-                buf.as_mut_ptr() as *mut c_void,
+            libc::getattrlistbulk(
+                fd.as_raw_fd(),
+                &SCAN_ATTRS as *const libc::attrlist as *mut libc::c_void,
+                buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
-                FSOPT_NOFOLLOW as u64,
+                libc::FSOPT_NOFOLLOW as u64,
             )
         };
 
@@ -534,10 +493,16 @@ fn scan_directory(
                         let mut name_buf = [0u8; 256];
                         if name_c.len() < 255 {
                             name_buf[..name_c.len()].copy_from_slice(name_c);
-                            let child_fd =
-                                unsafe { openat(fd, name_buf.as_ptr() as *const i8, O_RDONLY | O_DIRECTORY) };
-                            if child_fd >= 0 {
-                                if visited.lock().unwrap().insert(parsed.file_id) {
+                            let raw_fd = unsafe {
+                                libc::openat(
+                                    fd.as_raw_fd(),
+                                    name_buf.as_ptr() as *const i8,
+                                    libc::O_RDONLY | libc::O_DIRECTORY,
+                                )
+                            };
+                            if raw_fd >= 0 {
+                                let child_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+                                if visited.insert(parsed.file_id) {
                                     result.dir_parents.insert(parsed.file_id, dir_file_id);
                                     new_work.push(WorkItem {
                                         fd: child_fd,
@@ -550,8 +515,6 @@ fn scan_directory(
                                             format!("{dir_path}/{}", parsed.name)
                                         },
                                     });
-                                } else {
-                                    unsafe { close(child_fd) };
                                 }
                             }
                         } else {
@@ -565,14 +528,14 @@ fn scan_directory(
                                 .file_entries
                                 .push((parsed.file_id, dir_file_id, parsed.file_size));
                         }
-                        if let Some(tx) = tx {
-                            if parsed.file_size > 0 {
-                                let _ = tx.send(ScanEvent::File {
-                                    parent: dir_file_id,
-                                    name: parsed.name.to_string(),
-                                    size: parsed.file_size,
-                                });
-                            }
+                        if let Some(tx) = tx
+                            && parsed.file_size > 0
+                        {
+                            let _ = tx.send(ScanEvent::File {
+                                parent: dir_file_id,
+                                name: parsed.name.to_string(),
+                                size: parsed.file_size,
+                            });
                         }
                     }
                     _ => {}
@@ -583,7 +546,7 @@ fn scan_directory(
         }
     }
 
-    unsafe { close(fd) };
+    drop(fd);
 
     result.dir_sizes.insert(dir_file_id, dir_total);
 
@@ -696,10 +659,10 @@ fn get_name_by_id(dev_id: u64, file_id: u64) -> Option<String> {
 
     let mut buf = [0u8; 1024];
     if unsafe {
-        getattrlist(
+        libc::getattrlist(
             c_path.as_ptr(),
-            &NAME_ATTRS,
-            buf.as_mut_ptr() as *mut c_void,
+            &NAME_ATTRS as *const libc::attrlist as *mut libc::c_void,
+            buf.as_mut_ptr() as *mut libc::c_void,
             buf.len(),
             0,
         )
