@@ -3,7 +3,6 @@ use std::ffi::{CStr, CString, c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -88,25 +87,44 @@ pub struct ScanResult {
     pub file_entries: Vec<(PathBuf, u64)>,
 }
 
+pub enum ScanEvent {
+    ScanStart {
+        path: String,
+    },
+    Dir {
+        id: u64,
+        parent: u64,
+        name: String,
+        size: u64,
+    },
+    ScanDone,
+}
+
 struct WorkItem {
     fd: c_int,
     file_id: u64,
+    parent_id: u64,
+    name: String,
+}
+
+struct WorkQueueInner {
+    queue: Vec<WorkItem>,
+    pending: usize,
 }
 
 struct WorkQueue {
-    queue: Mutex<Vec<WorkItem>>,
-    active: AtomicUsize,
+    inner: Mutex<WorkQueueInner>,
     condvar: Condvar,
-    done: AtomicBool,
 }
 
 impl WorkQueue {
     fn new() -> Self {
         Self {
-            queue: Mutex::new(Vec::new()),
-            active: AtomicUsize::new(0),
+            inner: Mutex::new(WorkQueueInner {
+                queue: Vec::new(),
+                pending: 0,
+            }),
             condvar: Condvar::new(),
-            done: AtomicBool::new(false),
         }
     }
 
@@ -114,64 +132,105 @@ impl WorkQueue {
         if items.is_empty() {
             return;
         }
-        let count = items.len();
-        let mut q = self.queue.lock().unwrap();
-        q.extend(items);
-        if count == 1 {
-            self.condvar.notify_one();
-        } else {
-            self.condvar.notify_all();
-        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.pending += items.len();
+        inner.queue.extend(items);
+        self.condvar.notify_all();
     }
 
     fn take(&self) -> Option<WorkItem> {
-        let mut q = self.queue.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         loop {
-            if let Some(item) = q.pop() {
-                self.active.fetch_add(1, Ordering::AcqRel);
+            if let Some(item) = inner.queue.pop() {
                 return Some(item);
             }
-            if self.done.load(Ordering::Acquire) {
+            if inner.pending == 0 {
+                self.condvar.notify_all();
                 return None;
             }
-            q = self.condvar.wait(q).unwrap();
+            inner = self.condvar.wait(inner).unwrap();
         }
     }
 
     fn finish_one(&self) {
-        let prev = self.active.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            let q = self.queue.lock().unwrap();
-            if q.is_empty() {
-                self.done.store(true, Ordering::Release);
-                self.condvar.notify_all();
-            }
+        let mut inner = self.inner.lock().unwrap();
+        inner.pending -= 1;
+        if inner.pending == 0 {
+            self.condvar.notify_all();
         }
     }
 }
 
+#[derive(Default)]
 struct ThreadResult {
     dir_sizes: HashMap<u64, u64>,
     dir_parents: HashMap<u64, u64>,
     file_entries: Vec<(u64, u64, u64)>,
 }
 
-pub fn scan(
-    root: &Path,
-    collect_files: bool,
-    cross_filesystems: bool,
-    top: usize,
-) -> Result<ScanResult> {
-    let root = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
-    let meta = std::fs::metadata(&root).context("failed to stat root path")?;
-    let root_dev = meta.dev() as i32;
-    let root_ino = meta.ino();
+const RLIMIT_NOFILE: c_int = 8;
 
-    let c_root = CString::new(root.as_os_str().as_bytes()).context("path contains null byte")?;
-    let root_fd = unsafe { open(c_root.as_ptr(), O_RDONLY | O_DIRECTORY) };
-    if root_fd < 0 {
+fn raise_fd_limit() {
+    #[repr(C)]
+    struct Rlimit {
+        rlim_cur: u64,
+        rlim_max: u64,
+    }
+    unsafe extern "C" {
+        fn getrlimit(resource: c_int, rlim: *mut Rlimit) -> c_int;
+        fn setrlimit(resource: c_int, rlim: *const Rlimit) -> c_int;
+    }
+    unsafe {
+        let mut rlim: Rlimit = std::mem::zeroed();
+        getrlimit(RLIMIT_NOFILE, &mut rlim);
+        rlim.rlim_cur = rlim.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &rlim);
+    }
+}
+
+struct RootInfo {
+    path: PathBuf,
+    ino: u64,
+    dev: u64,
+    name: String,
+    fd: c_int,
+}
+
+fn open_root(root: &Path) -> Result<RootInfo> {
+    raise_fd_limit();
+    let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
+    let meta = std::fs::metadata(&path).context("failed to stat root path")?;
+    let dev = meta.dev();
+    let ino = meta.ino();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let c_path = CString::new(path.as_os_str().as_bytes()).context("path contains null byte")?;
+    let fd = unsafe { open(c_path.as_ptr(), O_RDONLY | O_DIRECTORY) };
+    if fd < 0 {
         anyhow::bail!("failed to open root directory");
     }
+    Ok(RootInfo {
+        path,
+        ino,
+        dev,
+        name,
+        fd,
+    })
+}
+
+struct RawScan {
+    root_path: PathBuf,
+    root_ino: u64,
+    root_dev: u64,
+    dir_sizes: HashMap<u64, u64>,
+    dir_parents: HashMap<u64, u64>,
+    file_entries: Vec<(u64, u64, u64)>,
+}
+
+fn scan_raw(root: &Path, collect_files: bool, cross_filesystems: bool) -> Result<RawScan> {
+    let ri = open_root(root)?;
 
     let num_threads = thread::available_parallelism()
         .map(|n| n.get())
@@ -179,31 +238,33 @@ pub fn scan(
 
     let work = Arc::new(WorkQueue::new());
     work.push(vec![WorkItem {
-        fd: root_fd,
-        file_id: root_ino,
+        fd: ri.fd,
+        file_id: ri.ino,
+        parent_id: 0,
+        name: ri.name,
     }]);
 
     let handles: Vec<_> = (0..num_threads)
         .map(|_| {
             let work = Arc::clone(&work);
+            let root_dev_i32 = ri.dev as i32;
             thread::spawn(move || {
-                let mut result = ThreadResult {
-                    dir_sizes: HashMap::new(),
-                    dir_parents: HashMap::new(),
-                    file_entries: Vec::new(),
-                };
+                let mut result = ThreadResult::default();
                 let mut buf = vec![0u8; BUF_SIZE];
 
                 while let Some(item) = work.take() {
                     scan_directory(
                         item.fd,
                         item.file_id,
-                        root_dev,
+                        item.parent_id,
+                        &item.name,
+                        root_dev_i32,
                         collect_files,
                         cross_filesystems,
                         &mut buf,
                         &work,
                         &mut result,
+                        None,
                     );
                     work.finish_one();
                 }
@@ -226,14 +287,34 @@ pub fn scan(
         file_entries.extend(result.file_entries);
     }
 
-    // Propagate sizes bottom-up via DFS visit order
+    Ok(RawScan {
+        root_path: ri.path,
+        root_ino: ri.ino,
+        root_dev: ri.dev,
+        dir_sizes,
+        dir_parents,
+        file_entries,
+    })
+}
+
+pub fn scan(
+    root: &Path,
+    collect_files: bool,
+    cross_filesystems: bool,
+    top: usize,
+) -> Result<ScanResult> {
+    let raw = scan_raw(root, collect_files, cross_filesystems)?;
+    let mut dir_sizes = raw.dir_sizes;
+    let mut dir_parents = raw.dir_parents;
+    let file_entries = raw.file_entries;
+
     let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
     for (&child, &parent) in &dir_parents {
         children.entry(parent).or_default().push(child);
     }
 
     let mut visit_order = Vec::with_capacity(dir_sizes.len());
-    let mut stack = vec![root_ino];
+    let mut stack = vec![raw.root_ino];
     while let Some(id) = stack.pop() {
         visit_order.push(id);
         if let Some(kids) = children.get(&id) {
@@ -252,8 +333,6 @@ pub fn scan(
         }
     }
 
-    // Resolve paths only for top-N results
-    let dev_id = meta.dev();
     let mut scan_result = ScanResult {
         dir_sizes: HashMap::new(),
         file_entries: Vec::new(),
@@ -265,11 +344,15 @@ pub fn scan(
         dir_list.select_nth_unstable_by(nd - 1, |a, b| b.1.cmp(&a.1));
         dir_list.truncate(nd);
         for (id, size) in &dir_list {
-            if *id == root_ino {
-                scan_result.dir_sizes.insert(root.clone(), *size);
-            } else if let Some(path) =
-                resolve_path(*id, dev_id, &dir_parents, root_ino, &root)
-            {
+            if *id == raw.root_ino {
+                scan_result.dir_sizes.insert(raw.root_path.clone(), *size);
+            } else if let Some(path) = resolve_path(
+                *id,
+                raw.root_dev,
+                &dir_parents,
+                raw.root_ino,
+                &raw.root_path,
+            ) {
                 scan_result.dir_sizes.insert(path, *size);
             }
         }
@@ -278,6 +361,7 @@ pub fn scan(
     if collect_files {
         let nf = top.min(file_entries.len());
         if nf > 0 {
+            let mut file_entries = file_entries;
             file_entries.select_nth_unstable_by(nf - 1, |a, b| b.2.cmp(&a.2));
             file_entries.truncate(nf);
             for &(file_id, parent_id, _) in &file_entries {
@@ -285,7 +369,7 @@ pub fn scan(
             }
             for &(id, _, size) in &file_entries {
                 if let Some(path) =
-                    resolve_path(id, dev_id, &dir_parents, root_ino, &root)
+                    resolve_path(id, raw.root_dev, &dir_parents, raw.root_ino, &raw.root_path)
                 {
                     scan_result.file_entries.push((path, size));
                 }
@@ -296,16 +380,82 @@ pub fn scan(
     Ok(scan_result)
 }
 
+pub fn scan_tree_streaming(
+    root: &Path,
+    cross_filesystems: bool,
+    tx: std::sync::mpsc::Sender<ScanEvent>,
+) -> Result<()> {
+    let ri = open_root(root)?;
+
+    let _ = tx.send(ScanEvent::ScanStart {
+        path: ri.name.clone(),
+    });
+
+    let num_threads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    let work = Arc::new(WorkQueue::new());
+    work.push(vec![WorkItem {
+        fd: ri.fd,
+        file_id: ri.ino,
+        parent_id: 0,
+        name: ri.name,
+    }]);
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|_| {
+            let work = Arc::clone(&work);
+            let tx = tx.clone();
+            let root_dev_i32 = ri.dev as i32;
+            thread::spawn(move || {
+                let mut buf = vec![0u8; BUF_SIZE];
+                let mut result = ThreadResult::default();
+
+                while let Some(item) = work.take() {
+                    scan_directory(
+                        item.fd,
+                        item.file_id,
+                        item.parent_id,
+                        &item.name,
+                        root_dev_i32,
+                        false,
+                        cross_filesystems,
+                        &mut buf,
+                        &work,
+                        &mut result,
+                        Some(&tx),
+                    );
+                    work.finish_one();
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("thread panicked"))?;
+    }
+
+    let _ = tx.send(ScanEvent::ScanDone);
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_directory(
     fd: c_int,
     dir_file_id: u64,
+    parent_id: u64,
+    dir_name: &str,
     root_dev: i32,
     collect_files: bool,
     cross_filesystems: bool,
     buf: &mut [u8],
     work: &WorkQueue,
     result: &mut ThreadResult,
+    tx: Option<&std::sync::mpsc::Sender<ScanEvent>>,
 ) {
     let mut new_work = Vec::new();
     let mut dir_total: u64 = 0;
@@ -345,23 +495,20 @@ fn scan_directory(
             {
                 match parsed.obj_type {
                     VDIR => {
-                        // openat avoids full path resolution in the kernel
                         let name_c = parsed.name.as_bytes();
                         let mut name_buf = [0u8; 256];
                         if name_c.len() < 255 {
                             name_buf[..name_c.len()].copy_from_slice(name_c);
                             let child_fd = unsafe {
-                                openat(
-                                    fd,
-                                    name_buf.as_ptr() as *const i8,
-                                    O_RDONLY | O_DIRECTORY,
-                                )
+                                openat(fd, name_buf.as_ptr() as *const i8, O_RDONLY | O_DIRECTORY)
                             };
                             if child_fd >= 0 {
                                 result.dir_parents.insert(parsed.file_id, dir_file_id);
                                 new_work.push(WorkItem {
                                     fd: child_fd,
                                     file_id: parsed.file_id,
+                                    parent_id: dir_file_id,
+                                    name: parsed.name.to_string(),
                                 });
                             }
                         }
@@ -387,6 +534,16 @@ fn scan_directory(
     unsafe { close(fd) };
 
     result.dir_sizes.insert(dir_file_id, dir_total);
+
+    if let Some(tx) = tx {
+        let _ = tx.send(ScanEvent::Dir {
+            id: dir_file_id,
+            parent: parent_id,
+            name: dir_name.to_string(),
+            size: dir_total,
+        });
+    }
+
     work.push(new_work);
 }
 
@@ -399,7 +556,6 @@ struct ParsedEntry<'a> {
 }
 
 fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
-    // entry_length(4) + attribute_set_t(20) + NAME(AttrRef:8) + DEVID(4) + OBJTYPE(4) + FILEID(8) + TOTALSIZE(8)
     let mut pos = 4;
 
     if pos + 20 > entry.len() {
@@ -456,8 +612,6 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
     })
 }
 
-/// Resolve a file ID to a full path by walking up the parent chain.
-/// Only called for the top-N results so cost is negligible.
 fn resolve_path(
     file_id: u64,
     dev_id: u64,

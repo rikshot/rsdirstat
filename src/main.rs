@@ -1,5 +1,7 @@
 mod format;
+mod layout;
 mod scan;
+mod server;
 
 use std::path::PathBuf;
 
@@ -29,10 +31,39 @@ struct Args {
     /// Cross filesystem boundaries
     #[arg(long)]
     all: bool,
+
+    /// Launch web GUI with interactive treemap
+    #[arg(long)]
+    gui: bool,
+
+    /// Port for the GUI server (0 = random)
+    #[arg(long, default_value_t = 0)]
+    port: u16,
+
+    /// Don't auto-open the browser
+    #[arg(long)]
+    no_open: bool,
+
+    /// Wait for manual start before scanning (for profiling)
+    #[arg(long)]
+    wait: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.gui {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(server::run_streaming(
+            args.path,
+            args.all,
+            args.port,
+            args.no_open,
+            args.wait,
+        ))?;
+        return Ok(());
+    }
+
     let result = scan::scan(&args.path, args.files, args.all, args.top)?;
 
     let mut entries: Vec<(PathBuf, u64)> = if args.files {

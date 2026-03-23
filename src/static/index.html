@@ -1,0 +1,832 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>rsdirstat</title>
+        <style>
+            *,
+            *::before,
+            *::after {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            html,
+            body {
+                width: 100%;
+                height: 100%;
+                overflow: hidden;
+                background: #1a1a2e;
+                color: #e0e0e0;
+                font-family:
+                    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                    Helvetica, Arial, sans-serif;
+            }
+            #breadcrumb-bar {
+                height: 32px;
+                background: #16213e;
+                display: flex;
+                align-items: center;
+                padding: 0 8px;
+                font-size: 13px;
+                gap: 2px;
+                flex-shrink: 0;
+                border-bottom: 1px solid #0f3460;
+                user-select: none;
+                white-space: nowrap;
+                overflow: hidden;
+            }
+            #crumbs {
+                display: flex;
+                align-items: center;
+                gap: 2px;
+                overflow: hidden;
+                min-width: 0;
+            }
+            #crumbs span {
+                cursor: pointer;
+                padding: 2px 6px;
+                border-radius: 3px;
+                color: #a0c4ff;
+            }
+            #crumbs span:hover {
+                background: #0f3460;
+            }
+            #crumbs span.sep {
+                cursor: default;
+                color: #555;
+                padding: 0 1px;
+            }
+            #crumbs span.sep:hover {
+                background: none;
+            }
+            #crumbs span.current {
+                color: #e0e0e0;
+                cursor: default;
+            }
+            #crumbs span.current:hover {
+                background: none;
+            }
+            #status {
+                margin-left: auto;
+                flex-shrink: 0;
+                color: #ccc;
+                font-size: 12px;
+                padding: 0 8px;
+            }
+            #tooltip {
+                position: fixed;
+                pointer-events: none;
+                z-index: 20;
+                background: rgba(15, 15, 30, 0.94);
+                border: 1px solid #333;
+                border-radius: 5px;
+                padding: 8px 12px;
+                font-size: 12px;
+                line-height: 1.5;
+                display: none;
+                max-width: 350px;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+            }
+            #tooltip .tt-name {
+                font-weight: 600;
+                color: #fff;
+                font-size: 13px;
+                margin-bottom: 2px;
+            }
+            #tooltip .tt-size {
+                color: #a0c4ff;
+            }
+            #tooltip .tt-pct {
+                color: #ccc;
+            }
+            canvas {
+                display: block;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="breadcrumb-bar">
+            <div id="crumbs"></div>
+            <span id="status">Connecting...</span>
+        </div>
+        <canvas id="treemap"></canvas>
+        <div id="tooltip">
+            <div class="tt-name"></div>
+            <div class="tt-size"></div>
+            <div class="tt-pct"></div>
+        </div>
+        <script>
+            (function () {
+                "use strict";
+
+                var canvas = document.getElementById("treemap");
+                var ctx = canvas.getContext("2d");
+                var breadcrumbBar = document.getElementById("crumbs");
+                var tooltipEl = document.getElementById("tooltip");
+                var statusEl = document.getElementById("status");
+
+                var layoutRects = [];
+                var viewRootSize = 0;
+                var breadcrumb = [];
+
+                var zoomAnim = null;
+                var ZOOM_DURATION = 300;
+                var pendingOldRects = null;
+
+                var dirty = true;
+                var hoveredRect = null;
+                var dpr = window.devicePixelRatio || 1;
+                var canvasW = 0,
+                    canvasH = 0;
+                var BREADCRUMB_H = 32;
+
+                var bufCanvas = document.createElement("canvas");
+                var bufCtx = bufCanvas.getContext("2d");
+                var bufDirty = true;
+
+                var waitMode = __WAIT_MODE__;
+                var ws = null;
+
+                function formatSize(bytes) {
+                    if (bytes < 0) bytes = 0;
+                    var units = ["B", "KiB", "MiB", "GiB", "TiB"];
+                    var i = 0;
+                    var v = bytes;
+                    while (v >= 1024 && i < units.length - 1) {
+                        v /= 1024;
+                        i++;
+                    }
+                    if (i === 0) return v + " " + units[i];
+                    return (
+                        v.toFixed(v < 10 ? 2 : v < 100 ? 1 : 0) + " " + units[i]
+                    );
+                }
+
+                var hslCache = {};
+                function hsl(hue, s, l) {
+                    var k = hue * 10000 + s * 100 + l;
+                    return (
+                        hslCache[k] ||
+                        (hslCache[k] = "hsl(" + hue + "," + s + "%," + l + "%)")
+                    );
+                }
+
+                function applyColors(r) {
+                    var h = r.hue;
+                    r.color = hsl(h, 65, 50);
+                    r.colorDark = hsl(h, 62, 38);
+                    r.colorBorder = hsl(h, 60, 28);
+                    if (r.isContainer) {
+                        r.colorBg = hsl(h, 25, 13);
+                        r.colorHdr = hsl(h, 35, 20);
+                        r.colorHdrHover = hsl(h, 45, 30);
+                    }
+                }
+
+                function resize() {
+                    var w = window.innerWidth;
+                    var h = window.innerHeight - BREADCRUMB_H;
+                    canvas.style.width = w + "px";
+                    canvas.style.height = h + "px";
+                    canvas.width = Math.round(w * dpr);
+                    canvas.height = Math.round(h * dpr);
+                    canvasW = w;
+                    canvasH = h;
+                    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    bufCanvas.width = canvas.width;
+                    bufCanvas.height = canvas.height;
+                    bufCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    bufDirty = true;
+                    dirty = true;
+                    scheduleTick();
+                    sendViewport();
+                }
+
+                var GAP = 1;
+
+                function drawSingleRect(r, alpha) {
+                    var rx = r.x + GAP,
+                        ry = r.y + GAP;
+                    var rw = Math.max(0, r.w - GAP * 2);
+                    var rh = Math.max(0, r.h - GAP * 2);
+                    if (rw < 0.5 || rh < 0.5) return;
+
+                    ctx.globalAlpha = alpha;
+
+                    if (rw < 4 || rh < 4) {
+                        ctx.fillStyle = r.isContainer
+                            ? r.colorBg || r.colorDark
+                            : r.colorDark;
+                        ctx.fillRect(rx, ry, rw, rh);
+                        ctx.globalAlpha = 1;
+                        return;
+                    }
+
+                    if (r.isContainer) {
+                        ctx.fillStyle = r.colorBg;
+                        ctx.fillRect(rx, ry, rw, rh);
+
+                        if (r.headerH > 0) {
+                            var hh = r.headerH;
+                            ctx.fillStyle = r.colorHdr;
+                            ctx.fillRect(rx, ry, rw, hh);
+
+                            var pw = rw - 8;
+                            if (pw > 20 && hh > 8) {
+                                var fontSize = Math.min(
+                                    12,
+                                    Math.max(8, hh - 4),
+                                );
+                                ctx.font =
+                                    "600 " +
+                                    fontSize +
+                                    "px -apple-system,BlinkMacSystemFont,sans-serif";
+                                ctx.fillStyle = "rgba(255,255,255,0.85)";
+                                ctx.textBaseline = "middle";
+                                var label = r.name;
+                                var tw = ctx.measureText(label).width;
+                                if (tw > pw) {
+                                    var ch = Math.max(
+                                        1,
+                                        Math.floor(
+                                            (label.length * (pw - 10)) / tw,
+                                        ),
+                                    );
+                                    label = label.slice(0, ch) + "\u2026";
+                                    tw = ctx.measureText(label).width;
+                                }
+                                if (tw <= pw) {
+                                    ctx.fillText(label, rx + 4, ry + hh / 2);
+                                    var sl = formatSize(r.size);
+                                    var slw = ctx.measureText("  " + sl).width;
+                                    if (tw + slw <= pw) {
+                                        ctx.fillStyle =
+                                            "rgba(255,255,255,0.45)";
+                                        ctx.fillText(
+                                            "  " + sl,
+                                            rx + 4 + tw,
+                                            ry + hh / 2,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        ctx.fillStyle = r.colorDark;
+                        ctx.fillRect(rx, ry, rw, rh);
+
+                        var pw = rw - 8;
+                        var ph = rh - 4;
+                        if (pw > 28 && ph > 13) {
+                            var fontSize = Math.min(
+                                14,
+                                Math.max(
+                                    9,
+                                    Math.min(
+                                        pw / (r.name.length * 0.6),
+                                        ph * 0.45,
+                                    ),
+                                ),
+                            );
+                            fontSize = Math.round(fontSize);
+                            ctx.font =
+                                "600 " +
+                                fontSize +
+                                "px -apple-system,BlinkMacSystemFont,sans-serif";
+                            ctx.fillStyle = "rgba(255,255,255,0.92)";
+                            ctx.textBaseline = "top";
+
+                            var label = r.name;
+                            var tw = ctx.measureText(label).width;
+                            if (tw > pw) {
+                                var ch = Math.max(
+                                    1,
+                                    Math.floor((label.length * (pw - 10)) / tw),
+                                );
+                                label = label.slice(0, ch) + "\u2026";
+                                tw = ctx.measureText(label).width;
+                            }
+                            if (tw <= pw) {
+                                ctx.fillText(label, rx + 4, ry + 3);
+                            }
+
+                            if (ph > 26 && r.size > 0) {
+                                var sf = Math.max(8, fontSize - 2);
+                                ctx.font =
+                                    sf +
+                                    "px -apple-system,BlinkMacSystemFont,sans-serif";
+                                ctx.fillStyle = "rgba(255,255,255,0.55)";
+                                var sl = formatSize(r.size);
+                                if (ctx.measureText(sl).width <= pw) {
+                                    ctx.fillText(
+                                        sl,
+                                        rx + 4,
+                                        ry + 3 + fontSize + 2,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    ctx.strokeStyle = r.colorBorder;
+                    ctx.lineWidth = 0.5;
+                    ctx.strokeRect(rx, ry, rw, rh);
+
+                    ctx.globalAlpha = 1;
+                }
+
+                function drawRects(rects, alpha) {
+                    for (var i = 0; i < rects.length; i++) {
+                        var r = rects[i];
+                        if (r.w < 1 || r.h < 1) continue;
+                        drawSingleRect(r, alpha);
+                    }
+                }
+
+                function easeOut(t) {
+                    return 1 - Math.pow(1 - t, 3);
+                }
+
+                function interpolateRects(from, to, t) {
+                    var toMap = new Map();
+                    for (var i = 0; i < to.length; i++)
+                        toMap.set(to[i].id, to[i]);
+                    var fromMap = new Map();
+                    for (var i = 0; i < from.length; i++)
+                        fromMap.set(from[i].id, from[i]);
+
+                    var result = [];
+                    var seen = new Set();
+
+                    for (var i = 0; i < to.length; i++) {
+                        var tr = to[i];
+                        var fr = fromMap.get(tr.id);
+                        seen.add(tr.id);
+                        if (fr) {
+                            result.push({
+                                id: tr.id,
+                                name: tr.name,
+                                color: tr.color,
+                                colorDark: tr.colorDark,
+                                colorBorder: tr.colorBorder,
+                                size: tr.size,
+                                isFiles: tr.isFiles,
+                                x: fr.x + (tr.x - fr.x) * t,
+                                y: fr.y + (tr.y - fr.y) * t,
+                                w: fr.w + (tr.w - fr.w) * t,
+                                h: fr.h + (tr.h - fr.h) * t,
+                            });
+                        } else {
+                            result.push({
+                                id: tr.id,
+                                name: tr.name,
+                                color: tr.color,
+                                colorDark: tr.colorDark,
+                                colorBorder: tr.colorBorder,
+                                size: tr.size,
+                                isFiles: tr.isFiles,
+                                x: tr.x + tr.w * 0.5 * (1 - t),
+                                y: tr.y + tr.h * 0.5 * (1 - t),
+                                w: tr.w * t,
+                                h: tr.h * t,
+                            });
+                        }
+                    }
+
+                    for (var i = 0; i < from.length; i++) {
+                        var fr = from[i];
+                        if (!seen.has(fr.id)) {
+                            var inv = 1 - t;
+                            result.push({
+                                id: fr.id,
+                                name: fr.name,
+                                color: fr.color,
+                                colorDark: fr.colorDark,
+                                colorBorder: fr.colorBorder,
+                                size: fr.size,
+                                isFiles: fr.isFiles,
+                                x: fr.x + fr.w * 0.5 * t,
+                                y: fr.y + fr.h * 0.5 * t,
+                                w: fr.w * inv,
+                                h: fr.h * inv,
+                            });
+                        }
+                    }
+
+                    return result;
+                }
+
+                function startZoom(fromRects, toRects) {
+                    zoomAnim = {
+                        from: fromRects,
+                        to: toRects,
+                        startTime: performance.now(),
+                        duration: ZOOM_DURATION,
+                    };
+                    dirty = true;
+                    scheduleTick();
+                }
+
+                function render() {
+                    if (zoomAnim) {
+                        ctx.clearRect(0, 0, canvasW, canvasH);
+                        ctx.fillStyle = "#1a1a2e";
+                        ctx.fillRect(0, 0, canvasW, canvasH);
+                        var elapsed = performance.now() - zoomAnim.startTime;
+                        var t = Math.min(1, elapsed / zoomAnim.duration);
+                        var et = easeOut(t);
+                        var interp = interpolateRects(
+                            zoomAnim.from,
+                            zoomAnim.to,
+                            et,
+                        );
+                        drawRects(interp, 1);
+                        if (t >= 1) {
+                            zoomAnim = null;
+                            bufDirty = true;
+                        } else {
+                            dirty = true;
+                        }
+                    } else {
+                        if (bufDirty) {
+                            var saved = ctx;
+                            var savedHover = hoveredRect;
+                            ctx = bufCtx;
+                            hoveredRect = null;
+                            ctx.clearRect(0, 0, canvasW, canvasH);
+                            ctx.fillStyle = "#1a1a2e";
+                            ctx.fillRect(0, 0, canvasW, canvasH);
+                            drawRects(layoutRects, 1);
+                            ctx = saved;
+                            hoveredRect = savedHover;
+                            bufDirty = false;
+                        }
+                        ctx.setTransform(1, 0, 0, 1, 0, 0);
+                        ctx.drawImage(bufCanvas, 0, 0);
+                        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                        if (hoveredRect) {
+                            var hr = hoveredRect;
+                            var rx = hr.x + GAP;
+                            var ry = hr.y + GAP;
+                            var rw = Math.max(0, hr.w - GAP * 2);
+                            var rh = Math.max(0, hr.h - GAP * 2);
+                            if (rw > 0 && rh > 0) {
+                                ctx.fillStyle = "rgba(255,255,255,0.08)";
+                                if (hr.isContainer && hr.headerH > 0) {
+                                    ctx.fillRect(rx, ry, rw, hr.headerH);
+                                } else {
+                                    ctx.fillRect(rx, ry, rw, rh);
+                                }
+                                ctx.strokeStyle = "rgba(255,255,255,0.7)";
+                                ctx.lineWidth = 1.5;
+                                ctx.strokeRect(rx, ry, rw, rh);
+                            }
+                        }
+                    }
+                }
+
+                function buildBreadcrumb() {
+                    breadcrumbBar.innerHTML = "";
+                    for (var i = 0; i < breadcrumb.length; i++) {
+                        if (i > 0) {
+                            var sep = document.createElement("span");
+                            sep.className = "sep";
+                            sep.textContent = "/";
+                            breadcrumbBar.appendChild(sep);
+                        }
+                        var span = document.createElement("span");
+                        span.textContent = breadcrumb[i].name || "/";
+                        if (i === breadcrumb.length - 1) {
+                            span.className = "current";
+                        } else {
+                            (function (nid) {
+                                span.addEventListener("click", function () {
+                                    navigateTo(nid);
+                                });
+                            })(breadcrumb[i].id);
+                        }
+                        breadcrumbBar.appendChild(span);
+                    }
+                }
+
+                function navigateTo(nodeId) {
+                    if (zoomAnim) return;
+                    hoveredRect = null;
+                    tooltipEl.style.display = "none";
+                    pendingOldRects = [];
+                    for (var i = 0; i < layoutRects.length; i++)
+                        pendingOldRects.push(Object.assign({}, layoutRects[i]));
+                    if (ws && ws.readyState === 1) {
+                        ws.send(
+                            JSON.stringify({
+                                type: "navigate",
+                                id: nodeId,
+                            }),
+                        );
+                    }
+                }
+
+                function findRect(mx, my) {
+                    for (var i = layoutRects.length - 1; i >= 0; i--) {
+                        var r = layoutRects[i];
+                        if (
+                            mx >= r.x &&
+                            mx < r.x + r.w &&
+                            my >= r.y &&
+                            my < r.y + r.h
+                        ) {
+                            return r;
+                        }
+                    }
+                    return null;
+                }
+
+                canvas.addEventListener("mousemove", function (e) {
+                    if (zoomAnim) return;
+                    var rect = canvas.getBoundingClientRect();
+                    var mx = e.clientX - rect.left;
+                    var my = e.clientY - rect.top;
+
+                    var found = findRect(mx, my);
+                    var changed = found !== hoveredRect;
+                    if (changed) {
+                        hoveredRect = found;
+                        dirty = true;
+                        scheduleTick();
+                        if (found) {
+                            tooltipEl.style.display = "block";
+                            tooltipEl.querySelector(".tt-name").textContent =
+                                found.name;
+                            tooltipEl.querySelector(".tt-size").textContent =
+                                formatSize(found.size);
+                            var pct =
+                                viewRootSize > 0
+                                    ? (found.size / viewRootSize) * 100
+                                    : 0;
+                            tooltipEl.querySelector(".tt-pct").textContent =
+                                pct.toFixed(1) + "% of parent";
+                        } else {
+                            tooltipEl.style.display = "none";
+                        }
+                    }
+
+                    if (found) {
+                        var tx = e.clientX + 14;
+                        var ty = e.clientY + 14;
+                        var tw = tooltipEl.offsetWidth;
+                        var th = tooltipEl.offsetHeight;
+                        if (tx + tw > window.innerWidth - 8)
+                            tx = e.clientX - tw - 8;
+                        if (ty + th > window.innerHeight - 8)
+                            ty = e.clientY - th - 8;
+                        tooltipEl.style.left = tx + "px";
+                        tooltipEl.style.top = ty + "px";
+                    }
+                });
+
+                canvas.addEventListener("mouseleave", function () {
+                    hoveredRect = null;
+                    tooltipEl.style.display = "none";
+                    dirty = true;
+                    scheduleTick();
+                });
+
+                canvas.addEventListener("click", function (e) {
+                    if (zoomAnim) return;
+                    var rect = canvas.getBoundingClientRect();
+                    var mx = e.clientX - rect.left;
+                    var my = e.clientY - rect.top;
+
+                    var target = null;
+                    for (var i = 0; i < layoutRects.length; i++) {
+                        var r = layoutRects[i];
+                        if (
+                            mx >= r.x &&
+                            mx < r.x + r.w &&
+                            my >= r.y &&
+                            my < r.y + r.h &&
+                            !r.isFiles &&
+                            r.id > 0 &&
+                            r.isContainer
+                        ) {
+                            target = r;
+                        }
+                    }
+
+                    if (target) {
+                        navigateTo(target.id);
+                    }
+                });
+
+                var rafId = null;
+                function scheduleTick() {
+                    if (rafId === null) rafId = requestAnimationFrame(tick);
+                }
+                function tick() {
+                    rafId = null;
+                    if (dirty || zoomAnim) {
+                        render();
+                        dirty = bufDirty;
+                    }
+                    if (zoomAnim || dirty) scheduleTick();
+                }
+
+                window.addEventListener("resize", function () {
+                    dpr = window.devicePixelRatio || 1;
+                    resize();
+                });
+
+                function sendViewport() {
+                    if (ws && ws.readyState === 1 && canvasW > 0) {
+                        ws.send(
+                            JSON.stringify({
+                                type: "viewport",
+                                w: canvasW,
+                                h: canvasH,
+                            }),
+                        );
+                    }
+                }
+
+                function connect() {
+                    var loc = window.location;
+                    var wsProto = loc.protocol === "https:" ? "wss:" : "ws:";
+                    var wsUrl = wsProto + "//" + loc.host + "/ws";
+
+                    var td = new TextDecoder();
+                    statusEl.textContent = "Connecting...";
+                    ws = new WebSocket(wsUrl);
+                    ws.binaryType = "arraybuffer";
+
+                    ws.onopen = function () {
+                        if (waitMode) {
+                            statusEl.textContent = "";
+                            var btn = document.createElement("button");
+                            btn.textContent = "Start Scan";
+                            btn.style.cssText =
+                                "background:#0f3460;color:#a0c4ff;border:1px solid #a0c4ff;" +
+                                "border-radius:4px;padding:2px 12px;cursor:pointer;font-size:12px";
+                            btn.onclick = function () {
+                                btn.disabled = true;
+                                btn.textContent = "Starting\u2026";
+                                fetch("/start");
+                                waitMode = false;
+                            };
+                            statusEl.appendChild(btn);
+                        } else {
+                            statusEl.textContent =
+                                "Connected. Waiting for scan...";
+                        }
+                        sendViewport();
+                    };
+
+                    ws.onmessage = function (e) {
+                        var buf = e.data;
+                        if (!(buf instanceof ArrayBuffer)) return;
+                        var dv = new DataView(buf);
+                        var off = 0;
+                        var type = dv.getUint8(off);
+                        off += 1;
+
+                        if (type === 1) {
+                            /* scan_start */
+                            var pathLen = dv.getUint16(off, true);
+                            off += 2;
+                            var path = td.decode(
+                                new Uint8Array(buf, off, pathLen),
+                            );
+                            layoutRects = [];
+                            breadcrumb = [];
+                            viewRootSize = 0;
+                            pendingOldRects = null;
+                            bufDirty = true;
+                            dirty = true;
+                            scheduleTick();
+                            statusEl.textContent = "Scanning " + path + "...";
+                            buildBreadcrumb();
+                        } else if (type === 2) {
+                            /* layout */
+                            var viewRoot = Number(dv.getBigUint64(off, true));
+                            off += 8;
+                            var rootSize = Number(dv.getBigUint64(off, true));
+                            off += 8;
+                            var dirCount = dv.getUint32(off, true);
+                            off += 4;
+                            var scanDone = dv.getUint8(off) !== 0;
+                            off += 1;
+
+                            var bcCount = dv.getUint16(off, true);
+                            off += 2;
+                            var bc = new Array(bcCount);
+                            for (var i = 0; i < bcCount; i++) {
+                                var bcId = Number(dv.getBigUint64(off, true));
+                                off += 8;
+                                var bcNL = dv.getUint16(off, true);
+                                off += 2;
+                                var bcN = td.decode(
+                                    new Uint8Array(buf, off, bcNL),
+                                );
+                                off += bcNL;
+                                bc[i] = {
+                                    id: bcId,
+                                    name: bcN,
+                                };
+                            }
+
+                            var rc = dv.getUint32(off, true);
+                            off += 4;
+                            var rects = new Array(rc);
+                            for (var i = 0; i < rc; i++) {
+                                var id = Number(dv.getBigInt64(off, true));
+                                off += 8;
+                                var x = dv.getFloat32(off, true);
+                                off += 4;
+                                var y = dv.getFloat32(off, true);
+                                off += 4;
+                                var w = dv.getFloat32(off, true);
+                                off += 4;
+                                var h = dv.getFloat32(off, true);
+                                off += 4;
+                                var hue = dv.getUint16(off, true);
+                                off += 2;
+                                var sz = Number(dv.getBigUint64(off, true));
+                                off += 8;
+                                var depth = dv.getUint8(off);
+                                off += 1;
+                                var flags = dv.getUint8(off);
+                                off += 1;
+                                var hH = dv.getFloat32(off, true);
+                                off += 4;
+                                var nL = dv.getUint16(off, true);
+                                off += 2;
+                                var nm = td.decode(
+                                    new Uint8Array(buf, off, nL),
+                                );
+                                off += nL;
+
+                                var r = {
+                                    id: id,
+                                    x: x,
+                                    y: y,
+                                    w: w,
+                                    h: h,
+                                    name: nm,
+                                    hue: hue,
+                                    size: sz,
+                                    depth: depth,
+                                    isContainer: (flags & 1) !== 0,
+                                    isFiles: (flags & 2) !== 0,
+                                    headerH: hH,
+                                };
+                                applyColors(r);
+                                rects[i] = r;
+                            }
+
+                            if (pendingOldRects) {
+                                startZoom(pendingOldRects, rects);
+                                pendingOldRects = null;
+                            }
+
+                            layoutRects = rects;
+                            viewRootSize = rootSize;
+                            breadcrumb = bc;
+                            buildBreadcrumb();
+
+                            bufDirty = true;
+                            dirty = true;
+                            scheduleTick();
+
+                            if (scanDone) {
+                                statusEl.textContent =
+                                    "Scan complete. " +
+                                    dirCount +
+                                    " directories. " +
+                                    formatSize(rootSize);
+                            } else {
+                                statusEl.textContent =
+                                    "Scanning... " + dirCount + " directories";
+                            }
+                        }
+                    };
+
+                    ws.onclose = function () {
+                        statusEl.textContent =
+                            "Disconnected. Reconnecting in 3s...";
+                        ws = null;
+                        setTimeout(connect, 3000);
+                    };
+
+                    ws.onerror = function () {
+                        statusEl.textContent = "Connection error.";
+                    };
+                }
+
+                resize();
+                connect();
+                scheduleTick();
+            })();
+        </script>
+    </body>
+</html>
