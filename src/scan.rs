@@ -39,11 +39,7 @@ struct AttrList {
 static SCAN_ATTRS: AttrList = AttrList {
     bitmapcount: ATTR_BIT_MAP_COUNT,
     reserved: 0,
-    commonattr: ATTR_CMN_RETURNED_ATTRS
-        | ATTR_CMN_NAME
-        | ATTR_CMN_DEVID
-        | ATTR_CMN_OBJTYPE
-        | ATTR_CMN_FILEID,
+    commonattr: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FILEID,
     volattr: 0,
     dirattr: 0,
     fileattr: ATTR_FILE_TOTALSIZE,
@@ -97,6 +93,11 @@ pub enum ScanEvent {
         name: String,
         size: u64,
     },
+    File {
+        parent: u64,
+        name: String,
+        size: u64,
+    },
     ScanDone,
 }
 
@@ -134,9 +135,14 @@ impl WorkQueue {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
-        inner.pending += items.len();
+        let count = items.len();
+        inner.pending += count;
         inner.queue.extend(items);
-        self.condvar.notify_all();
+        if count == 1 {
+            self.condvar.notify_one();
+        } else {
+            self.condvar.notify_all();
+        }
     }
 
     fn take(&self) -> Option<WorkItem> {
@@ -244,20 +250,17 @@ struct RawScan {
 fn scan_raw(root: &Path, collect_files: bool, cross_filesystems: bool) -> Result<RawScan> {
     let ri = open_root(root)?;
 
-    let num_threads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
     let visited = Arc::new(Mutex::new(HashSet::from([ri.ino])));
 
     let work = Arc::new(WorkQueue::new());
-    let root_path = ri.path.display().to_string();
     work.push(vec![WorkItem {
         fd: ri.fd,
         file_id: ri.ino,
         parent_id: 0,
         name: ri.name,
-        path: root_path,
+        path: String::new(),
     }]);
 
     let handles: Vec<_> = (0..num_threads)
@@ -298,9 +301,7 @@ fn scan_raw(root: &Path, collect_files: bool, cross_filesystems: bool) -> Result
     let mut file_entries: Vec<(u64, u64, u64)> = Vec::new();
 
     for handle in handles {
-        let result = handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("thread panicked"))?;
+        let result = handle.join().map_err(|_| anyhow::anyhow!("thread panicked"))?;
         dir_sizes.extend(result.dir_sizes);
         dir_parents.extend(result.dir_parents);
         file_entries.extend(result.file_entries);
@@ -316,12 +317,7 @@ fn scan_raw(root: &Path, collect_files: bool, cross_filesystems: bool) -> Result
     })
 }
 
-pub fn scan(
-    root: &Path,
-    collect_files: bool,
-    cross_filesystems: bool,
-    top: usize,
-) -> Result<ScanResult> {
+pub fn scan(root: &Path, collect_files: bool, cross_filesystems: bool, top: usize) -> Result<ScanResult> {
     let raw = scan_raw(root, collect_files, cross_filesystems)?;
     let mut dir_sizes = raw.dir_sizes;
     let mut dir_parents = raw.dir_parents;
@@ -365,13 +361,7 @@ pub fn scan(
         for (id, size) in &dir_list {
             if *id == raw.root_ino {
                 scan_result.dir_sizes.insert(raw.root_path.clone(), *size);
-            } else if let Some(path) = resolve_path(
-                *id,
-                raw.root_dev,
-                &dir_parents,
-                raw.root_ino,
-                &raw.root_path,
-            ) {
+            } else if let Some(path) = resolve_path(*id, raw.root_dev, &dir_parents, raw.root_ino, &raw.root_path) {
                 scan_result.dir_sizes.insert(path, *size);
             }
         }
@@ -387,9 +377,7 @@ pub fn scan(
                 dir_parents.insert(file_id, parent_id);
             }
             for &(id, _, size) in &file_entries {
-                if let Some(path) =
-                    resolve_path(id, raw.root_dev, &dir_parents, raw.root_ino, &raw.root_path)
-                {
+                if let Some(path) = resolve_path(id, raw.root_dev, &dir_parents, raw.root_ino, &raw.root_path) {
                     scan_result.file_entries.push((path, size));
                 }
             }
@@ -399,20 +387,12 @@ pub fn scan(
     Ok(scan_result)
 }
 
-pub fn scan_tree_streaming(
-    root: &Path,
-    cross_filesystems: bool,
-    tx: std::sync::mpsc::Sender<ScanEvent>,
-) -> Result<()> {
+pub fn scan_tree_streaming(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
     let ri = open_root(root)?;
 
-    let _ = tx.send(ScanEvent::ScanStart {
-        path: ri.name.clone(),
-    });
+    let _ = tx.send(ScanEvent::ScanStart { path: ri.name.clone() });
 
-    let num_threads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
     let visited = Arc::new(Mutex::new(HashSet::from([ri.ino])));
 
@@ -425,9 +405,7 @@ pub fn scan_tree_streaming(
         path: ri.path.display().to_string(),
     }]);
 
-    let active_dirs: Arc<Vec<Mutex<String>>> = Arc::new(
-        (0..num_threads).map(|_| Mutex::new(String::new())).collect(),
-    );
+    let active_dirs: Arc<Vec<Mutex<String>>> = Arc::new((0..num_threads).map(|_| Mutex::new(String::new())).collect());
 
     let _handles: Vec<_> = (0..num_threads)
         .enumerate()
@@ -469,14 +447,14 @@ pub fn scan_tree_streaming(
     let mut stall_count = 0u32;
     let mut last_pending = usize::MAX;
     loop {
-        thread::sleep(std::time::Duration::from_secs(1));
+        thread::sleep(std::time::Duration::from_millis(200));
         let p = work.pending();
         if p == 0 {
             break;
         }
         if p == last_pending {
             stall_count += 1;
-            if stall_count >= 3 {
+            if stall_count >= 15 {
                 eprintln!("Scan stalled with {p} items pending, finishing with partial results");
                 eprintln!("Stuck directories:");
                 for dir in active_dirs.iter() {
@@ -539,8 +517,7 @@ fn scan_directory(
                 break;
             }
 
-            let entry_length =
-                u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+            let entry_length = u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
             if entry_length == 0 || offset + entry_length > buf.len() {
                 break;
             }
@@ -557,35 +534,45 @@ fn scan_directory(
                         let mut name_buf = [0u8; 256];
                         if name_c.len() < 255 {
                             name_buf[..name_c.len()].copy_from_slice(name_c);
-                            let child_fd = unsafe {
-                                openat(fd, name_buf.as_ptr() as *const i8, O_RDONLY | O_DIRECTORY)
-                            };
+                            let child_fd =
+                                unsafe { openat(fd, name_buf.as_ptr() as *const i8, O_RDONLY | O_DIRECTORY) };
                             if child_fd >= 0 {
                                 if visited.lock().unwrap().insert(parsed.file_id) {
-                                    result
-                                        .dir_parents
-                                        .insert(parsed.file_id, dir_file_id);
+                                    result.dir_parents.insert(parsed.file_id, dir_file_id);
                                     new_work.push(WorkItem {
                                         fd: child_fd,
                                         file_id: parsed.file_id,
                                         parent_id: dir_file_id,
                                         name: parsed.name.to_string(),
-                                        path: format!("{dir_path}/{}", parsed.name),
+                                        path: if dir_path.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!("{dir_path}/{}", parsed.name)
+                                        },
                                     });
                                 } else {
                                     unsafe { close(child_fd) };
                                 }
                             }
+                        } else {
+                            eprintln!("Skipping directory with name >= 255 bytes");
                         }
                     }
                     VREG => {
                         dir_total += parsed.file_size;
                         if collect_files {
-                            result.file_entries.push((
-                                parsed.file_id,
-                                dir_file_id,
-                                parsed.file_size,
-                            ));
+                            result
+                                .file_entries
+                                .push((parsed.file_id, dir_file_id, parsed.file_size));
+                        }
+                        if let Some(tx) = tx {
+                            if parsed.file_size > 0 {
+                                let _ = tx.send(ScanEvent::File {
+                                    parent: dir_file_id,
+                                    name: parsed.name.to_string(),
+                                    size: parsed.file_size,
+                                });
+                            }
                         }
                     }
                     _ => {}
@@ -663,10 +650,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
     if name_start >= entry.len() {
         return None;
     }
-    let name = CStr::from_bytes_until_nul(&entry[name_start..])
-        .ok()?
-        .to_str()
-        .ok()?;
+    let name = CStr::from_bytes_until_nul(&entry[name_start..]).ok()?.to_str().ok()?;
 
     Some(ParsedEntry {
         name,

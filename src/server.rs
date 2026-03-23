@@ -23,6 +23,8 @@ struct ServerState {
     viewport: Mutex<(f64, f64)>,
     view_root: Mutex<Option<u64>>,
     scan_done: AtomicBool,
+    scan_root: PathBuf,
+    index_html: String,
     layout_tx: broadcast::Sender<Vec<u8>>,
     last_layout: Mutex<Option<Vec<u8>>>,
     layout_notify: Notify,
@@ -30,7 +32,6 @@ struct ServerState {
     shutdown: Notify,
     connections: AtomicU64,
     had_connection: AtomicBool,
-    wait: bool,
 }
 
 fn encode_scan_start(path: &str) -> Vec<u8> {
@@ -50,7 +51,7 @@ fn encode_layout(
     breadcrumb: &[layout::BreadcrumbEntry],
     rects: &[layout::LayoutRect],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(32 + breadcrumb.len() * 20 + rects.len() * 52);
+    let mut buf = Vec::with_capacity(32 + breadcrumb.len() * 20 + rects.len() * 60);
     buf.push(MSG_LAYOUT);
     buf.extend_from_slice(&view_root.to_le_bytes());
     buf.extend_from_slice(&root_size.to_le_bytes());
@@ -66,6 +67,7 @@ fn encode_layout(
     buf.extend_from_slice(&(rects.len() as u32).to_le_bytes());
     for r in rects {
         buf.extend_from_slice(&r.id.to_le_bytes());
+        buf.extend_from_slice(&r.parent_id.to_le_bytes());
         buf.extend_from_slice(&(r.x as f32).to_le_bytes());
         buf.extend_from_slice(&(r.y as f32).to_le_bytes());
         buf.extend_from_slice(&(r.w as f32).to_le_bytes());
@@ -73,7 +75,7 @@ fn encode_layout(
         buf.extend_from_slice(&r.hue.to_le_bytes());
         buf.extend_from_slice(&r.size.to_le_bytes());
         buf.push(r.depth);
-        buf.push((r.is_container as u8) | ((r.is_files as u8) << 1));
+        buf.push((r.is_container as u8) | ((r.is_files as u8) << 1) | ((r.is_file as u8) << 2));
         buf.extend_from_slice(&(r.header_h as f32).to_le_bytes());
         let nb = r.name.as_bytes();
         buf.extend_from_slice(&(nb.len() as u16).to_le_bytes());
@@ -91,12 +93,16 @@ pub async fn run_streaming(
 ) -> anyhow::Result<()> {
     let (layout_tx, _) = broadcast::channel::<Vec<u8>>(64);
 
+    let scan_root = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+
     let state = Arc::new(ServerState {
         tree: RwLock::new(layout::DirTree::new()),
         tree_version: AtomicU64::new(0),
         viewport: Mutex::new((0.0, 0.0)),
         view_root: Mutex::new(None),
         scan_done: AtomicBool::new(false),
+        scan_root,
+        index_html: INDEX_HTML.replace("__WAIT_MODE__", if wait { "true" } else { "false" }),
         layout_tx,
         last_layout: Mutex::new(None),
         layout_notify: Notify::new(),
@@ -104,7 +110,6 @@ pub async fn run_streaming(
         shutdown: Notify::new(),
         connections: AtomicU64::new(0),
         had_connection: AtomicBool::new(false),
-        wait,
     });
 
     let scan_state = Arc::clone(&state);
@@ -130,13 +135,11 @@ pub async fn run_streaming(
                             relay_state.scan_done.store(false, Ordering::Relaxed);
                             let _ = relay_state.layout_tx.send(encode_scan_start(&path));
                         }
-                        scan::ScanEvent::Dir {
-                            id,
-                            parent,
-                            name,
-                            size,
-                        } => {
+                        scan::ScanEvent::Dir { id, parent, name, size } => {
                             tree.insert_dir(id, parent, &name, size);
+                        }
+                        scan::ScanEvent::File { parent, name, size } => {
+                            tree.insert_file(parent, &name, size);
                         }
                         scan::ScanEvent::ScanDone => {
                             tree.recompute_sizes();
@@ -170,7 +173,7 @@ pub async fn run_streaming(
             let cur_version = layout_state.tree_version.load(Ordering::Relaxed);
             let scan_done = layout_state.scan_done.load(Ordering::Relaxed);
 
-            if cur_version == last_version {
+            if cur_version == last_version || layout_state.connections.load(Ordering::Relaxed) == 0 {
                 continue;
             }
             if !scan_done && last_compute.elapsed() < Duration::from_millis(45) {
@@ -197,14 +200,7 @@ pub async fn run_streaming(
             let dir_count = tree.nodes.len() as u32;
             drop(tree);
 
-            let msg = encode_layout(
-                view_root,
-                root_size,
-                dir_count,
-                scan_done,
-                &breadcrumb,
-                &rects,
-            );
+            let msg = encode_layout(view_root, root_size, dir_count, scan_done, &breadcrumb, &rects);
 
             *layout_state.last_layout.lock().unwrap() = Some(msg.clone());
             let _ = layout_state.layout_tx.send(msg);
@@ -235,24 +231,20 @@ pub async fn run_streaming(
         }
     }
 
+    let shutdown_state = Arc::clone(&state);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            state.shutdown.notified().await;
+            shutdown_state.shutdown.notified().await;
         })
         .await?;
     Ok(())
 }
 
-async fn index_handler(
-    axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
-) -> Html<String> {
-    let html = INDEX_HTML.replace("__WAIT_MODE__", if state.wait { "true" } else { "false" });
-    Html(html)
+async fn index_handler(axum::extract::State(state): axum::extract::State<Arc<ServerState>>) -> Html<String> {
+    Html(state.index_html.clone())
 }
 
-async fn start_handler(
-    axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
-) -> &'static str {
+async fn start_handler(axum::extract::State(state): axum::extract::State<Arc<ServerState>>) -> &'static str {
     state.start.notify_one();
     "ok"
 }
@@ -281,8 +273,8 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ServerState>) {
         tokio::select! {
             msg = socket.recv() => {
                 match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        handle_client_message(&state, text.as_ref());
+                    Some(Ok(Message::Binary(data))) => {
+                        handle_client_message(&state, &data);
                     }
                     Some(Ok(_)) => {}
                     _ => break,
@@ -306,9 +298,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ServerState>) {
         let s = Arc::clone(&state);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            if s.connections.load(Ordering::Relaxed) == 0
-                && s.had_connection.load(Ordering::Relaxed)
-            {
+            if s.connections.load(Ordering::Relaxed) == 0 && s.had_connection.load(Ordering::Relaxed) {
                 s.shutdown.notify_one();
             }
         });
@@ -322,25 +312,51 @@ impl ServerState {
     }
 }
 
-fn handle_client_message(state: &ServerState, text: &str) {
-    let parsed: serde_json::Value = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    match parsed["type"].as_str() {
-        Some("viewport") => {
-            let w = parsed["w"].as_f64().unwrap_or(0.0);
-            let h = parsed["h"].as_f64().unwrap_or(0.0);
+const MSG_CLIENT_VIEWPORT: u8 = 1;
+const MSG_CLIENT_NAVIGATE: u8 = 2;
+const MSG_CLIENT_REVEAL_DIR: u8 = 3;
+const MSG_CLIENT_REVEAL_FILE: u8 = 4;
+
+fn reveal_in_finder(path: &std::path::Path) {
+    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+}
+
+fn handle_client_message(state: &ServerState, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    match data[0] {
+        MSG_CLIENT_VIEWPORT if data.len() >= 9 => {
+            let w = f32::from_le_bytes(data[1..5].try_into().unwrap()) as f64;
+            let h = f32::from_le_bytes(data[5..9].try_into().unwrap()) as f64;
             *state.viewport.lock().unwrap() = (w, h);
             state.invalidate_layout();
         }
-        Some("navigate") => {
-            if let Some(id) = parsed["id"]
-                .as_str()
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                *state.view_root.lock().unwrap() = Some(id);
-                state.invalidate_layout();
+        MSG_CLIENT_NAVIGATE if data.len() >= 9 => {
+            let id = u64::from_le_bytes(data[1..9].try_into().unwrap());
+            *state.view_root.lock().unwrap() = Some(id);
+            state.invalidate_layout();
+        }
+        MSG_CLIENT_REVEAL_DIR if data.len() >= 9 => {
+            let id = u64::from_le_bytes(data[1..9].try_into().unwrap());
+            let tree = state.tree.read().unwrap();
+            let path = tree.full_path(id, &state.scan_root);
+            drop(tree);
+            if let Some(path) = path {
+                reveal_in_finder(&path);
+            }
+        }
+        MSG_CLIENT_REVEAL_FILE if data.len() >= 11 => {
+            let dir_id = u64::from_le_bytes(data[1..9].try_into().unwrap());
+            let name_len = u16::from_le_bytes(data[9..11].try_into().unwrap()) as usize;
+            if data.len() >= 11 + name_len {
+                let name = std::str::from_utf8(&data[11..11 + name_len]).unwrap_or("");
+                let tree = state.tree.read().unwrap();
+                let path = tree.full_path(dir_id, &state.scan_root).map(|p| p.join(name));
+                drop(tree);
+                if let Some(path) = path {
+                    reveal_in_finder(&path);
+                }
             }
         }
         _ => {}

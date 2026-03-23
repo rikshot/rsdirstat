@@ -75,6 +75,30 @@
                 font-size: 12px;
                 padding: 0 8px;
             }
+            #path-bar {
+                height: 24px;
+                background: #16213e;
+                display: flex;
+                align-items: center;
+                padding: 0 8px;
+                font-size: 12px;
+                gap: 8px;
+                flex-shrink: 0;
+                border-top: 1px solid #0f3460;
+                white-space: nowrap;
+                overflow: hidden;
+            }
+            #path-text {
+                color: #a0c4ff;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                min-width: 0;
+            }
+            #path-size {
+                margin-left: auto;
+                flex-shrink: 0;
+                color: #ccc;
+            }
             #tooltip {
                 position: fixed;
                 pointer-events: none;
@@ -112,6 +136,10 @@
             <span id="status">Connecting...</span>
         </div>
         <canvas id="treemap"></canvas>
+        <div id="path-bar">
+            <span id="path-text"></span>
+            <span id="path-size"></span>
+        </div>
         <div id="tooltip">
             <div class="tt-name"></div>
             <div class="tt-size"></div>
@@ -126,6 +154,8 @@
                 var breadcrumbBar = document.getElementById("crumbs");
                 var tooltipEl = document.getElementById("tooltip");
                 var statusEl = document.getElementById("status");
+                var pathTextEl = document.getElementById("path-text");
+                var pathSizeEl = document.getElementById("path-size");
 
                 var layoutRects = [];
                 var viewRootSize = 0;
@@ -138,17 +168,35 @@
                 var dirty = true;
                 var hoveredRect = null;
                 var hoveredAncestors = [];
+                var lastMouseX = -1;
+                var lastMouseY = -1;
+                var lastBreadcrumbKey = "";
                 var dpr = window.devicePixelRatio || 1;
                 var canvasW = 0,
                     canvasH = 0;
                 var BREADCRUMB_H = 32;
+                var PATH_BAR_H = 24;
 
                 var bufCanvas = document.createElement("canvas");
                 var bufCtx = bufCanvas.getContext("2d");
                 var bufDirty = true;
 
                 var waitMode = __WAIT_MODE__;
+                var scanStartTime = 0;
+                var scanTimer = null;
                 var ws = null;
+
+                function startScanTimer() {
+                    if (scanTimer) return;
+                    scanStartTime = performance.now();
+                    scanTimer = setInterval(function () {
+                        var el = (
+                            (performance.now() - scanStartTime) /
+                            1000
+                        ).toFixed(1);
+                        statusEl.textContent = "Scanning... " + el + "s";
+                    }, 100);
+                }
 
                 function formatSize(bytes) {
                     if (bytes < 0) bytes = 0;
@@ -188,7 +236,7 @@
 
                 function resize() {
                     var w = window.innerWidth;
-                    var h = window.innerHeight - BREADCRUMB_H;
+                    var h = window.innerHeight - BREADCRUMB_H - PATH_BAR_H;
                     canvas.style.width = w + "px";
                     canvas.style.height = h + "px";
                     canvas.width = Math.round(w * dpr);
@@ -350,14 +398,7 @@
                     return 1 - Math.pow(1 - t, 3);
                 }
 
-                function interpolateRects(from, to, t) {
-                    var toMap = new Map();
-                    for (var i = 0; i < to.length; i++)
-                        toMap.set(to[i].id, to[i]);
-                    var fromMap = new Map();
-                    for (var i = 0; i < from.length; i++)
-                        fromMap.set(from[i].id, from[i]);
-
+                function interpolateRects(from, to, fromMap, t) {
                     var result = [];
                     var seen = new Set();
 
@@ -420,9 +461,13 @@
                 }
 
                 function startZoom(fromRects, toRects) {
+                    var fromMap = new Map();
+                    for (var i = 0; i < fromRects.length; i++)
+                        fromMap.set(fromRects[i].id, fromRects[i]);
                     zoomAnim = {
                         from: fromRects,
                         to: toRects,
+                        fromMap: fromMap,
                         startTime: performance.now(),
                         duration: ZOOM_DURATION,
                     };
@@ -441,6 +486,7 @@
                         var interp = interpolateRects(
                             zoomAnim.from,
                             zoomAnim.to,
+                            zoomAnim.fromMap,
                             et,
                         );
                         drawRects(interp, 1);
@@ -467,11 +513,7 @@
                         ctx.setTransform(1, 0, 0, 1, 0, 0);
                         ctx.drawImage(bufCanvas, 0, 0);
                         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-                        for (
-                            var ai = 0;
-                            ai < hoveredAncestors.length;
-                            ai++
-                        ) {
+                        for (var ai = 0; ai < hoveredAncestors.length; ai++) {
                             var ar = hoveredAncestors[ai];
                             var ax = ar.x + GAP;
                             var ay = ar.y + GAP;
@@ -479,17 +521,10 @@
                             var ah = Math.max(0, ar.h - GAP * 2);
                             if (aw > 0 && ah > 0) {
                                 if (ar.headerH > 0) {
-                                    ctx.fillStyle =
-                                        "rgba(255,255,255,0.05)";
-                                    ctx.fillRect(
-                                        ax,
-                                        ay,
-                                        aw,
-                                        ar.headerH,
-                                    );
+                                    ctx.fillStyle = "rgba(255,255,255,0.05)";
+                                    ctx.fillRect(ax, ay, aw, ar.headerH);
                                 }
-                                ctx.strokeStyle =
-                                    "rgba(255,255,255,0.3)";
+                                ctx.strokeStyle = "rgba(255,255,255,0.3)";
                                 ctx.lineWidth = 1;
                                 ctx.strokeRect(ax, ay, aw, ah);
                             }
@@ -501,41 +536,28 @@
                             var rw = Math.max(0, hr.w - GAP * 2);
                             var rh = Math.max(0, hr.h - GAP * 2);
                             if (rw > 0 && rh > 0) {
-                                ctx.fillStyle =
-                                    "rgba(255,255,255,0.08)";
-                                if (
-                                    hr.isContainer &&
-                                    hr.headerH > 0
-                                ) {
-                                    ctx.fillRect(
-                                        rx,
-                                        ry,
-                                        rw,
-                                        hr.headerH,
-                                    );
+                                ctx.fillStyle = "rgba(255,255,255,0.08)";
+                                if (hr.isContainer && hr.headerH > 0) {
+                                    ctx.fillRect(rx, ry, rw, hr.headerH);
                                 } else {
-                                    ctx.fillRect(
-                                        rx,
-                                        ry,
-                                        rw,
-                                        rh,
-                                    );
+                                    ctx.fillRect(rx, ry, rw, rh);
                                 }
-                                ctx.strokeStyle =
-                                    "rgba(255,255,255,0.7)";
+                                ctx.strokeStyle = "rgba(255,255,255,0.7)";
                                 ctx.lineWidth = 1.5;
-                                ctx.strokeRect(
-                                    rx,
-                                    ry,
-                                    rw,
-                                    rh,
-                                );
+                                ctx.strokeRect(rx, ry, rw, rh);
                             }
                         }
                     }
                 }
 
                 function buildBreadcrumb() {
+                    var key = "";
+                    for (var i = 0; i < breadcrumb.length; i++) {
+                        if (i > 0) key += ",";
+                        key += breadcrumb[i].id.toString();
+                    }
+                    if (key === lastBreadcrumbKey) return;
+                    lastBreadcrumbKey = key;
                     breadcrumbBar.innerHTML = "";
                     for (var i = 0; i < breadcrumb.length; i++) {
                         if (i > 0) {
@@ -559,6 +581,19 @@
                     }
                 }
 
+                function buildHoverPath(found) {
+                    var parts = [];
+                    for (var i = 0; i < breadcrumb.length; i++)
+                        parts.push(breadcrumb[i].name || "/");
+                    var sorted = hoveredAncestors.slice().sort(function (a, b) {
+                        return b.w * b.h - a.w * a.h;
+                    });
+                    for (var i = 0; i < sorted.length; i++)
+                        parts.push(sorted[i].name);
+                    parts.push(found.name);
+                    return parts.join("/").replace(/\/+/g, "/");
+                }
+
                 function navigateTo(nodeId) {
                     if (zoomAnim) return;
                     hoveredRect = null;
@@ -568,12 +603,10 @@
                     for (var i = 0; i < layoutRects.length; i++)
                         pendingOldRects.push(Object.assign({}, layoutRects[i]));
                     if (ws && ws.readyState === 1) {
-                        ws.send(
-                            JSON.stringify({
-                                type: "navigate",
-                                id: String(nodeId),
-                            }),
-                        );
+                        var b = new DataView(new ArrayBuffer(9));
+                        b.setUint8(0, 2);
+                        b.setBigUint64(1, BigInt(nodeId), true);
+                        sendBinary(new Uint8Array(b.buffer));
                     }
                 }
 
@@ -592,47 +625,58 @@
                     return null;
                 }
 
+                function recomputeHover() {
+                    if (lastMouseX < 0) {
+                        hoveredRect = null;
+                        hoveredAncestors = [];
+                        return;
+                    }
+                    var found = findRect(lastMouseX, lastMouseY);
+                    hoveredRect = found;
+                    hoveredAncestors = [];
+                    if (found) {
+                        for (var i = 0; i < layoutRects.length; i++) {
+                            var r = layoutRects[i];
+                            if (
+                                r !== found &&
+                                r.isContainer &&
+                                found.x >= r.x &&
+                                found.y >= r.y &&
+                                found.x < r.x + r.w &&
+                                found.y < r.y + r.h
+                            ) {
+                                hoveredAncestors.push(r);
+                            }
+                        }
+                        pathTextEl.textContent = buildHoverPath(found);
+                        pathSizeEl.textContent = formatSize(found.size);
+                    } else {
+                        pathTextEl.textContent = "";
+                        pathSizeEl.textContent = "";
+                    }
+                }
+
                 canvas.addEventListener("mousemove", function (e) {
                     if (zoomAnim) return;
                     var rect = canvas.getBoundingClientRect();
-                    var mx = e.clientX - rect.left;
-                    var my = e.clientY - rect.top;
+                    lastMouseX = e.clientX - rect.left;
+                    lastMouseY = e.clientY - rect.top;
 
-                    var found = findRect(mx, my);
-                    var changed = found !== hoveredRect;
-                    if (changed) {
-                        hoveredRect = found;
-                        hoveredAncestors = [];
-                        if (found) {
-                            for (
-                                var i = 0;
-                                i < layoutRects.length;
-                                i++
-                            ) {
-                                var r = layoutRects[i];
-                                if (
-                                    r !== found &&
-                                    r.isContainer &&
-                                    found.x >= r.x &&
-                                    found.y >= r.y &&
-                                    found.x < r.x + r.w &&
-                                    found.y < r.y + r.h
-                                ) {
-                                    hoveredAncestors.push(r);
-                                }
-                            }
-                        }
+                    var prev = hoveredRect;
+                    recomputeHover();
+
+                    if (hoveredRect !== prev) {
                         dirty = true;
                         scheduleTick();
-                        if (found) {
+                        if (hoveredRect) {
                             tooltipEl.style.display = "block";
                             tooltipEl.querySelector(".tt-name").textContent =
-                                found.name;
+                                hoveredRect.name;
                             tooltipEl.querySelector(".tt-size").textContent =
-                                formatSize(found.size);
+                                formatSize(hoveredRect.size);
                             var pct =
                                 viewRootSize > 0
-                                    ? (found.size / viewRootSize) * 100
+                                    ? (hoveredRect.size / viewRootSize) * 100
                                     : 0;
                             tooltipEl.querySelector(".tt-pct").textContent =
                                 pct.toFixed(1) + "% of parent";
@@ -641,7 +685,7 @@
                         }
                     }
 
-                    if (found) {
+                    if (hoveredRect) {
                         var tx = e.clientX + 14;
                         var ty = e.clientY + 14;
                         var tw = tooltipEl.offsetWidth;
@@ -656,8 +700,13 @@
                 });
 
                 canvas.addEventListener("mouseleave", function () {
+                    lastMouseX = -1;
+                    lastMouseY = -1;
                     hoveredRect = null;
+                    hoveredAncestors = [];
                     tooltipEl.style.display = "none";
+                    pathTextEl.textContent = "";
+                    pathSizeEl.textContent = "";
                     dirty = true;
                     scheduleTick();
                 });
@@ -677,6 +726,7 @@
                             my >= r.y &&
                             my < r.y + r.h &&
                             !r.isFiles &&
+                            !r.isFile &&
                             r.id > 0n &&
                             r.isContainer
                         ) {
@@ -686,6 +736,26 @@
 
                     if (target) {
                         navigateTo(target.id);
+                    }
+                });
+
+                canvas.addEventListener("contextmenu", function (e) {
+                    e.preventDefault();
+                    if (!hoveredRect || !ws || ws.readyState !== 1) return;
+                    if (hoveredRect.isFile) {
+                        var enc = new TextEncoder();
+                        var nb = enc.encode(hoveredRect.name);
+                        var b = new DataView(new ArrayBuffer(11 + nb.length));
+                        b.setUint8(0, 4);
+                        b.setBigUint64(1, BigInt(hoveredRect.parentId), true);
+                        b.setUint16(9, nb.length, true);
+                        new Uint8Array(b.buffer).set(nb, 11);
+                        sendBinary(new Uint8Array(b.buffer));
+                    } else {
+                        var b = new DataView(new ArrayBuffer(9));
+                        b.setUint8(0, 3);
+                        b.setBigUint64(1, BigInt(hoveredRect.id), true);
+                        sendBinary(new Uint8Array(b.buffer));
                     }
                 });
 
@@ -707,16 +777,17 @@
                     resize();
                 });
 
+                function sendBinary(buf) {
+                    if (ws && ws.readyState === 1) ws.send(buf.buffer);
+                }
+
                 function sendViewport() {
-                    if (ws && ws.readyState === 1 && canvasW > 0) {
-                        ws.send(
-                            JSON.stringify({
-                                type: "viewport",
-                                w: canvasW,
-                                h: canvasH,
-                            }),
-                        );
-                    }
+                    if (!ws || ws.readyState !== 1 || canvasW <= 0) return;
+                    var b = new DataView(new ArrayBuffer(9));
+                    b.setUint8(0, 1);
+                    b.setFloat32(1, canvasW, true);
+                    b.setFloat32(5, canvasH, true);
+                    sendBinary(new Uint8Array(b.buffer));
                 }
 
                 function connect() {
@@ -760,7 +831,6 @@
                         off += 1;
 
                         if (type === 1) {
-                            /* scan_start */
                             var pathLen = dv.getUint16(off, true);
                             off += 2;
                             var path = td.decode(
@@ -773,11 +843,14 @@
                             bufDirty = true;
                             dirty = true;
                             scheduleTick();
-                            statusEl.textContent = "Scanning " + path + "...";
+                            if (scanTimer) {
+                                clearInterval(scanTimer);
+                                scanTimer = null;
+                            }
+                            startScanTimer();
                             buildBreadcrumb();
                         } else if (type === 2) {
-                            /* layout */
-                            var viewRoot = Number(dv.getBigUint64(off, true));
+                            var viewRoot = dv.getBigUint64(off, true);
                             off += 8;
                             var rootSize = Number(dv.getBigUint64(off, true));
                             off += 8;
@@ -810,6 +883,8 @@
                             for (var i = 0; i < rc; i++) {
                                 var id = dv.getBigInt64(off, true);
                                 off += 8;
+                                var parentId = dv.getBigUint64(off, true);
+                                off += 8;
                                 var x = dv.getFloat32(off, true);
                                 off += 4;
                                 var y = dv.getFloat32(off, true);
@@ -837,6 +912,7 @@
 
                                 var r = {
                                     id: id,
+                                    parentId: parentId,
                                     x: x,
                                     y: y,
                                     w: w,
@@ -847,6 +923,7 @@
                                     depth: depth,
                                     isContainer: (flags & 1) !== 0,
                                     isFiles: (flags & 2) !== 0,
+                                    isFile: (flags & 4) !== 0,
                                     headerH: hH,
                                 };
                                 applyColors(r);
@@ -863,19 +940,27 @@
                             breadcrumb = bc;
                             buildBreadcrumb();
 
+                            recomputeHover();
                             bufDirty = true;
                             dirty = true;
                             scheduleTick();
 
+                            if (!scanDone) startScanTimer();
                             if (scanDone) {
+                                if (scanTimer) {
+                                    clearInterval(scanTimer);
+                                    scanTimer = null;
+                                }
+                                var elapsed = (
+                                    (performance.now() - scanStartTime) /
+                                    1000
+                                ).toFixed(1);
                                 statusEl.textContent =
-                                    "Scan complete. " +
                                     dirCount +
-                                    " directories. " +
+                                    " dirs in " +
+                                    elapsed +
+                                    "s \u2014 " +
                                     formatSize(rootSize);
-                            } else {
-                                statusEl.textContent =
-                                    "Scanning... " + dirCount + " directories";
                             }
                         }
                     };
