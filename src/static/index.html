@@ -137,6 +137,7 @@
 
                 var dirty = true;
                 var hoveredRect = null;
+                var hoveredAncestors = [];
                 var dpr = window.devicePixelRatio || 1;
                 var canvasW = 0,
                     canvasH = 0;
@@ -466,6 +467,33 @@
                         ctx.setTransform(1, 0, 0, 1, 0, 0);
                         ctx.drawImage(bufCanvas, 0, 0);
                         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                        for (
+                            var ai = 0;
+                            ai < hoveredAncestors.length;
+                            ai++
+                        ) {
+                            var ar = hoveredAncestors[ai];
+                            var ax = ar.x + GAP;
+                            var ay = ar.y + GAP;
+                            var aw = Math.max(0, ar.w - GAP * 2);
+                            var ah = Math.max(0, ar.h - GAP * 2);
+                            if (aw > 0 && ah > 0) {
+                                if (ar.headerH > 0) {
+                                    ctx.fillStyle =
+                                        "rgba(255,255,255,0.05)";
+                                    ctx.fillRect(
+                                        ax,
+                                        ay,
+                                        aw,
+                                        ar.headerH,
+                                    );
+                                }
+                                ctx.strokeStyle =
+                                    "rgba(255,255,255,0.3)";
+                                ctx.lineWidth = 1;
+                                ctx.strokeRect(ax, ay, aw, ah);
+                            }
+                        }
                         if (hoveredRect) {
                             var hr = hoveredRect;
                             var rx = hr.x + GAP;
@@ -473,15 +501,35 @@
                             var rw = Math.max(0, hr.w - GAP * 2);
                             var rh = Math.max(0, hr.h - GAP * 2);
                             if (rw > 0 && rh > 0) {
-                                ctx.fillStyle = "rgba(255,255,255,0.08)";
-                                if (hr.isContainer && hr.headerH > 0) {
-                                    ctx.fillRect(rx, ry, rw, hr.headerH);
+                                ctx.fillStyle =
+                                    "rgba(255,255,255,0.08)";
+                                if (
+                                    hr.isContainer &&
+                                    hr.headerH > 0
+                                ) {
+                                    ctx.fillRect(
+                                        rx,
+                                        ry,
+                                        rw,
+                                        hr.headerH,
+                                    );
                                 } else {
-                                    ctx.fillRect(rx, ry, rw, rh);
+                                    ctx.fillRect(
+                                        rx,
+                                        ry,
+                                        rw,
+                                        rh,
+                                    );
                                 }
-                                ctx.strokeStyle = "rgba(255,255,255,0.7)";
+                                ctx.strokeStyle =
+                                    "rgba(255,255,255,0.7)";
                                 ctx.lineWidth = 1.5;
-                                ctx.strokeRect(rx, ry, rw, rh);
+                                ctx.strokeRect(
+                                    rx,
+                                    ry,
+                                    rw,
+                                    rh,
+                                );
                             }
                         }
                     }
@@ -514,6 +562,7 @@
                 function navigateTo(nodeId) {
                     if (zoomAnim) return;
                     hoveredRect = null;
+                    hoveredAncestors = [];
                     tooltipEl.style.display = "none";
                     pendingOldRects = [];
                     for (var i = 0; i < layoutRects.length; i++)
@@ -522,7 +571,7 @@
                         ws.send(
                             JSON.stringify({
                                 type: "navigate",
-                                id: nodeId,
+                                id: String(nodeId),
                             }),
                         );
                     }
@@ -553,6 +602,26 @@
                     var changed = found !== hoveredRect;
                     if (changed) {
                         hoveredRect = found;
+                        hoveredAncestors = [];
+                        if (found) {
+                            for (
+                                var i = 0;
+                                i < layoutRects.length;
+                                i++
+                            ) {
+                                var r = layoutRects[i];
+                                if (
+                                    r !== found &&
+                                    r.isContainer &&
+                                    found.x >= r.x &&
+                                    found.y >= r.y &&
+                                    found.x < r.x + r.w &&
+                                    found.y < r.y + r.h
+                                ) {
+                                    hoveredAncestors.push(r);
+                                }
+                            }
+                        }
                         dirty = true;
                         scheduleTick();
                         if (found) {
@@ -608,7 +677,7 @@
                             my >= r.y &&
                             my < r.y + r.h &&
                             !r.isFiles &&
-                            r.id > 0 &&
+                            r.id > 0n &&
                             r.isContainer
                         ) {
                             target = r;
@@ -721,7 +790,7 @@
                             off += 2;
                             var bc = new Array(bcCount);
                             for (var i = 0; i < bcCount; i++) {
-                                var bcId = Number(dv.getBigUint64(off, true));
+                                var bcId = dv.getBigUint64(off, true);
                                 off += 8;
                                 var bcNL = dv.getUint16(off, true);
                                 off += 2;
@@ -739,7 +808,7 @@
                             off += 4;
                             var rects = new Array(rc);
                             for (var i = 0; i < rc; i++) {
-                                var id = Number(dv.getBigInt64(off, true));
+                                var id = dv.getBigInt64(off, true);
                                 off += 8;
                                 var x = dv.getFloat32(off, true);
                                 off += 4;

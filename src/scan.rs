@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -105,6 +105,7 @@ struct WorkItem {
     file_id: u64,
     parent_id: u64,
     name: String,
+    path: String,
 }
 
 struct WorkQueueInner {
@@ -158,6 +159,17 @@ impl WorkQueue {
         if inner.pending == 0 {
             self.condvar.notify_all();
         }
+    }
+
+    fn pending(&self) -> usize {
+        self.inner.lock().unwrap().pending
+    }
+
+    fn cancel(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.pending = 0;
+        inner.queue.clear();
+        self.condvar.notify_all();
     }
 }
 
@@ -236,17 +248,22 @@ fn scan_raw(root: &Path, collect_files: bool, cross_filesystems: bool) -> Result
         .map(|n| n.get())
         .unwrap_or(4);
 
+    let visited = Arc::new(Mutex::new(HashSet::from([ri.ino])));
+
     let work = Arc::new(WorkQueue::new());
+    let root_path = ri.path.display().to_string();
     work.push(vec![WorkItem {
         fd: ri.fd,
         file_id: ri.ino,
         parent_id: 0,
         name: ri.name,
+        path: root_path,
     }]);
 
     let handles: Vec<_> = (0..num_threads)
         .map(|_| {
             let work = Arc::clone(&work);
+            let visited = Arc::clone(&visited);
             let root_dev_i32 = ri.dev as i32;
             thread::spawn(move || {
                 let mut result = ThreadResult::default();
@@ -265,6 +282,8 @@ fn scan_raw(root: &Path, collect_files: bool, cross_filesystems: bool) -> Result
                         &work,
                         &mut result,
                         None,
+                        &visited,
+                        &item.path,
                     );
                     work.finish_one();
                 }
@@ -395,24 +414,35 @@ pub fn scan_tree_streaming(
         .map(|n| n.get())
         .unwrap_or(4);
 
+    let visited = Arc::new(Mutex::new(HashSet::from([ri.ino])));
+
     let work = Arc::new(WorkQueue::new());
     work.push(vec![WorkItem {
         fd: ri.fd,
         file_id: ri.ino,
         parent_id: 0,
-        name: ri.name,
+        name: ri.name.clone(),
+        path: ri.path.display().to_string(),
     }]);
 
-    let handles: Vec<_> = (0..num_threads)
-        .map(|_| {
+    let active_dirs: Arc<Vec<Mutex<String>>> = Arc::new(
+        (0..num_threads).map(|_| Mutex::new(String::new())).collect(),
+    );
+
+    let _handles: Vec<_> = (0..num_threads)
+        .enumerate()
+        .map(|(tid, _)| {
             let work = Arc::clone(&work);
             let tx = tx.clone();
+            let visited = Arc::clone(&visited);
             let root_dev_i32 = ri.dev as i32;
+            let active = Arc::clone(&active_dirs);
             thread::spawn(move || {
                 let mut buf = vec![0u8; BUF_SIZE];
                 let mut result = ThreadResult::default();
 
                 while let Some(item) = work.take() {
+                    *active[tid].lock().unwrap() = item.path.clone();
                     scan_directory(
                         item.fd,
                         item.file_id,
@@ -425,6 +455,8 @@ pub fn scan_tree_streaming(
                         &work,
                         &mut result,
                         Some(&tx),
+                        &visited,
+                        &item.path,
                     );
                     work.finish_one();
                 }
@@ -432,10 +464,34 @@ pub fn scan_tree_streaming(
         })
         .collect();
 
-    for handle in handles {
-        handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("thread panicked"))?;
+    // Wait for completion with stall detection — a hung mount can block
+    // a worker thread in getattrlistbulk indefinitely
+    let mut stall_count = 0u32;
+    let mut last_pending = usize::MAX;
+    loop {
+        thread::sleep(std::time::Duration::from_secs(1));
+        let p = work.pending();
+        if p == 0 {
+            break;
+        }
+        if p == last_pending {
+            stall_count += 1;
+            if stall_count >= 3 {
+                eprintln!("Scan stalled with {p} items pending, finishing with partial results");
+                eprintln!("Stuck directories:");
+                for dir in active_dirs.iter() {
+                    let name = dir.lock().unwrap();
+                    if !name.is_empty() {
+                        eprintln!("  {name}");
+                    }
+                }
+                work.cancel();
+                break;
+            }
+        } else {
+            stall_count = 0;
+        }
+        last_pending = p;
     }
 
     let _ = tx.send(ScanEvent::ScanDone);
@@ -456,6 +512,8 @@ fn scan_directory(
     work: &WorkQueue,
     result: &mut ThreadResult,
     tx: Option<&std::sync::mpsc::Sender<ScanEvent>>,
+    visited: &Mutex<HashSet<u64>>,
+    dir_path: &str,
 ) {
     let mut new_work = Vec::new();
     let mut dir_total: u64 = 0;
@@ -503,13 +561,20 @@ fn scan_directory(
                                 openat(fd, name_buf.as_ptr() as *const i8, O_RDONLY | O_DIRECTORY)
                             };
                             if child_fd >= 0 {
-                                result.dir_parents.insert(parsed.file_id, dir_file_id);
-                                new_work.push(WorkItem {
-                                    fd: child_fd,
-                                    file_id: parsed.file_id,
-                                    parent_id: dir_file_id,
-                                    name: parsed.name.to_string(),
-                                });
+                                if visited.lock().unwrap().insert(parsed.file_id) {
+                                    result
+                                        .dir_parents
+                                        .insert(parsed.file_id, dir_file_id);
+                                    new_work.push(WorkItem {
+                                        fd: child_fd,
+                                        file_id: parsed.file_id,
+                                        parent_id: dir_file_id,
+                                        name: parsed.name.to_string(),
+                                        path: format!("{dir_path}/{}", parsed.name),
+                                    });
+                                } else {
+                                    unsafe { close(child_fd) };
+                                }
                             }
                         }
                     }

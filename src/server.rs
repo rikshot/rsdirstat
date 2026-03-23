@@ -187,7 +187,10 @@ pub async fn run_streaming(
                 Some(id) => id,
                 None => continue,
             };
-            let view_root = layout_state.view_root.lock().unwrap().unwrap_or(root_id);
+            let mut view_root = layout_state.view_root.lock().unwrap().unwrap_or(root_id);
+            if tree.nodes.get(&view_root).is_none() {
+                view_root = root_id;
+            }
             let rects = layout::compute_layout(&tree, view_root, vw, vh);
             let breadcrumb = tree.breadcrumb(view_root);
             let root_size = tree.recursive_sizes.get(&view_root).copied().unwrap_or(0);
@@ -332,7 +335,10 @@ fn handle_client_message(state: &ServerState, text: &str) {
             state.invalidate_layout();
         }
         Some("navigate") => {
-            if let Some(id) = parsed["id"].as_u64() {
+            if let Some(id) = parsed["id"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
                 *state.view_root.lock().unwrap() = Some(id);
                 state.invalidate_layout();
             }
