@@ -1,18 +1,16 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::response::Html;
 use axum::routing::get;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, broadcast};
+use tower_http::services::ServeDir;
 
 use crate::{layout, scan};
-
-const INDEX_HTML: &str = include_str!("static/index.html");
 
 const MSG_SCAN_START: u8 = 1;
 const MSG_LAYOUT: u8 = 2;
@@ -24,14 +22,16 @@ struct ServerState {
     view_root: Mutex<Option<u64>>,
     scan_done: AtomicBool,
     scan_root: PathBuf,
-    index_html: String,
+    cross_filesystems: bool,
     layout_tx: broadcast::Sender<Vec<u8>>,
     last_layout: Mutex<Option<Vec<u8>>>,
     layout_notify: Notify,
     start: Notify,
-    shutdown: Notify,
     connections: AtomicU64,
     had_connection: AtomicBool,
+    max_depth: AtomicU8,
+    color_mode: AtomicU8,
+    filter: Mutex<layout::FilterConfig>,
 }
 
 fn encode_scan_start(path: &str) -> Vec<u8> {
@@ -51,7 +51,7 @@ fn encode_layout(
     breadcrumb: &[layout::BreadcrumbEntry],
     rects: &[layout::LayoutRect],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(32 + breadcrumb.len() * 20 + rects.len() * 60);
+    let mut buf = Vec::with_capacity(32 + breadcrumb.len() * 20 + rects.len() * 68);
     buf.push(MSG_LAYOUT);
     buf.extend_from_slice(&view_root.to_le_bytes());
     buf.extend_from_slice(&root_size.to_le_bytes());
@@ -77,6 +77,7 @@ fn encode_layout(
         buf.push(r.depth);
         buf.push((r.is_container as u8) | ((r.is_files as u8) << 1) | ((r.is_file as u8) << 2));
         buf.extend_from_slice(&(r.header_h as f32).to_le_bytes());
+        buf.extend_from_slice(&r.mtime.to_le_bytes());
         let nb = r.name.as_bytes();
         buf.extend_from_slice(&(nb.len() as u16).to_le_bytes());
         buf.extend_from_slice(nb);
@@ -102,61 +103,22 @@ pub async fn run_streaming(
         view_root: Mutex::new(None),
         scan_done: AtomicBool::new(false),
         scan_root,
-        index_html: INDEX_HTML.replace("__WAIT_MODE__", if wait { "true" } else { "false" }),
+        cross_filesystems,
         layout_tx,
         last_layout: Mutex::new(None),
         layout_notify: Notify::new(),
         start: Notify::new(),
-        shutdown: Notify::new(),
         connections: AtomicU64::new(0),
         had_connection: AtomicBool::new(false),
+        max_depth: AtomicU8::new(5),
+        color_mode: AtomicU8::new(0),
+        filter: Mutex::new(layout::FilterConfig::default()),
     });
 
     let scan_state = Arc::clone(&state);
     tokio::task::spawn(async move {
         scan_state.start.notified().await;
-
-        let (tx, rx) = std::sync::mpsc::channel::<scan::ScanEvent>();
-
-        let relay_state = Arc::clone(&scan_state);
-        tokio::task::spawn_blocking(move || {
-            while let Ok(event) = rx.recv() {
-                let mut events = vec![event];
-                while let Ok(e) = rx.try_recv() {
-                    events.push(e);
-                }
-
-                let mut tree = relay_state.tree.write().unwrap();
-                for event in events {
-                    match event {
-                        scan::ScanEvent::ScanStart { path } => {
-                            tree.clear();
-                            tree.scan_path = path.clone();
-                            relay_state.scan_done.store(false, Ordering::Relaxed);
-                            let _ = relay_state.layout_tx.send(encode_scan_start(&path));
-                        }
-                        scan::ScanEvent::Dir { id, parent, name, size } => {
-                            tree.insert_dir(id, parent, &name, size);
-                        }
-                        scan::ScanEvent::File { parent, name, size } => {
-                            tree.insert_file(parent, &name, size);
-                        }
-                        scan::ScanEvent::ScanDone => {
-                            tree.recompute_sizes();
-                            relay_state.scan_done.store(true, Ordering::Relaxed);
-                        }
-                    }
-                }
-                drop(tree);
-                relay_state.invalidate_layout();
-            }
-        });
-
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = scan::scan_tree_streaming(&path, cross_filesystems, tx) {
-                eprintln!("Scan error: {e}");
-            }
-        });
+        start_scan(&scan_state);
     });
 
     let layout_state = Arc::clone(&state);
@@ -185,6 +147,17 @@ pub async fn run_streaming(
                 continue;
             }
 
+            let max_depth = layout_state.max_depth.load(Ordering::Relaxed);
+            let color_mode = layout_state.color_mode.load(Ordering::Relaxed);
+            let filter = {
+                let f = layout_state.filter.lock().unwrap();
+                if f.is_active() {
+                    f.clone()
+                } else {
+                    layout::FilterConfig::default()
+                }
+            };
+
             let tree = layout_state.tree.read().unwrap();
             let root_id = match tree.root_id {
                 Some(id) => id,
@@ -194,7 +167,15 @@ pub async fn run_streaming(
             if !tree.nodes.contains_key(&view_root) {
                 view_root = root_id;
             }
-            let rects = layout::compute_layout(&tree, view_root, vw, vh);
+
+            let config = layout::LayoutConfig {
+                max_depth,
+                color_mode,
+                filter,
+                mtime_range: tree.mtime_range,
+            };
+
+            let rects = layout::compute_layout(&tree, view_root, vw, vh, &config);
             let breadcrumb = tree.breadcrumb(view_root);
             let root_size = tree.recursive_sizes.get(&view_root).copied().unwrap_or(0);
             let dir_count = tree.nodes.len() as u32;
@@ -214,34 +195,105 @@ pub async fn run_streaming(
         state.start.notify_one();
     }
 
+    let static_dir = find_static_dir();
+
     let app = Router::new()
-        .route("/", get(index_handler))
         .route("/ws", get(ws_handler))
         .route("/start", get(start_handler))
-        .with_state(Arc::clone(&state));
+        .with_state(Arc::clone(&state))
+        .fallback_service(ServeDir::new(&static_dir));
 
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let actual_port = listener.local_addr()?.port();
     eprintln!("Listening on http://localhost:{actual_port}");
 
     if !no_open {
-        let url = format!("http://localhost:{actual_port}");
+        let url = if wait {
+            format!("http://localhost:{actual_port}/?wait")
+        } else {
+            format!("http://localhost:{actual_port}")
+        };
         if let Err(e) = open::that(&url) {
             eprintln!("Failed to open browser: {e}");
         }
     }
 
-    let shutdown_state = Arc::clone(&state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_state.shutdown.notified().await;
-        })
-        .await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
-async fn index_handler(axum::extract::State(state): axum::extract::State<Arc<ServerState>>) -> Html<String> {
-    Html(state.index_html.clone())
+fn start_scan(state: &Arc<ServerState>) {
+    let (tx, rx) = std::sync::mpsc::channel::<scan::ScanEvent>();
+
+    let relay_state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        while let Ok(event) = rx.recv() {
+            let mut events = vec![event];
+            while let Ok(e) = rx.try_recv() {
+                events.push(e);
+            }
+
+            let mut tree = relay_state.tree.write().unwrap();
+            for event in events {
+                match event {
+                    scan::ScanEvent::ScanStart { path } => {
+                        tree.clear();
+                        tree.scan_path = path.clone();
+                        *relay_state.view_root.lock().unwrap() = None;
+                        relay_state.scan_done.store(false, Ordering::Relaxed);
+                        let _ = relay_state.layout_tx.send(encode_scan_start(&path));
+                    }
+                    scan::ScanEvent::Dir {
+                        id,
+                        parent,
+                        name,
+                        size,
+                        mtime,
+                    } => {
+                        tree.insert_dir(id, parent, &name, size, mtime);
+                    }
+                    scan::ScanEvent::File {
+                        parent,
+                        name,
+                        size,
+                        mtime,
+                    } => {
+                        tree.insert_file(parent, &name, size, mtime);
+                    }
+                    scan::ScanEvent::ScanDone => {
+                        tree.recompute_sizes();
+                        relay_state.scan_done.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+            drop(tree);
+            relay_state.invalidate_layout();
+        }
+    });
+
+    let path = state.scan_root.clone();
+    let cross_fs = state.cross_filesystems;
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = scan::scan_tree_streaming(&path, cross_fs, tx) {
+            eprintln!("Scan error: {e}");
+        }
+    });
+}
+
+fn find_static_dir() -> PathBuf {
+    // Check relative to executable, then current dir
+    if let Ok(exe) = std::env::current_exe() {
+        let dir = exe.parent().unwrap_or(std::path::Path::new(".")).join("static");
+        if dir.is_dir() {
+            return dir;
+        }
+    }
+    let cwd = PathBuf::from("static");
+    if cwd.is_dir() {
+        return cwd;
+    }
+    eprintln!("Warning: 'static/' directory not found, serving from current directory");
+    PathBuf::from(".")
 }
 
 async fn start_handler(axum::extract::State(state): axum::extract::State<Arc<ServerState>>) -> &'static str {
@@ -299,7 +351,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ServerState>) {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
             if s.connections.load(Ordering::Relaxed) == 0 && s.had_connection.load(Ordering::Relaxed) {
-                s.shutdown.notify_one();
+                std::process::exit(0);
             }
         });
     }
@@ -316,12 +368,19 @@ const MSG_CLIENT_VIEWPORT: u8 = 1;
 const MSG_CLIENT_NAVIGATE: u8 = 2;
 const MSG_CLIENT_REVEAL_DIR: u8 = 3;
 const MSG_CLIENT_REVEAL_FILE: u8 = 4;
+const MSG_CLIENT_RESCAN: u8 = 5;
+const MSG_CLIENT_SET_DEPTH: u8 = 6;
+const MSG_CLIENT_COLOR_MODE: u8 = 7;
+const MSG_CLIENT_FILTER_EXT: u8 = 8;
+const MSG_CLIENT_FILTER_SIZE: u8 = 9;
+const MSG_CLIENT_FILTER_NAME: u8 = 10;
+const MSG_CLIENT_CLEAR_FILTER: u8 = 11;
 
 fn reveal_in_finder(path: &std::path::Path) {
     let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
 }
 
-fn handle_client_message(state: &ServerState, data: &[u8]) {
+fn handle_client_message(state: &Arc<ServerState>, data: &[u8]) {
     if data.is_empty() {
         return;
     }
@@ -358,6 +417,63 @@ fn handle_client_message(state: &ServerState, data: &[u8]) {
                     reveal_in_finder(&path);
                 }
             }
+        }
+        MSG_CLIENT_RESCAN => {
+            if state.scan_done.load(Ordering::Relaxed) {
+                start_scan(state);
+            }
+        }
+        MSG_CLIENT_SET_DEPTH if data.len() >= 2 => {
+            let depth = data[1].clamp(1, 10);
+            state.max_depth.store(depth, Ordering::Relaxed);
+            state.invalidate_layout();
+        }
+        MSG_CLIENT_COLOR_MODE if data.len() >= 2 => {
+            state.color_mode.store(data[1], Ordering::Relaxed);
+            state.invalidate_layout();
+        }
+        MSG_CLIENT_FILTER_EXT if data.len() >= 2 => {
+            let count = data[1] as usize;
+            let mut off = 2;
+            let mut exts = Vec::with_capacity(count);
+            for _ in 0..count {
+                if off >= data.len() {
+                    break;
+                }
+                let len = data[off] as usize;
+                off += 1;
+                if off + len > data.len() {
+                    break;
+                }
+                if let Ok(s) = std::str::from_utf8(&data[off..off + len]) {
+                    exts.push(s.into());
+                }
+                off += len;
+            }
+            state.filter.lock().unwrap().extensions = exts;
+            state.invalidate_layout();
+        }
+        MSG_CLIENT_FILTER_SIZE if data.len() >= 17 => {
+            let min = u64::from_le_bytes(data[1..9].try_into().unwrap());
+            let max = u64::from_le_bytes(data[9..17].try_into().unwrap());
+            let mut f = state.filter.lock().unwrap();
+            f.min_size = min;
+            f.max_size = max;
+            state.invalidate_layout();
+        }
+        MSG_CLIENT_FILTER_NAME if data.len() >= 3 => {
+            let len = u16::from_le_bytes(data[1..3].try_into().unwrap()) as usize;
+            if data.len() >= 3 + len {
+                let pattern = std::str::from_utf8(&data[3..3 + len])
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                state.filter.lock().unwrap().name_pattern = pattern;
+                state.invalidate_layout();
+            }
+        }
+        MSG_CLIENT_CLEAR_FILTER => {
+            *state.filter.lock().unwrap() = layout::FilterConfig::default();
+            state.invalidate_layout();
         }
         _ => {}
     }

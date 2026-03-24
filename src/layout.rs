@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const MAX_NEST_DEPTH: u8 = 5;
 const NEST_PAD: f64 = 2.0;
 const NEST_HEADER: f64 = 18.0;
 const MIN_NEST_PX: f64 = 40.0;
@@ -17,9 +16,10 @@ fn header_height(w: f64, h: f64) -> f64 {
 }
 
 pub struct FileEntry {
-    pub name: String,
+    pub name: Box<str>,
     pub size: u64,
     pub hue: u16,
+    pub mtime: i64,
 }
 
 #[derive(Default)]
@@ -30,6 +30,7 @@ pub struct DirNode {
     pub children: Vec<u64>,
     pub files: Vec<FileEntry>,
     pub hue: u16,
+    pub mtime: i64,
 }
 
 pub struct DirTree {
@@ -37,6 +38,7 @@ pub struct DirTree {
     pub root_id: Option<u64>,
     pub recursive_sizes: HashMap<u64, u64>,
     pub scan_path: String,
+    pub mtime_range: (i64, i64),
     hue_cache: HashMap<Box<str>, u16>,
 }
 
@@ -47,6 +49,7 @@ impl DirTree {
             root_id: None,
             recursive_sizes: HashMap::new(),
             scan_path: String::new(),
+            mtime_range: (i64::MAX, 0),
             hue_cache: HashMap::new(),
         }
     }
@@ -56,9 +59,10 @@ impl DirTree {
         self.root_id = None;
         self.recursive_sizes.clear();
         self.scan_path.clear();
+        self.mtime_range = (i64::MAX, 0);
     }
 
-    pub fn insert_dir(&mut self, id: u64, parent: u64, name: &str, size: u64) {
+    pub fn insert_dir(&mut self, id: u64, parent: u64, name: &str, size: u64, mtime: i64) {
         let hue = hash_name(name);
 
         if parent == 0 {
@@ -70,12 +74,18 @@ impl DirTree {
             pn.children.push(id);
         }
 
+        if mtime > 0 {
+            self.mtime_range.0 = self.mtime_range.0.min(mtime);
+            self.mtime_range.1 = self.mtime_range.1.max(mtime);
+        }
+
         match self.nodes.get_mut(&id) {
             Some(existing) => {
                 existing.parent = parent;
                 existing.name = name.to_string();
                 existing.direct_size = size;
                 existing.hue = hue;
+                existing.mtime = mtime;
             }
             None => {
                 self.nodes.insert(
@@ -87,6 +97,7 @@ impl DirTree {
                         children: Vec::new(),
                         files: Vec::new(),
                         hue,
+                        mtime,
                     },
                 );
             }
@@ -95,13 +106,20 @@ impl DirTree {
         self.propagate_size(id, size);
     }
 
-    pub fn insert_file(&mut self, parent: u64, name: &str, size: u64) {
+    pub fn insert_file(&mut self, parent: u64, name: &str, size: u64, mtime: i64) {
         let hue = self.cached_extension_hue(name);
+
+        if mtime > 0 {
+            self.mtime_range.0 = self.mtime_range.0.min(mtime);
+            self.mtime_range.1 = self.mtime_range.1.max(mtime);
+        }
+
         let node = self.nodes.entry(parent).or_default();
         node.files.push(FileEntry {
-            name: name.to_string(),
+            name: name.into(),
             size,
             hue,
+            mtime,
         });
     }
 
@@ -129,11 +147,10 @@ impl DirTree {
         }
     }
 
-    pub fn recompute_sizes(&mut self) {
-        self.recursive_sizes.clear();
+    fn bottom_up_order(&self) -> Vec<u64> {
         let root_id = match self.root_id {
             Some(id) => id,
-            None => return,
+            None => return Vec::new(),
         };
         let mut stack = vec![root_id];
         let mut order = Vec::with_capacity(self.nodes.len());
@@ -145,6 +162,12 @@ impl DirTree {
                 }
             }
         }
+        order
+    }
+
+    pub fn recompute_sizes(&mut self) {
+        self.recursive_sizes.clear();
+        let order = self.bottom_up_order();
         for &id in order.iter().rev() {
             if let Some(node) = self.nodes.get(&id) {
                 let mut total = node.direct_size;
@@ -154,6 +177,26 @@ impl DirTree {
                 self.recursive_sizes.insert(id, total);
             }
         }
+    }
+
+    pub fn compute_filtered_sizes(&self, filter: &FilterConfig) -> HashMap<u64, u64> {
+        let order = self.bottom_up_order();
+        let mut sizes = HashMap::with_capacity(order.len());
+        for &id in order.iter().rev() {
+            if let Some(node) = self.nodes.get(&id) {
+                let mut total: u64 = 0;
+                for f in &node.files {
+                    if filter.matches_file(&f.name, f.size) {
+                        total += f.size;
+                    }
+                }
+                for &child in &node.children {
+                    total += sizes.get(&child).copied().unwrap_or(0);
+                }
+                sizes.insert(id, total);
+            }
+        }
+        sizes
     }
 
     pub fn breadcrumb(&self, view_root: u64) -> Vec<BreadcrumbEntry> {
@@ -226,6 +269,60 @@ fn hue_for_ext(ext: &str) -> u16 {
     }
 }
 
+pub fn age_hue(mtime: i64, min_t: i64, max_t: i64) -> u16 {
+    if max_t <= min_t || mtime <= 0 {
+        return 60; // neutral yellow
+    }
+    let t = ((mtime - min_t) as f64) / ((max_t - min_t) as f64);
+    // newest (t=1) → green(120), oldest (t=0) → red(0)
+    (t * 120.0) as u16
+}
+
+pub const COLOR_MODE_AGE: u8 = 1;
+
+#[derive(Clone, Default)]
+pub struct FilterConfig {
+    pub extensions: Vec<Box<str>>,
+    pub min_size: u64,
+    pub max_size: u64,
+    pub name_pattern: String,
+}
+
+impl FilterConfig {
+    pub fn is_active(&self) -> bool {
+        !self.extensions.is_empty() || self.min_size > 0 || self.max_size > 0 || !self.name_pattern.is_empty()
+    }
+
+    pub fn matches_file(&self, name: &str, size: u64) -> bool {
+        if self.min_size > 0 && size < self.min_size {
+            return false;
+        }
+        if self.max_size > 0 && size > self.max_size {
+            return false;
+        }
+        if !self.name_pattern.is_empty() {
+            let pat = self.name_pattern.as_bytes();
+            if !name.as_bytes().windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat)) {
+                return false;
+            }
+        }
+        if !self.extensions.is_empty() {
+            let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+            if !self.extensions.iter().any(|e| e.as_ref().eq_ignore_ascii_case(ext)) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+pub struct LayoutConfig {
+    pub max_depth: u8,
+    pub color_mode: u8,
+    pub filter: FilterConfig,
+    pub mtime_range: (i64, i64),
+}
+
 pub struct LayoutRect {
     pub id: i64,
     pub parent_id: u64,
@@ -241,6 +338,7 @@ pub struct LayoutRect {
     pub header_h: f64,
     pub is_files: bool,
     pub is_file: bool,
+    pub mtime: i64,
 }
 
 #[derive(Clone)]
@@ -249,12 +347,28 @@ pub struct BreadcrumbEntry {
     pub name: String,
 }
 
-pub fn compute_layout(tree: &DirTree, view_root: u64, canvas_w: f64, canvas_h: f64) -> Vec<LayoutRect> {
+pub fn compute_layout(
+    tree: &DirTree,
+    view_root: u64,
+    canvas_w: f64,
+    canvas_h: f64,
+    config: &LayoutConfig,
+) -> Vec<LayoutRect> {
+    let filtered;
+    let sizes = if config.filter.is_active() {
+        filtered = tree.compute_filtered_sizes(&config.filter);
+        &filtered
+    } else {
+        &tree.recursive_sizes
+    };
+
     let pad = NEST_PAD;
     let mut out = Vec::new();
     let mut file_id = -1i64;
     layout_node(
         tree,
+        sizes,
+        config,
         view_root,
         pad,
         pad,
@@ -276,6 +390,7 @@ enum ItemKind<'a> {
         hue: u16,
         parent_id: u64,
         size: u64,
+        mtime: i64,
     },
     Aggregate {
         hue: u16,
@@ -286,6 +401,8 @@ enum ItemKind<'a> {
 #[allow(clippy::too_many_arguments)]
 fn layout_node(
     tree: &DirTree,
+    sizes: &HashMap<u64, u64>,
+    config: &LayoutConfig,
     node_id: u64,
     x: f64,
     y: f64,
@@ -311,7 +428,6 @@ fn layout_node(
         return;
     }
 
-    // Build items: child directories + individual files + residual aggregate
     struct LayoutItem<'a> {
         id: i64,
         size: f64,
@@ -319,9 +435,10 @@ fn layout_node(
     }
 
     let mut layout_items: Vec<LayoutItem<'_>> = Vec::new();
+    let filtering = config.filter.is_active();
 
     for &child_id in &node.children {
-        let s = tree.recursive_sizes.get(&child_id).copied().unwrap_or(0);
+        let s = sizes.get(&child_id).copied().unwrap_or(0);
         if s > 0 {
             layout_items.push(LayoutItem {
                 id: child_id as i64,
@@ -331,7 +448,7 @@ fn layout_node(
         }
     }
 
-    let total_size = tree.recursive_sizes.get(&node_id).copied().unwrap_or(1) as f64;
+    let total_size = sizes.get(&node_id).copied().unwrap_or(1) as f64;
     let area = cw * ch;
     let min_file_size = if area > 0.0 && total_size > 0.0 {
         (4.0 / area) * total_size
@@ -342,6 +459,9 @@ fn layout_node(
     let mut residual: u64 = 0;
     for f in &node.files {
         if f.size == 0 {
+            continue;
+        }
+        if filtering && !config.filter.matches_file(&f.name, f.size) {
             continue;
         }
         if (f.size as f64) >= min_file_size {
@@ -355,6 +475,7 @@ fn layout_node(
                     hue: f.hue,
                     parent_id: node_id,
                     size: f.size,
+                    mtime: f.mtime,
                 },
             });
         } else {
@@ -385,15 +506,22 @@ fn layout_node(
     let mut rects = Vec::new();
     squarify(&squarify_items, cx, cy, cw, ch, &mut rects);
 
+    let (min_t, max_t) = config.mtime_range;
+
     for (raw, item) in rects.iter().zip(layout_items.iter()) {
         match &item.kind {
             ItemKind::Dir { child_id } => {
                 let cn = tree.nodes.get(child_id);
                 let name = cn.map_or_else(|| "?".to_string(), |n| n.name.clone());
-                let hue = cn.map_or(0, |n| n.hue);
-                let size = tree.recursive_sizes.get(child_id).copied().unwrap_or(0);
+                let mut hue = cn.map_or(0, |n| n.hue);
+                let size = sizes.get(child_id).copied().unwrap_or(0);
+                let mtime = cn.map_or(0, |n| n.mtime);
 
-                let can_nest = depth < MAX_NEST_DEPTH
+                if config.color_mode == COLOR_MODE_AGE {
+                    hue = age_hue(mtime, min_t, max_t);
+                }
+
+                let can_nest = depth < config.max_depth
                     && raw.w >= MIN_NEST_PX
                     && raw.h >= MIN_NEST_PX
                     && cn.is_some_and(|n| !n.children.is_empty());
@@ -418,9 +546,22 @@ fn layout_node(
                     header_h: hdr_h,
                     is_files: false,
                     is_file: false,
+                    mtime,
                 });
                 if can_nest {
-                    layout_node(tree, *child_id, raw.x, raw.y, raw.w, raw.h, depth + 1, out, file_id);
+                    layout_node(
+                        tree,
+                        sizes,
+                        config,
+                        *child_id,
+                        raw.x,
+                        raw.y,
+                        raw.w,
+                        raw.h,
+                        depth + 1,
+                        out,
+                        file_id,
+                    );
                 }
             }
             ItemKind::File {
@@ -428,7 +569,13 @@ fn layout_node(
                 hue,
                 parent_id,
                 size,
+                mtime,
             } => {
+                let final_hue = if config.color_mode == COLOR_MODE_AGE {
+                    age_hue(*mtime, min_t, max_t)
+                } else {
+                    *hue
+                };
                 out.push(LayoutRect {
                     id: raw.id,
                     parent_id: *parent_id,
@@ -437,13 +584,14 @@ fn layout_node(
                     w: raw.w,
                     h: raw.h,
                     name: name.to_string(),
-                    hue: *hue,
+                    hue: final_hue,
                     size: *size,
                     depth,
                     is_container: false,
                     header_h: 0.0,
                     is_files: false,
                     is_file: true,
+                    mtime: *mtime,
                 });
             }
             ItemKind::Aggregate { hue, parent_id } => {
@@ -462,6 +610,7 @@ fn layout_node(
                     header_h: 0.0,
                     is_files: true,
                     is_file: false,
+                    mtime: 0,
                 });
             }
         }

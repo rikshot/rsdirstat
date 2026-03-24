@@ -22,6 +22,7 @@ static SCAN_ATTRS: libc::attrlist = libc::attrlist {
         | libc::ATTR_CMN_NAME
         | libc::ATTR_CMN_DEVID
         | libc::ATTR_CMN_OBJTYPE
+        | libc::ATTR_CMN_MODTIME
         | libc::ATTR_CMN_FILEID,
     volattr: 0,
     dirattr: 0,
@@ -53,11 +54,13 @@ pub enum ScanEvent {
         parent: u64,
         name: String,
         size: u64,
+        mtime: i64,
     },
     File {
         parent: u64,
         name: String,
         size: u64,
+        mtime: i64,
     },
     ScanDone,
 }
@@ -454,6 +457,7 @@ fn scan_directory(
 ) {
     let mut new_work = Vec::new();
     let mut dir_total: u64 = 0;
+    let mut dir_mtime: i64 = 0;
 
     loop {
         let count = unsafe {
@@ -512,7 +516,7 @@ fn scan_directory(
                                         path: if dir_path.is_empty() {
                                             String::new()
                                         } else {
-                                            format!("{dir_path}/{}", parsed.name)
+                                            format!("{}/{}", dir_path.trim_end_matches('/'), parsed.name)
                                         },
                                     });
                                 }
@@ -523,6 +527,7 @@ fn scan_directory(
                     }
                     VREG => {
                         dir_total += parsed.file_size;
+                        dir_mtime = dir_mtime.max(parsed.mtime);
                         if collect_files {
                             result
                                 .file_entries
@@ -535,6 +540,7 @@ fn scan_directory(
                                 parent: dir_file_id,
                                 name: parsed.name.to_string(),
                                 size: parsed.file_size,
+                                mtime: parsed.mtime,
                             });
                         }
                     }
@@ -556,6 +562,7 @@ fn scan_directory(
             parent: parent_id,
             name: dir_name.to_string(),
             size: dir_total,
+            mtime: dir_mtime,
         });
     }
 
@@ -568,6 +575,7 @@ struct ParsedEntry<'a> {
     obj_type: u32,
     file_id: u64,
     file_size: u64,
+    mtime: i64,
 }
 
 fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
@@ -597,6 +605,12 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
     let obj_type = u32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
     pos += 4;
 
+    if pos + 16 > entry.len() {
+        return None;
+    }
+    let mtime = i64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
+    pos += 16; // tv_sec(8) + tv_nsec(8)
+
     if pos + 8 > entry.len() {
         return None;
     }
@@ -621,6 +635,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
         obj_type,
         file_id,
         file_size,
+        mtime,
     })
 }
 
