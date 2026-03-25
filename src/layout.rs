@@ -1,15 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const NEST_PAD: f64 = 2.0;
 const NEST_HEADER: f64 = 18.0;
 const MIN_NEST_PX: f64 = 40.0;
 
-fn header_height(w: f64, h: f64) -> f64 {
-    if w > 60.0 && h > 30.0 {
-        let hdr = (h * 0.15).floor().min(NEST_HEADER);
-        if hdr >= 12.0 {
-            return hdr;
+fn header_height(width: f64, height: f64) -> f64 {
+    if width > 60.0 && height > 30.0 {
+        let header = (height * 0.15).floor().min(NEST_HEADER);
+        if header >= 12.0 {
+            return header;
         }
     }
     0.0
@@ -25,7 +24,7 @@ pub struct FileEntry {
 #[derive(Default)]
 pub struct DirNode {
     pub parent: u64,
-    pub name: String,
+    pub name: Box<str>,
     pub direct_size: u64,
     pub children: Vec<u64>,
     pub files: Vec<FileEntry>,
@@ -70,8 +69,8 @@ impl DirTree {
                 self.root_id = Some(id);
             }
         } else {
-            let pn = self.nodes.entry(parent).or_default();
-            pn.children.push(id);
+            let parent_node = self.nodes.entry(parent).or_default();
+            parent_node.children.push(id);
         }
 
         if mtime > 0 {
@@ -82,7 +81,7 @@ impl DirTree {
         match self.nodes.get_mut(&id) {
             Some(existing) => {
                 existing.parent = parent;
-                existing.name = name.to_string();
+                existing.name = name.into();
                 existing.direct_size = size;
                 existing.hue = hue;
                 existing.mtime = mtime;
@@ -92,7 +91,7 @@ impl DirTree {
                     id,
                     DirNode {
                         parent,
-                        name: name.to_string(),
+                        name: name.into(),
                         direct_size: size,
                         children: Vec::new(),
                         files: Vec::new(),
@@ -124,24 +123,24 @@ impl DirTree {
     }
 
     fn cached_extension_hue(&mut self, name: &str) -> u16 {
-        let ext = match name.rsplit_once('.') {
+        let extension = match name.rsplit_once('.') {
             Some((_, e)) if !e.is_empty() && e.len() <= 10 => e,
             _ => return 0,
         };
-        if let Some(&h) = self.hue_cache.get(ext) {
-            return h;
+        if let Some(&cached) = self.hue_cache.get(extension) {
+            return cached;
         }
-        let h = hue_for_ext(ext);
-        self.hue_cache.insert(ext.into(), h);
-        h
+        let hue = hue_for_extension(extension);
+        self.hue_cache.insert(extension.into(), hue);
+        hue
     }
 
     fn propagate_size(&mut self, node_id: u64, delta: u64) {
-        let mut cur = node_id;
+        let mut current = node_id;
         loop {
-            *self.recursive_sizes.entry(cur).or_insert(0) += delta;
-            match self.nodes.get(&cur) {
-                Some(n) if n.parent != 0 => cur = n.parent,
+            *self.recursive_sizes.entry(current).or_insert(0) += delta;
+            match self.nodes.get(&current) {
+                Some(node) if node.parent != 0 => current = node.parent,
                 _ => break,
             }
         }
@@ -185,9 +184,9 @@ impl DirTree {
         for &id in order.iter().rev() {
             if let Some(node) = self.nodes.get(&id) {
                 let mut total: u64 = 0;
-                for f in &node.files {
-                    if filter.matches_file(&f.name, f.size) {
-                        total += f.size;
+                for file in &node.files {
+                    if filter.matches_file(&file.name, file.size) {
+                        total += file.size;
                     }
                 }
                 for &child in &node.children {
@@ -202,18 +201,18 @@ impl DirTree {
     pub fn breadcrumb(&self, view_root: u64) -> Vec<BreadcrumbEntry> {
         let root_id = self.root_id.unwrap_or(0);
         let mut path = Vec::new();
-        let mut cur = view_root;
-        while let Some(node) = self.nodes.get(&cur) {
+        let mut current = view_root;
+        while let Some(node) = self.nodes.get(&current) {
             let name = if node.name.is_empty() {
                 self.scan_path.clone()
             } else {
-                node.name.clone()
+                node.name.to_string()
             };
-            path.push(BreadcrumbEntry { id: cur, name });
-            if cur == root_id || node.parent == 0 {
+            path.push(BreadcrumbEntry { id: current, name });
+            if current == root_id || node.parent == 0 {
                 break;
             }
-            cur = node.parent;
+            current = node.parent;
         }
         path.reverse();
         path
@@ -222,17 +221,17 @@ impl DirTree {
     pub fn full_path(&self, node_id: u64, root_path: &Path) -> Option<PathBuf> {
         let root_id = self.root_id?;
         let mut parts: Vec<&str> = Vec::new();
-        let mut cur = node_id;
+        let mut current = node_id;
         loop {
-            if cur == root_id {
+            if current == root_id {
                 break;
             }
-            let node = self.nodes.get(&cur)?;
+            let node = self.nodes.get(&current)?;
             parts.push(&node.name);
             if node.parent == 0 {
                 break;
             }
-            cur = node.parent;
+            current = node.parent;
         }
         parts.reverse();
         let mut path = root_path.to_path_buf();
@@ -245,19 +244,19 @@ impl DirTree {
 
 /// Hash a name to a hue (0-359) using UTF-16 code units.
 pub fn hash_name(name: &str) -> u16 {
-    let mut h: i32 = 0;
-    for c in name.encode_utf16() {
-        h = h.wrapping_shl(5).wrapping_sub(h).wrapping_add(c as i32);
+    let mut hash: i32 = 0;
+    for code_unit in name.encode_utf16() {
+        hash = hash.wrapping_shl(5).wrapping_sub(hash).wrapping_add(code_unit as i32);
     }
-    h.rem_euclid(360) as u16
+    hash.rem_euclid(360) as u16
 }
 
 fn hash_id_to_hue(id: u64) -> u16 {
     ((id.wrapping_mul(2654435761) >> 16) % 360) as u16
 }
 
-fn hue_for_ext(ext: &str) -> u16 {
-    let mime = mime_guess::from_ext(ext).first_or(mime::APPLICATION_OCTET_STREAM);
+fn hue_for_extension(extension: &str) -> u16 {
+    let mime = mime_guess::from_ext(extension).first_or(mime::APPLICATION_OCTET_STREAM);
     match mime.type_().as_str() {
         "video" => 220,     // blue
         "audio" => 280,     // purple
@@ -265,17 +264,17 @@ fn hue_for_ext(ext: &str) -> u16 {
         "text" => 55,       // yellow
         "font" => 310,      // pink
         "application" => 5, // red
-        _ => hash_name(ext),
+        _ => hash_name(extension),
     }
 }
 
-pub fn age_hue(mtime: i64, min_t: i64, max_t: i64) -> u16 {
-    if max_t <= min_t || mtime <= 0 {
+pub fn age_hue(mtime: i64, min_time: i64, max_time: i64) -> u16 {
+    if max_time <= min_time || mtime <= 0 {
         return 60; // neutral yellow
     }
-    let t = ((mtime - min_t) as f64) / ((max_t - min_t) as f64);
-    // newest (t=1) → green(120), oldest (t=0) → red(0)
-    (t * 120.0) as u16
+    let ratio = ((mtime - min_time) as f64) / ((max_time - min_time) as f64);
+    // newest (ratio=1) → green(120), oldest (ratio=0) → red(0)
+    (ratio * 120.0) as u16
 }
 
 pub const COLOR_MODE_AGE: u8 = 1;
@@ -301,14 +300,22 @@ impl FilterConfig {
             return false;
         }
         if !self.name_pattern.is_empty() {
-            let pat = self.name_pattern.as_bytes();
-            if !name.as_bytes().windows(pat.len()).any(|w| w.eq_ignore_ascii_case(pat)) {
+            let pattern = self.name_pattern.as_bytes();
+            if !name
+                .as_bytes()
+                .windows(pattern.len())
+                .any(|window| window.eq_ignore_ascii_case(pattern))
+            {
                 return false;
             }
         }
         if !self.extensions.is_empty() {
-            let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-            if !self.extensions.iter().any(|e| e.as_ref().eq_ignore_ascii_case(ext)) {
+            let extension = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+            if !self
+                .extensions
+                .iter()
+                .any(|e| e.as_ref().eq_ignore_ascii_case(extension))
+            {
                 return false;
             }
         }
@@ -335,7 +342,7 @@ pub struct LayoutRect {
     pub size: u64,
     pub depth: u8,
     pub is_container: bool,
-    pub header_h: f64,
+    pub header_height: f64,
     pub is_files: bool,
     pub is_file: bool,
     pub mtime: i64,
@@ -362,7 +369,6 @@ pub fn compute_layout(
         &tree.recursive_sizes
     };
 
-    let pad = NEST_PAD;
     let mut out = Vec::new();
     let mut file_id = -1i64;
     layout_node(
@@ -370,10 +376,10 @@ pub fn compute_layout(
         sizes,
         config,
         view_root,
-        pad,
-        pad,
-        canvas_w - pad * 2.0,
-        canvas_h - pad * 2.0,
+        0.0,
+        0.0,
+        canvas_w,
+        canvas_h,
         0,
         &mut out,
         &mut file_id,
@@ -413,18 +419,17 @@ fn layout_node(
     file_id: &mut i64,
 ) {
     let node = match tree.nodes.get(&node_id) {
-        Some(n) => n,
+        Some(node) => node,
         None => return,
     };
 
-    let pad = if depth > 0 { NEST_PAD } else { 0.0 };
-    let hdr = if depth > 0 { header_height(w, h) } else { 0.0 };
+    let header = if depth > 0 { header_height(w, h) } else { 0.0 };
 
-    let cx = x + pad;
-    let cy = y + hdr;
-    let cw = (w - pad * 2.0).max(0.0);
-    let ch = (h - hdr - pad).max(0.0);
-    if cw < 2.0 || ch < 2.0 {
+    let content_x = x;
+    let content_y = y + header;
+    let content_w = w;
+    let content_h = (h - header).max(0.0);
+    if content_w < 2.0 || content_h < 2.0 {
         return;
     }
 
@@ -438,18 +443,18 @@ fn layout_node(
     let filtering = config.filter.is_active();
 
     for &child_id in &node.children {
-        let s = sizes.get(&child_id).copied().unwrap_or(0);
-        if s > 0 {
+        let child_size = sizes.get(&child_id).copied().unwrap_or(0);
+        if child_size > 0 {
             layout_items.push(LayoutItem {
                 id: child_id as i64,
-                size: s as f64,
+                size: child_size as f64,
                 kind: ItemKind::Dir { child_id },
             });
         }
     }
 
     let total_size = sizes.get(&node_id).copied().unwrap_or(1) as f64;
-    let area = cw * ch;
+    let area = content_w * content_h;
     let min_file_size = if area > 0.0 && total_size > 0.0 {
         (4.0 / area) * total_size
     } else {
@@ -457,29 +462,29 @@ fn layout_node(
     };
 
     let mut residual: u64 = 0;
-    for f in &node.files {
-        if f.size == 0 {
+    for file in &node.files {
+        if file.size == 0 {
             continue;
         }
-        if filtering && !config.filter.matches_file(&f.name, f.size) {
+        if filtering && !config.filter.matches_file(&file.name, file.size) {
             continue;
         }
-        if (f.size as f64) >= min_file_size {
+        if (file.size as f64) >= min_file_size {
             let id = *file_id;
             *file_id -= 1;
             layout_items.push(LayoutItem {
                 id,
-                size: f.size as f64,
+                size: file.size as f64,
                 kind: ItemKind::File {
-                    name: &f.name,
-                    hue: f.hue,
+                    name: &file.name,
+                    hue: file.hue,
                     parent_id: node_id,
-                    size: f.size,
-                    mtime: f.mtime,
+                    size: file.size,
+                    mtime: file.mtime,
                 },
             });
         } else {
-            residual += f.size;
+            residual += file.size;
         }
     }
 
@@ -502,31 +507,31 @@ fn layout_node(
     }
     layout_items.sort_unstable_by(|a, b| b.size.partial_cmp(&a.size).unwrap());
 
-    let squarify_items: Vec<(i64, f64)> = layout_items.iter().map(|i| (i.id, i.size)).collect();
+    let squarify_items: Vec<(i64, f64)> = layout_items.iter().map(|item| (item.id, item.size)).collect();
     let mut rects = Vec::new();
-    squarify(&squarify_items, cx, cy, cw, ch, &mut rects);
+    squarify(&squarify_items, content_x, content_y, content_w, content_h, &mut rects);
 
-    let (min_t, max_t) = config.mtime_range;
+    let (min_time, max_time) = config.mtime_range;
 
     for (raw, item) in rects.iter().zip(layout_items.iter()) {
         match &item.kind {
             ItemKind::Dir { child_id } => {
-                let cn = tree.nodes.get(child_id);
-                let name = cn.map_or_else(|| "?".to_string(), |n| n.name.clone());
-                let mut hue = cn.map_or(0, |n| n.hue);
+                let child_node = tree.nodes.get(child_id);
+                let name = child_node.map_or_else(|| "?".to_string(), |node| node.name.to_string());
+                let mut hue = child_node.map_or(0, |node| node.hue);
                 let size = sizes.get(child_id).copied().unwrap_or(0);
-                let mtime = cn.map_or(0, |n| n.mtime);
+                let mtime = child_node.map_or(0, |node| node.mtime);
 
                 if config.color_mode == COLOR_MODE_AGE {
-                    hue = age_hue(mtime, min_t, max_t);
+                    hue = age_hue(mtime, min_time, max_time);
                 }
 
                 let can_nest = depth < config.max_depth
                     && raw.w >= MIN_NEST_PX
                     && raw.h >= MIN_NEST_PX
-                    && cn.is_some_and(|n| !n.children.is_empty());
+                    && child_node.is_some_and(|node| !node.children.is_empty());
 
-                let (is_container, hdr_h) = if can_nest {
+                let (is_container, header_height_value) = if can_nest {
                     (true, header_height(raw.w, raw.h))
                 } else {
                     (false, 0.0)
@@ -543,7 +548,7 @@ fn layout_node(
                     size,
                     depth,
                     is_container,
-                    header_h: hdr_h,
+                    header_height: header_height_value,
                     is_files: false,
                     is_file: false,
                     mtime,
@@ -572,7 +577,7 @@ fn layout_node(
                 mtime,
             } => {
                 let final_hue = if config.color_mode == COLOR_MODE_AGE {
-                    age_hue(*mtime, min_t, max_t)
+                    age_hue(*mtime, min_time, max_time)
                 } else {
                     *hue
                 };
@@ -588,7 +593,7 @@ fn layout_node(
                     size: *size,
                     depth,
                     is_container: false,
-                    header_h: 0.0,
+                    header_height: 0.0,
                     is_files: false,
                     is_file: true,
                     mtime: *mtime,
@@ -607,7 +612,7 @@ fn layout_node(
                     size: residual,
                     depth,
                     is_container: false,
-                    header_h: 0.0,
+                    header_height: 0.0,
                     is_files: true,
                     is_file: false,
                     mtime: 0,
@@ -629,7 +634,7 @@ fn squarify(items: &[(i64, f64)], x: f64, y: f64, w: f64, h: f64, out: &mut Vec<
     if items.is_empty() || w <= 0.0 || h <= 0.0 {
         return;
     }
-    let total: f64 = items.iter().map(|i| i.1).sum();
+    let total: f64 = items.iter().map(|item| item.1).sum();
     if total <= 0.0 {
         return;
     }
@@ -683,17 +688,17 @@ fn squarify_slice(
         let worst = {
             let first = (items[lo].1 * scale) / test_len;
             let last = (items[i].1 * scale) / test_len;
-            let ar_first = if first > 0.0 {
+            let aspect_ratio_first = if first > 0.0 {
                 (test_len / first).max(first / test_len)
             } else {
                 0.0
             };
-            let ar_last = if last > 0.0 {
+            let aspect_ratio_last = if last > 0.0 {
                 (test_len / last).max(last / test_len)
             } else {
                 0.0
             };
-            ar_first.max(ar_last)
+            aspect_ratio_first.max(aspect_ratio_last)
         };
 
         if worst <= best_worst {
@@ -713,40 +718,40 @@ fn squarify_slice(
     let row_items = &items[lo..split];
     if vertical {
         let row_w = w * row_frac;
-        let mut cy = y;
+        let mut current_y = y;
         for (i, item) in row_items.iter().enumerate() {
             let item_h = if i == row_items.len() - 1 {
-                y + h - cy
+                y + h - current_y
             } else {
                 (item.1 / row_area) * h
             };
             out.push(RawRect {
                 id: item.0,
                 x,
-                y: cy,
+                y: current_y,
                 w: row_w,
                 h: item_h,
             });
-            cy += item_h;
+            current_y += item_h;
         }
         squarify_slice(items, split, hi, x + row_w, y, w - row_w, h, area_left - row_area, out);
     } else {
         let row_h = h * row_frac;
-        let mut cx = x;
+        let mut current_x = x;
         for (i, item) in row_items.iter().enumerate() {
             let item_w = if i == row_items.len() - 1 {
-                x + w - cx
+                x + w - current_x
             } else {
                 (item.1 / row_area) * w
             };
             out.push(RawRect {
                 id: item.0,
-                x: cx,
+                x: current_x,
                 y,
                 w: item_w,
                 h: row_h,
             });
-            cx += item_w;
+            current_x += item_w;
         }
         squarify_slice(items, split, hi, x, y + row_h, w, h - row_h, area_left - row_area, out);
     }

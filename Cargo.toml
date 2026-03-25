@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
-dashmap = "6"
+dashmap = { version = "6", features = ["inline"] }
 humansize = "2"
 libc = "0.2"
 mime = "0.3"
@@ -15,7 +15,7 @@ mime_guess = "2"
 mimalloc = "0.1"
 open = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "parking_lot"] }
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs", "compression-gzip"] }
 
 [profile.release]
 opt-level = 3

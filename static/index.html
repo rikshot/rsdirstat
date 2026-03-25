@@ -5,6 +5,13 @@
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>rsdirstat</title>
         <link rel="stylesheet" href="/main.css" />
+        <link rel="modulepreload" href="/main.js" />
+        <link rel="modulepreload" href="/protocol.js" />
+        <link rel="modulepreload" href="/util.js" />
+        <link rel="modulepreload" href="/render.js" />
+        <link rel="modulepreload" href="/parser.js" />
+        <link rel="modulepreload" href="/events.js" />
+        <link rel="modulepreload" href="/toolbar.js" />
     </head>
     <body>
         <div id="breadcrumb-bar">
@@ -13,7 +20,7 @@
         </div>
         <div id="toolbar">
             <label>Depth</label>
-            <select id="tb-depth">
+            <select id="depth">
                 <option>1</option>
                 <option>2</option>
                 <option>3</option>
@@ -25,28 +32,28 @@
                 <option>9</option>
                 <option>10</option>
             </select>
-            <span class="sep">|</span>
+            <span class="separator">|</span>
             <label>Color</label>
-            <select id="tb-color">
+            <select id="color-mode">
                 <option value="0">Type</option>
                 <option value="1">Age</option>
             </select>
-            <span class="sep">|</span>
+            <span class="separator">|</span>
             <label>Filter ext</label>
-            <input type="text" id="tb-filter-ext" placeholder="e.g. mp4,jpg" />
+            <input type="text" id="filter-ext" placeholder="e.g. mp4,jpg" />
             <label>Name</label>
-            <input type="text" id="tb-filter-name" placeholder="search..." />
+            <input type="text" id="filter-name" placeholder="search..." />
             <label>Min</label>
-            <input type="number" id="tb-filter-min" placeholder="0" min="0" />
-            <select id="tb-filter-min-unit">
+            <input type="number" id="filter-min" placeholder="0" min="0" />
+            <select id="filter-min-unit">
                 <option value="1">B</option>
                 <option value="1024">KiB</option>
                 <option value="1048576" selected>MiB</option>
                 <option value="1073741824">GiB</option>
             </select>
-            <button id="tb-filter-clear">Clear</button>
-            <span class="sep">|</span>
-            <button id="tb-rescan" style="display: none">Rescan</button>
+            <button id="filter-clear">Clear</button>
+            <span class="separator">|</span>
+            <button id="rescan" style="display: none">Rescan</button>
         </div>
         <canvas id="treemap"></canvas>
         <div id="path-bar">
@@ -54,10 +61,10 @@
             <span id="path-size"></span>
         </div>
         <div id="tooltip">
-            <div class="tt-name"></div>
-            <div class="tt-size"></div>
-            <div class="tt-pct"></div>
-            <div class="tt-mtime"></div>
+            <div class="tip-name"></div>
+            <div class="tip-size"></div>
+            <div class="tip-percent"></div>
+            <div class="tip-mtime"></div>
         </div>
         <script type="module" src="/main.js"></script>
     </body>

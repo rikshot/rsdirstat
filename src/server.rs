@@ -8,6 +8,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::routing::get;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, broadcast};
+use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
 
 use crate::{layout, scan};
@@ -35,12 +36,12 @@ struct ServerState {
 }
 
 fn encode_scan_start(path: &str) -> Vec<u8> {
-    let pb = path.as_bytes();
-    let mut buf = Vec::with_capacity(3 + pb.len());
-    buf.push(MSG_SCAN_START);
-    buf.extend_from_slice(&(pb.len() as u16).to_le_bytes());
-    buf.extend_from_slice(pb);
-    buf
+    let path_bytes = path.as_bytes();
+    let mut buffer = Vec::with_capacity(3 + path_bytes.len());
+    buffer.push(MSG_SCAN_START);
+    buffer.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+    buffer.extend_from_slice(path_bytes);
+    buffer
 }
 
 fn encode_layout(
@@ -51,38 +52,38 @@ fn encode_layout(
     breadcrumb: &[layout::BreadcrumbEntry],
     rects: &[layout::LayoutRect],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(32 + breadcrumb.len() * 20 + rects.len() * 68);
-    buf.push(MSG_LAYOUT);
-    buf.extend_from_slice(&view_root.to_le_bytes());
-    buf.extend_from_slice(&root_size.to_le_bytes());
-    buf.extend_from_slice(&dir_count.to_le_bytes());
-    buf.push(scan_done as u8);
-    buf.extend_from_slice(&(breadcrumb.len() as u16).to_le_bytes());
-    for bc in breadcrumb {
-        buf.extend_from_slice(&bc.id.to_le_bytes());
-        let nb = bc.name.as_bytes();
-        buf.extend_from_slice(&(nb.len() as u16).to_le_bytes());
-        buf.extend_from_slice(nb);
+    let mut buffer = Vec::with_capacity(32 + breadcrumb.len() * 20 + rects.len() * 68);
+    buffer.push(MSG_LAYOUT);
+    buffer.extend_from_slice(&view_root.to_le_bytes());
+    buffer.extend_from_slice(&root_size.to_le_bytes());
+    buffer.extend_from_slice(&dir_count.to_le_bytes());
+    buffer.push(scan_done as u8);
+    buffer.extend_from_slice(&(breadcrumb.len() as u16).to_le_bytes());
+    for entry in breadcrumb {
+        buffer.extend_from_slice(&entry.id.to_le_bytes());
+        let name_bytes = entry.name.as_bytes();
+        buffer.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buffer.extend_from_slice(name_bytes);
     }
-    buf.extend_from_slice(&(rects.len() as u32).to_le_bytes());
-    for r in rects {
-        buf.extend_from_slice(&r.id.to_le_bytes());
-        buf.extend_from_slice(&r.parent_id.to_le_bytes());
-        buf.extend_from_slice(&(r.x as f32).to_le_bytes());
-        buf.extend_from_slice(&(r.y as f32).to_le_bytes());
-        buf.extend_from_slice(&(r.w as f32).to_le_bytes());
-        buf.extend_from_slice(&(r.h as f32).to_le_bytes());
-        buf.extend_from_slice(&r.hue.to_le_bytes());
-        buf.extend_from_slice(&r.size.to_le_bytes());
-        buf.push(r.depth);
-        buf.push((r.is_container as u8) | ((r.is_files as u8) << 1) | ((r.is_file as u8) << 2));
-        buf.extend_from_slice(&(r.header_h as f32).to_le_bytes());
-        buf.extend_from_slice(&r.mtime.to_le_bytes());
-        let nb = r.name.as_bytes();
-        buf.extend_from_slice(&(nb.len() as u16).to_le_bytes());
-        buf.extend_from_slice(nb);
+    buffer.extend_from_slice(&(rects.len() as u32).to_le_bytes());
+    for rect in rects {
+        buffer.extend_from_slice(&rect.id.to_le_bytes());
+        buffer.extend_from_slice(&rect.parent_id.to_le_bytes());
+        buffer.extend_from_slice(&(rect.x as f32).to_le_bytes());
+        buffer.extend_from_slice(&(rect.y as f32).to_le_bytes());
+        buffer.extend_from_slice(&(rect.w as f32).to_le_bytes());
+        buffer.extend_from_slice(&(rect.h as f32).to_le_bytes());
+        buffer.extend_from_slice(&rect.hue.to_le_bytes());
+        buffer.extend_from_slice(&rect.size.to_le_bytes());
+        buffer.push(rect.depth);
+        buffer.push((rect.is_container as u8) | ((rect.is_files as u8) << 1) | ((rect.is_file as u8) << 2));
+        buffer.extend_from_slice(&(rect.header_height as f32).to_le_bytes());
+        buffer.extend_from_slice(&rect.mtime.to_le_bytes());
+        let name_bytes = rect.name.as_bytes();
+        buffer.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buffer.extend_from_slice(name_bytes);
     }
-    buf
+    buffer
 }
 
 pub async fn run_streaming(
@@ -132,27 +133,27 @@ pub async fn run_streaming(
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {},
             }
 
-            let cur_version = layout_state.tree_version.load(Ordering::Relaxed);
+            let current_version = layout_state.tree_version.load(Ordering::Relaxed);
             let scan_done = layout_state.scan_done.load(Ordering::Relaxed);
 
-            if cur_version == last_version || layout_state.connections.load(Ordering::Relaxed) == 0 {
+            if current_version == last_version || layout_state.connections.load(Ordering::Relaxed) == 0 {
                 continue;
             }
             if !scan_done && last_compute.elapsed() < Duration::from_millis(45) {
                 continue;
             }
 
-            let (vw, vh) = *layout_state.viewport.lock().unwrap();
-            if vw <= 0.0 || vh <= 0.0 {
+            let (viewport_width, viewport_height) = *layout_state.viewport.lock().unwrap();
+            if viewport_width <= 0.0 || viewport_height <= 0.0 {
                 continue;
             }
 
             let max_depth = layout_state.max_depth.load(Ordering::Relaxed);
             let color_mode = layout_state.color_mode.load(Ordering::Relaxed);
             let filter = {
-                let f = layout_state.filter.lock().unwrap();
-                if f.is_active() {
-                    f.clone()
+                let active_filter = layout_state.filter.lock().unwrap();
+                if active_filter.is_active() {
+                    active_filter.clone()
                 } else {
                     layout::FilterConfig::default()
                 }
@@ -175,18 +176,18 @@ pub async fn run_streaming(
                 mtime_range: tree.mtime_range,
             };
 
-            let rects = layout::compute_layout(&tree, view_root, vw, vh, &config);
+            let rects = layout::compute_layout(&tree, view_root, viewport_width, viewport_height, &config);
             let breadcrumb = tree.breadcrumb(view_root);
             let root_size = tree.recursive_sizes.get(&view_root).copied().unwrap_or(0);
             let dir_count = tree.nodes.len() as u32;
             drop(tree);
 
-            let msg = encode_layout(view_root, root_size, dir_count, scan_done, &breadcrumb, &rects);
+            let message = encode_layout(view_root, root_size, dir_count, scan_done, &breadcrumb, &rects);
 
-            *layout_state.last_layout.lock().unwrap() = Some(msg.clone());
-            let _ = layout_state.layout_tx.send(msg);
+            *layout_state.last_layout.lock().unwrap() = Some(message.clone());
+            let _ = layout_state.layout_tx.send(message);
 
-            last_version = cur_version;
+            last_version = current_version;
             last_compute = Instant::now();
         }
     });
@@ -201,7 +202,8 @@ pub async fn run_streaming(
         .route("/ws", get(ws_handler))
         .route("/start", get(start_handler))
         .with_state(Arc::clone(&state))
-        .fallback_service(ServeDir::new(&static_dir));
+        .fallback_service(ServeDir::new(&static_dir))
+        .layer(CompressionLayer::new());
 
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let actual_port = listener.local_addr()?.port();
@@ -229,8 +231,8 @@ fn start_scan(state: &Arc<ServerState>) {
     tokio::task::spawn_blocking(move || {
         while let Ok(event) = rx.recv() {
             let mut events = vec![event];
-            while let Ok(e) = rx.try_recv() {
-                events.push(e);
+            while let Ok(extra) = rx.try_recv() {
+                events.push(extra);
             }
 
             let mut tree = relay_state.tree.write().unwrap();
@@ -272,9 +274,9 @@ fn start_scan(state: &Arc<ServerState>) {
     });
 
     let path = state.scan_root.clone();
-    let cross_fs = state.cross_filesystems;
+    let cross_filesystems = state.cross_filesystems;
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = scan::scan_tree_streaming(&path, cross_fs, tx) {
+        if let Err(e) = scan::scan_tree_streaming(&path, cross_filesystems, tx) {
             eprintln!("Scan error: {e}");
         }
     });
@@ -313,8 +315,8 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ServerState>) {
     state.had_connection.store(true, Ordering::Relaxed);
 
     let last = state.last_layout.lock().unwrap().clone();
-    if let Some(msg) = last
-        && socket.send(Message::Binary(msg.into())).await.is_err()
+    if let Some(message) = last
+        && socket.send(Message::Binary(message.into())).await.is_err()
     {
         return;
     }
@@ -323,8 +325,8 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ServerState>) {
 
     loop {
         tokio::select! {
-            msg = socket.recv() => {
-                match msg {
+            incoming = socket.recv() => {
+                match incoming {
                     Some(Ok(Message::Binary(data))) => {
                         handle_client_message(&state, &data);
                     }
@@ -334,8 +336,8 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ServerState>) {
             }
             result = layout_rx.recv() => {
                 match result {
-                    Ok(msg) => {
-                        if socket.send(Message::Binary(msg.into())).await.is_err() {
+                    Ok(message) => {
+                        if socket.send(Message::Binary(message.into())).await.is_err() {
                             break;
                         }
                     }
@@ -347,10 +349,10 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<ServerState>) {
     }
 
     if state.connections.fetch_sub(1, Ordering::Relaxed) == 1 {
-        let s = Arc::clone(&state);
+        let server = Arc::clone(&state);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            if s.connections.load(Ordering::Relaxed) == 0 && s.had_connection.load(Ordering::Relaxed) {
+            if server.connections.load(Ordering::Relaxed) == 0 && server.had_connection.load(Ordering::Relaxed) {
                 std::process::exit(0);
             }
         });
@@ -386,9 +388,9 @@ fn handle_client_message(state: &Arc<ServerState>, data: &[u8]) {
     }
     match data[0] {
         MSG_CLIENT_VIEWPORT if data.len() >= 9 => {
-            let w = f32::from_le_bytes(data[1..5].try_into().unwrap()) as f64;
-            let h = f32::from_le_bytes(data[5..9].try_into().unwrap()) as f64;
-            *state.viewport.lock().unwrap() = (w, h);
+            let width = f32::from_le_bytes(data[1..5].try_into().unwrap()) as f64;
+            let height = f32::from_le_bytes(data[5..9].try_into().unwrap()) as f64;
+            *state.viewport.lock().unwrap() = (width, height);
             state.invalidate_layout();
         }
         MSG_CLIENT_NAVIGATE if data.len() >= 9 => {
@@ -434,31 +436,31 @@ fn handle_client_message(state: &Arc<ServerState>, data: &[u8]) {
         }
         MSG_CLIENT_FILTER_EXT if data.len() >= 2 => {
             let count = data[1] as usize;
-            let mut off = 2;
-            let mut exts = Vec::with_capacity(count);
+            let mut offset = 2;
+            let mut extensions = Vec::with_capacity(count);
             for _ in 0..count {
-                if off >= data.len() {
+                if offset >= data.len() {
                     break;
                 }
-                let len = data[off] as usize;
-                off += 1;
-                if off + len > data.len() {
+                let len = data[offset] as usize;
+                offset += 1;
+                if offset + len > data.len() {
                     break;
                 }
-                if let Ok(s) = std::str::from_utf8(&data[off..off + len]) {
-                    exts.push(s.into());
+                if let Ok(s) = std::str::from_utf8(&data[offset..offset + len]) {
+                    extensions.push(s.into());
                 }
-                off += len;
+                offset += len;
             }
-            state.filter.lock().unwrap().extensions = exts;
+            state.filter.lock().unwrap().extensions = extensions;
             state.invalidate_layout();
         }
         MSG_CLIENT_FILTER_SIZE if data.len() >= 17 => {
             let min = u64::from_le_bytes(data[1..9].try_into().unwrap());
             let max = u64::from_le_bytes(data[9..17].try_into().unwrap());
-            let mut f = state.filter.lock().unwrap();
-            f.min_size = min;
-            f.max_size = max;
+            let mut active_filter = state.filter.lock().unwrap();
+            active_filter.min_size = min;
+            active_filter.max_size = max;
             state.invalidate_layout();
         }
         MSG_CLIENT_FILTER_NAME if data.len() >= 3 => {

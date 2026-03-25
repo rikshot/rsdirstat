@@ -52,13 +52,13 @@ pub enum ScanEvent {
     Dir {
         id: u64,
         parent: u64,
-        name: String,
+        name: Box<str>,
         size: u64,
         mtime: i64,
     },
     File {
         parent: u64,
-        name: String,
+        name: Box<str>,
         size: u64,
         mtime: i64,
     },
@@ -202,22 +202,22 @@ struct RawScan {
 }
 
 fn scan_raw(root: &Path, collect_files: bool, cross_filesystems: bool) -> Result<RawScan> {
-    let ri = open_root(root)?;
+    let root_info = open_root(root)?;
 
     let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
     let visited = {
         let set = DashSet::new();
-        set.insert(ri.ino);
+        set.insert(root_info.ino);
         Arc::new(set)
     };
 
     let work = Arc::new(WorkQueue::new());
     work.push(vec![WorkItem {
-        fd: ri.fd,
-        file_id: ri.ino,
+        fd: root_info.fd,
+        file_id: root_info.ino,
         parent_id: 0,
-        name: ri.name,
+        name: root_info.name,
         path: String::new(),
     }]);
 
@@ -225,10 +225,10 @@ fn scan_raw(root: &Path, collect_files: bool, cross_filesystems: bool) -> Result
         .map(|_| {
             let work = Arc::clone(&work);
             let visited = Arc::clone(&visited);
-            let root_dev_i32 = ri.dev as i32;
+            let root_dev_i32 = root_info.dev as i32;
             thread::spawn(move || {
                 let mut result = ThreadResult::default();
-                let mut buf = vec![0u8; BUF_SIZE];
+                let mut buffer = vec![0u8; BUF_SIZE];
 
                 while let Some(item) = work.take() {
                     scan_directory(
@@ -239,7 +239,7 @@ fn scan_raw(root: &Path, collect_files: bool, cross_filesystems: bool) -> Result
                         root_dev_i32,
                         collect_files,
                         cross_filesystems,
-                        &mut buf,
+                        &mut buffer,
                         &work,
                         &mut result,
                         None,
@@ -266,9 +266,9 @@ fn scan_raw(root: &Path, collect_files: bool, cross_filesystems: bool) -> Result
     }
 
     Ok(RawScan {
-        root_path: ri.path,
-        root_ino: ri.ino,
-        root_dev: ri.dev,
+        root_path: root_info.path,
+        root_ino: root_info.ino,
+        root_dev: root_info.dev,
         dir_sizes,
         dir_parents,
         file_entries,
@@ -346,25 +346,27 @@ pub fn scan(root: &Path, collect_files: bool, cross_filesystems: bool, top: usiz
 }
 
 pub fn scan_tree_streaming(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
-    let ri = open_root(root)?;
+    let root_info = open_root(root)?;
 
-    let _ = tx.send(ScanEvent::ScanStart { path: ri.name.clone() });
+    let _ = tx.send(ScanEvent::ScanStart {
+        path: root_info.name.clone(),
+    });
 
     let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
     let visited = {
         let set = DashSet::new();
-        set.insert(ri.ino);
+        set.insert(root_info.ino);
         Arc::new(set)
     };
 
     let work = Arc::new(WorkQueue::new());
     work.push(vec![WorkItem {
-        fd: ri.fd,
-        file_id: ri.ino,
+        fd: root_info.fd,
+        file_id: root_info.ino,
         parent_id: 0,
-        name: ri.name.clone(),
-        path: ri.path.display().to_string(),
+        name: root_info.name.clone(),
+        path: root_info.path.display().to_string(),
     }]);
 
     let active_dirs: Arc<Vec<Mutex<String>>> = Arc::new((0..num_threads).map(|_| Mutex::new(String::new())).collect());
@@ -375,10 +377,10 @@ pub fn scan_tree_streaming(root: &Path, cross_filesystems: bool, tx: std::sync::
             let work = Arc::clone(&work);
             let tx = tx.clone();
             let visited = Arc::clone(&visited);
-            let root_dev_i32 = ri.dev as i32;
+            let root_dev_i32 = root_info.dev as i32;
             let active = Arc::clone(&active_dirs);
             thread::spawn(move || {
-                let mut buf = vec![0u8; BUF_SIZE];
+                let mut buffer = vec![0u8; BUF_SIZE];
                 let mut result = ThreadResult::default();
 
                 while let Some(item) = work.take() {
@@ -391,7 +393,7 @@ pub fn scan_tree_streaming(root: &Path, cross_filesystems: bool, tx: std::sync::
                         root_dev_i32,
                         false,
                         cross_filesystems,
-                        &mut buf,
+                        &mut buffer,
                         &work,
                         &mut result,
                         Some(&tx),
@@ -410,14 +412,14 @@ pub fn scan_tree_streaming(root: &Path, cross_filesystems: bool, tx: std::sync::
     let mut last_pending = usize::MAX;
     loop {
         thread::sleep(std::time::Duration::from_millis(200));
-        let p = work.pending();
-        if p == 0 {
+        let pending = work.pending();
+        if pending == 0 {
             break;
         }
-        if p == last_pending {
+        if pending == last_pending {
             stall_count += 1;
             if stall_count >= 15 {
-                eprintln!("Scan stalled with {p} items pending, finishing with partial results");
+                eprintln!("Scan stalled with {pending} items pending, finishing with partial results");
                 eprintln!("Stuck directories:");
                 for dir in active_dirs.iter() {
                     let name = dir.lock().unwrap();
@@ -431,7 +433,7 @@ pub fn scan_tree_streaming(root: &Path, cross_filesystems: bool, tx: std::sync::
         } else {
             stall_count = 0;
         }
-        last_pending = p;
+        last_pending = pending;
     }
 
     let _ = tx.send(ScanEvent::ScanDone);
@@ -448,7 +450,7 @@ fn scan_directory(
     root_dev: i32,
     collect_files: bool,
     cross_filesystems: bool,
-    buf: &mut [u8],
+    buffer: &mut [u8],
     work: &WorkQueue,
     result: &mut ThreadResult,
     tx: Option<&std::sync::mpsc::Sender<ScanEvent>>,
@@ -464,8 +466,8 @@ fn scan_directory(
             libc::getattrlistbulk(
                 fd.as_raw_fd(),
                 &SCAN_ATTRS as *const libc::attrlist as *mut libc::c_void,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
+                buffer.as_mut_ptr() as *mut libc::c_void,
+                buffer.len(),
                 libc::FSOPT_NOFOLLOW as u64,
             )
         };
@@ -476,16 +478,16 @@ fn scan_directory(
 
         let mut offset = 0usize;
         for _ in 0..count {
-            if offset + 4 > buf.len() {
+            if offset + 4 > buffer.len() {
                 break;
             }
 
-            let entry_length = u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
-            if entry_length == 0 || offset + entry_length > buf.len() {
+            let entry_length = u32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+            if entry_length == 0 || offset + entry_length > buffer.len() {
                 break;
             }
 
-            let entry = &buf[offset..offset + entry_length];
+            let entry = &buffer[offset..offset + entry_length];
             if let Some(parsed) = parse_entry(entry)
                 && parsed.name != "."
                 && parsed.name != ".."
@@ -494,13 +496,13 @@ fn scan_directory(
                 match parsed.obj_type {
                     VDIR => {
                         let name_c = parsed.name.as_bytes();
-                        let mut name_buf = [0u8; 256];
+                        let mut name_buffer = [0u8; 256];
                         if name_c.len() < 255 {
-                            name_buf[..name_c.len()].copy_from_slice(name_c);
+                            name_buffer[..name_c.len()].copy_from_slice(name_c);
                             let raw_fd = unsafe {
                                 libc::openat(
                                     fd.as_raw_fd(),
-                                    name_buf.as_ptr() as *const i8,
+                                    name_buffer.as_ptr() as *const i8,
                                     libc::O_RDONLY | libc::O_DIRECTORY,
                                 )
                             };
@@ -538,7 +540,7 @@ fn scan_directory(
                         {
                             let _ = tx.send(ScanEvent::File {
                                 parent: dir_file_id,
-                                name: parsed.name.to_string(),
+                                name: parsed.name.into(),
                                 size: parsed.file_size,
                                 mtime: parsed.mtime,
                             });
@@ -560,7 +562,7 @@ fn scan_directory(
         let _ = tx.send(ScanEvent::Dir {
             id: dir_file_id,
             parent: parent_id,
-            name: dir_name.to_string(),
+            name: dir_name.into(),
             size: dir_total,
             mtime: dir_mtime,
         });
@@ -672,13 +674,13 @@ fn get_name_by_id(dev_id: u64, file_id: u64) -> Option<String> {
     let vol_path = format!("/.vol/{}/{}", dev_id, file_id);
     let c_path = CString::new(vol_path.as_bytes()).ok()?;
 
-    let mut buf = [0u8; 1024];
+    let mut buffer = [0u8; 1024];
     if unsafe {
         libc::getattrlist(
             c_path.as_ptr(),
             &NAME_ATTRS as *const libc::attrlist as *mut libc::c_void,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len(),
+            buffer.as_mut_ptr() as *mut libc::c_void,
+            buffer.len(),
             0,
         )
     } != 0
@@ -686,12 +688,12 @@ fn get_name_by_id(dev_id: u64, file_id: u64) -> Option<String> {
         return None;
     }
 
-    let name_offset = i32::from_ne_bytes(buf[4..8].try_into().ok()?) as usize;
+    let name_offset = i32::from_ne_bytes(buffer[4..8].try_into().ok()?) as usize;
     let name_start = 4 + name_offset;
-    if name_start >= buf.len() {
+    if name_start >= buffer.len() {
         return None;
     }
-    CStr::from_bytes_until_nul(&buf[name_start..])
+    CStr::from_bytes_until_nul(&buffer[name_start..])
         .ok()?
         .to_str()
         .ok()
