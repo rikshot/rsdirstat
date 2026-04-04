@@ -19,7 +19,8 @@ const ZOOM_DURATION = 300;
 class TreemapApp {
   constructor() {
     this.canvas = $("treemap");
-    this.ctx = this.canvas.getContext("2d");
+    const contextOptions = { alpha: false, desynchronized: true };
+    this.ctx = this.canvas.getContext("2d", contextOptions);
     this.breadcrumbBar = $("crumbs");
     this.tooltipElement = $("tooltip");
     this.statusElement = $("status");
@@ -30,7 +31,7 @@ class TreemapApp {
     this.tooltipPercent = this.tooltipElement.querySelector(".tip-percent");
     this.tooltipMtime = this.tooltipElement.querySelector(".tip-mtime");
     this.bufferCanvas = document.createElement("canvas");
-    this.bufferContext = this.bufferCanvas.getContext("2d");
+    this.bufferContext = this.bufferCanvas.getContext("2d", contextOptions);
 
     this.layoutRects = [];
     this.rectById = new Map();
@@ -282,8 +283,7 @@ class TreemapApp {
         this.statusElement.textContent = "";
         const button = document.createElement("button");
         button.textContent = "Start Scan";
-        button.style.cssText =
-          "background:var(--accent);color:var(--link);border:1px solid var(--link);border-radius:4px;padding:2px 12px;cursor:pointer;font-size:12px";
+        button.className = "action-button";
         button.onclick = () => {
           button.disabled = true;
           button.textContent = "Starting\u2026";
@@ -364,7 +364,7 @@ class TreemapApp {
     this.bufferDirty = this.dirty = true;
     this.scheduleTick();
 
-    $("rescan").style.display = newScanDone ? "" : "none";
+    $("rescan").classList.toggle("hidden", !newScanDone);
     if (!newScanDone) {
       this.startScanTimer();
     } else if (!this.scanDone) {

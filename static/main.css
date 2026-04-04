@@ -97,17 +97,13 @@ body {
     align-items: center;
     padding: 0 8px;
     font-size: 11px;
-    gap: 12px;
+    gap: 6px;
     flex-shrink: 0;
     border-bottom: 1px solid var(--border);
     user-select: none;
-    color: var(--link);
 
     & label {
         color: var(--text-muted);
-    }
-    & .separator {
-        color: var(--border-dim);
     }
 
     & select,
@@ -131,7 +127,7 @@ body {
     & button {
         background: var(--accent);
         color: var(--link);
-        border: 1px solid var(--link);
+        border: 1px solid var(--border-dim);
         border-radius: 3px;
         padding: 1px 8px;
         cursor: pointer;
@@ -140,6 +136,37 @@ body {
         &:hover {
             background: var(--accent-hover);
         }
+    }
+}
+
+.toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding-right: 6px;
+    border-right: 1px solid var(--border-dim);
+
+    &:last-of-type {
+        border-right: none;
+        padding-right: 0;
+    }
+}
+
+.hidden {
+    display: none;
+}
+
+.action-button {
+    background: var(--accent);
+    color: var(--link);
+    border: 1px solid var(--border-dim);
+    border-radius: 3px;
+    padding: 1px 10px;
+    cursor: pointer;
+    font-size: 12px;
+    height: 20px;
+    &:hover {
+        background: var(--accent-hover);
     }
 }
 

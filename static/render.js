@@ -15,6 +15,14 @@ function insetRect(rect) {
 const FONT =
   "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
 
+const boldFonts = {};
+const normalFonts = {};
+for (let size = 6; size <= 16; size++) {
+  boldFonts[size] = `600 ${size}px ${FONT}`;
+  normalFonts[size] = `${size}px ${FONT}`;
+}
+let lastFont = "";
+
 function truncateLabel(ctx, label, maxWidth) {
   let textWidth = ctx.measureText(label).width;
   if (textWidth <= maxWidth) return { label, textWidth };
@@ -58,7 +66,8 @@ export function drawSingleRect(ctx, rect, alpha) {
       const availableWidth = w - 8;
       if (availableWidth > 20 && visibleHeaderHeight > 8) {
         const fontSize = Math.min(12, Math.max(8, visibleHeaderHeight - 4));
-        ctx.font = `600 ${fontSize}px ${FONT}`;
+        const font = boldFonts[fontSize];
+        if (font !== lastFont) { ctx.font = font; lastFont = font; }
         ctx.fillStyle = "rgba(255,255,255,0.85)";
         ctx.textBaseline = "middle";
         const { label, textWidth } = truncateLabel(
@@ -107,7 +116,8 @@ export function drawSingleRect(ctx, rect, alpha) {
           ),
         ),
       );
-      ctx.font = `600 ${fontSize}px ${FONT}`;
+      const font = boldFonts[fontSize];
+      if (font !== lastFont) { ctx.font = font; lastFont = font; }
       ctx.fillStyle = "rgba(255,255,255,0.92)";
       ctx.textBaseline = "top";
       const { label, textWidth } = truncateLabel(
@@ -119,7 +129,8 @@ export function drawSingleRect(ctx, rect, alpha) {
 
       if (availableHeight > 26 && rect.size > 0) {
         const smallFontSize = Math.max(8, fontSize - 2);
-        ctx.font = `${smallFontSize}px ${FONT}`;
+        const smallFont = normalFonts[smallFontSize];
+        if (smallFont !== lastFont) { ctx.font = smallFont; lastFont = smallFont; }
         ctx.fillStyle = "rgba(255,255,255,0.55)";
         const sizeLabel = formatSize(rect.size);
         if (ctx.measureText(sizeLabel).width <= availableWidth) {
@@ -140,6 +151,7 @@ export function drawSingleRect(ctx, rect, alpha) {
 }
 
 export function drawRects(ctx, rects, alpha) {
+  lastFont = "";
   for (const rect of rects) {
     if (rect.w >= 1 && rect.h >= 1) drawSingleRect(ctx, rect, alpha);
   }

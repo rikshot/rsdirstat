@@ -377,7 +377,6 @@ const MSG_CLIENT_FILTER_EXT: u8 = 8;
 const MSG_CLIENT_FILTER_SIZE: u8 = 9;
 const MSG_CLIENT_FILTER_NAME: u8 = 10;
 const MSG_CLIENT_CLEAR_FILTER: u8 = 11;
-
 fn reveal_in_finder(path: &std::path::Path) {
     let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
 }

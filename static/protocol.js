@@ -14,6 +14,5 @@ export const MSG_FILTER_EXT = 8;
 export const MSG_FILTER_SIZE = 9;
 export const MSG_FILTER_NAME = 10;
 export const MSG_CLEAR_FILTER = 11;
-
 export const textEncoder = new TextEncoder();
 export const textDecoder = new TextDecoder();
