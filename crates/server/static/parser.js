@@ -11,19 +11,21 @@ export function parseLayout(view, offset, buffer) {
 
   const breadcrumbCount = view.getUint16(offset, true);
   offset += 2;
-  const breadcrumb = Array.from({ length: breadcrumbCount }, () => {
+  const breadcrumb = [];
+  for (let i = 0; i < breadcrumbCount; i++) {
     const id = view.getBigUint64(offset, true);
     offset += 8;
-    const nameLength = view.getUint16(offset, true);
+    const nameLen = view.getUint16(offset, true);
     offset += 2;
-    const name = textDecoder.decode(new Uint8Array(buffer, offset, nameLength));
-    offset += nameLength;
-    return { id, name };
-  });
+    const name = textDecoder.decode(new Uint8Array(buffer, offset, nameLen));
+    offset += nameLen;
+    breadcrumb.push({ id, name });
+  }
 
   const rectCount = view.getUint32(offset, true);
   offset += 4;
-  const rects = Array.from({ length: rectCount }, () => {
+  const rects = [];
+  for (let i = 0; i < rectCount; i++) {
     const id = view.getBigInt64(offset, true);
     offset += 8;
     const parentId = view.getBigUint64(offset, true);
@@ -46,10 +48,10 @@ export function parseLayout(view, offset, buffer) {
     offset += 4;
     const mtime = Number(view.getBigInt64(offset, true));
     offset += 8;
-    const nameLength = view.getUint16(offset, true);
+    const nameLen = view.getUint16(offset, true);
     offset += 2;
-    const name = textDecoder.decode(new Uint8Array(buffer, offset, nameLength));
-    offset += nameLength;
+    const name = textDecoder.decode(new Uint8Array(buffer, offset, nameLen));
+    offset += nameLen;
     const rect = {
       id,
       parentId,
@@ -57,7 +59,6 @@ export function parseLayout(view, offset, buffer) {
       y,
       w,
       h,
-      name,
       hue,
       size,
       depth,
@@ -66,10 +67,11 @@ export function parseLayout(view, offset, buffer) {
       isFile: !!(flags & 4),
       headerHeight,
       mtime,
+      name,
     };
     applyColors(rect);
-    return rect;
-  });
+    rects.push(rect);
+  }
 
   return { rootSize, dirCount, scanDone, breadcrumb, rects };
 }

@@ -67,7 +67,10 @@ export function drawSingleRect(ctx, rect, alpha) {
       if (availableWidth > 20 && visibleHeaderHeight > 8) {
         const fontSize = Math.min(12, Math.max(8, visibleHeaderHeight - 4));
         const font = boldFonts[fontSize];
-        if (font !== lastFont) { ctx.font = font; lastFont = font; }
+        if (font !== lastFont) {
+          ctx.font = font;
+          lastFont = font;
+        }
         ctx.fillStyle = "rgba(255,255,255,0.85)";
         ctx.textBaseline = "middle";
         const { label, textWidth } = truncateLabel(
@@ -117,7 +120,10 @@ export function drawSingleRect(ctx, rect, alpha) {
         ),
       );
       const font = boldFonts[fontSize];
-      if (font !== lastFont) { ctx.font = font; lastFont = font; }
+      if (font !== lastFont) {
+        ctx.font = font;
+        lastFont = font;
+      }
       ctx.fillStyle = "rgba(255,255,255,0.92)";
       ctx.textBaseline = "top";
       const { label, textWidth } = truncateLabel(
@@ -130,7 +136,10 @@ export function drawSingleRect(ctx, rect, alpha) {
       if (availableHeight > 26 && rect.size > 0) {
         const smallFontSize = Math.max(8, fontSize - 2);
         const smallFont = normalFonts[smallFontSize];
-        if (smallFont !== lastFont) { ctx.font = smallFont; lastFont = smallFont; }
+        if (smallFont !== lastFont) {
+          ctx.font = smallFont;
+          lastFont = smallFont;
+        }
         ctx.fillStyle = "rgba(255,255,255,0.55)";
         const sizeLabel = formatSize(rect.size);
         if (ctx.measureText(sizeLabel).width <= availableWidth) {

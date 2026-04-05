@@ -21,7 +21,7 @@ export function setupEvents(app) {
           app.viewRootSize > 0
             ? (app.hoveredRect.size / app.viewRootSize) * 100
             : 0;
-        app.tooltipPercent.textContent = `${percent.toFixed(1)}% of parent`;
+        app.tooltipPercent.textContent = `${percent.toFixed(1)}%`;
         app.tooltipMtime.textContent =
           app.hoveredRect.mtime > 0
             ? new Date(app.hoveredRect.mtime * 1000).toLocaleDateString()
@@ -63,18 +63,11 @@ export function setupEvents(app) {
     event.preventDefault();
     if (!app.hoveredRect) return;
     if (app.hoveredRect.isFile) {
-      const nameBytes = P.textEncoder.encode(app.hoveredRect.name);
-      const message = new DataView(new ArrayBuffer(11 + nameBytes.length));
-      message.setUint8(0, P.MSG_REVEAL_FILE);
-      message.setBigUint64(1, BigInt(app.hoveredRect.parentId), true);
-      message.setUint16(9, nameBytes.length, true);
-      new Uint8Array(message.buffer).set(nameBytes, 11);
-      app.sendBinary(new Uint8Array(message.buffer));
+      app.sendBinary(
+        P.encodeRevealFile(app.hoveredRect.parentId, app.hoveredRect.name),
+      );
     } else {
-      const message = new DataView(new ArrayBuffer(9));
-      message.setUint8(0, P.MSG_REVEAL_DIR);
-      message.setBigUint64(1, BigInt(app.hoveredRect.id), true);
-      app.sendBinary(new Uint8Array(message.buffer));
+      app.sendBinary(P.encodeRevealDir(app.hoveredRect.id));
     }
   });
 

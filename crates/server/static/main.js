@@ -151,7 +151,11 @@ class TreemapApp {
   buildBreadcrumb() {
     const length = this.breadcrumb.length;
     const tail = length > 0 ? this.breadcrumb[length - 1].id : 0n;
-    if (length === this.lastBreadcrumbLength && tail === this.lastBreadcrumbTail) return;
+    if (
+      length === this.lastBreadcrumbLength &&
+      tail === this.lastBreadcrumbTail
+    )
+      return;
     this.lastBreadcrumbLength = length;
     this.lastBreadcrumbTail = tail;
     this.breadcrumbBar.innerHTML = "";
@@ -195,10 +199,7 @@ class TreemapApp {
     if (this.zoomAnim) return;
     this.clearHover();
     this.pendingOldRects = this.layoutRects.map((rect) => ({ ...rect }));
-    const message = new DataView(new ArrayBuffer(9));
-    message.setUint8(0, P.MSG_NAVIGATE);
-    message.setBigUint64(1, BigInt(nodeId), true);
-    this.sendBinary(new Uint8Array(message.buffer));
+    this.sendBinary(P.encodeNavigate(nodeId));
   }
 
   findRect(mouseX, mouseY) {
@@ -257,11 +258,7 @@ class TreemapApp {
 
   sendViewport() {
     if (!this.ws || this.ws.readyState !== 1 || this.canvasWidth <= 0) return;
-    const message = new DataView(new ArrayBuffer(9));
-    message.setUint8(0, P.MSG_VIEWPORT);
-    message.setFloat32(1, this.canvasWidth, true);
-    message.setFloat32(5, this.canvasHeight, true);
-    this.sendBinary(new Uint8Array(message.buffer));
+    this.sendBinary(P.encodeViewport(this.canvasWidth, this.canvasHeight));
   }
 
   startScanTimer() {
@@ -383,4 +380,8 @@ class TreemapApp {
   }
 }
 
-new TreemapApp();
+if (document.readyState === "complete") {
+  new TreemapApp();
+} else {
+  addEventListener("load", () => new TreemapApp());
+}

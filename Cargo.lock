@@ -763,19 +763,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsdirstat"
+name = "rsdirstat-core"
+version = "0.1.0"
+dependencies = [
+ "mime",
+ "mime_guess",
+]
+
+[[package]]
+name = "rsdirstat-macos"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dashmap",
+ "libc",
+ "rsdirstat-core",
+]
+
+[[package]]
+name = "rsdirstat-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
- "dashmap",
  "humansize",
- "libc",
  "mimalloc",
- "mime",
- "mime_guess",
  "open",
+ "rsdirstat-core",
+ "rsdirstat-macos",
  "tokio",
  "tower-http",
 ]

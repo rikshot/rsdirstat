@@ -9,6 +9,7 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use dashmap::DashSet;
+use rsdirstat_core::protocol::ScanEvent;
 
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
@@ -43,26 +44,6 @@ static NAME_ATTRS: libc::attrlist = libc::attrlist {
 pub struct ScanResult {
     pub dir_sizes: HashMap<PathBuf, u64>,
     pub file_entries: Vec<(PathBuf, u64)>,
-}
-
-pub enum ScanEvent {
-    ScanStart {
-        path: String,
-    },
-    Dir {
-        id: u64,
-        parent: u64,
-        name: Box<str>,
-        size: u64,
-        mtime: i64,
-    },
-    File {
-        parent: u64,
-        name: Box<str>,
-        size: u64,
-        mtime: i64,
-    },
-    ScanDone,
 }
 
 struct WorkItem {
@@ -406,8 +387,6 @@ pub fn scan_tree_streaming(root: &Path, cross_filesystems: bool, tx: std::sync::
         })
         .collect();
 
-    // Wait for completion with stall detection — a hung mount can block
-    // a worker thread in getattrlistbulk indefinitely
     let mut stall_count = 0u32;
     let mut last_pending = usize::MAX;
     loop {
@@ -509,7 +488,9 @@ fn scan_directory(
                             if raw_fd >= 0 {
                                 let child_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
                                 if visited.insert(parsed.file_id) {
-                                    result.dir_parents.insert(parsed.file_id, dir_file_id);
+                                    if tx.is_none() {
+                                        result.dir_parents.insert(parsed.file_id, dir_file_id);
+                                    }
                                     new_work.push(WorkItem {
                                         fd: child_fd,
                                         file_id: parsed.file_id,
@@ -540,7 +521,7 @@ fn scan_directory(
                         {
                             let _ = tx.send(ScanEvent::File {
                                 parent: dir_file_id,
-                                name: parsed.name.into(),
+                                name: parsed.name.to_string(),
                                 size: parsed.file_size,
                                 mtime: parsed.mtime,
                             });
@@ -556,13 +537,15 @@ fn scan_directory(
 
     drop(fd);
 
-    result.dir_sizes.insert(dir_file_id, dir_total);
+    if tx.is_none() {
+        result.dir_sizes.insert(dir_file_id, dir_total);
+    }
 
     if let Some(tx) = tx {
         let _ = tx.send(ScanEvent::Dir {
             id: dir_file_id,
             parent: parent_id,
-            name: dir_name.into(),
+            name: dir_name.to_string(),
             size: dir_total,
             mtime: dir_mtime,
         });
@@ -611,7 +594,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
         return None;
     }
     let mtime = i64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
-    pos += 16; // tv_sec(8) + tv_nsec(8)
+    pos += 16;
 
     if pos + 8 > entry.len() {
         return None;

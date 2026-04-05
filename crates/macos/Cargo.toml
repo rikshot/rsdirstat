@@ -1,0 +1,10 @@
+[package]
+name = "rsdirstat-macos"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+rsdirstat-core = { path = "../core" }
+anyhow = "1"
+dashmap = { version = "6", features = ["inline"] }
+libc = "0.2"
