@@ -6,7 +6,5 @@ edition.workspace = true
 [dependencies]
 rsdirstat-core = { path = "../core" }
 anyhow = "1"
-
-[target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security"] }
 dashmap = { version = "6", features = ["inline"] }

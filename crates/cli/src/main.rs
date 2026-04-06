@@ -6,10 +6,10 @@ use humansize::{BINARY, format_size};
 use rsdirstat_core::protocol::ScanEvent;
 use rsdirstat_core::tree::DirTree;
 
-#[cfg(target_os = "macos")]
-use rsdirstat_macos as scanner;
 #[cfg(target_os = "linux")]
 use rsdirstat_linux as scanner;
+#[cfg(target_os = "macos")]
+use rsdirstat_macos as scanner;
 #[cfg(target_os = "windows")]
 use rsdirstat_windows as scanner;
 
@@ -47,10 +47,21 @@ fn main() -> Result<()> {
     while let Ok(event) = rx.recv() {
         match event {
             ScanEvent::ScanStart { .. } => {}
-            ScanEvent::Dir { id, parent, name, size, mtime } => {
+            ScanEvent::Dir {
+                id,
+                parent,
+                name,
+                size,
+                mtime,
+            } => {
                 tree.insert_dir(id, parent, &name, size, mtime);
             }
-            ScanEvent::File { parent, name, size, mtime } => {
+            ScanEvent::File {
+                parent,
+                name,
+                size,
+                mtime,
+            } => {
                 tree.insert_file(parent, &name, size, mtime);
                 if args.files {
                     file_entries.push((parent, name, size));
@@ -82,9 +93,11 @@ fn main() -> Result<()> {
             dir_list.select_nth_unstable_by(top - 1, |a, b| b.1.cmp(&a.1));
             dir_list.truncate(top);
             dir_list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-            print_entries(dir_list.iter().map(|(id, size)| {
-                (tree.full_path(*id, &root).unwrap_or_default(), *size)
-            }));
+            print_entries(
+                dir_list
+                    .iter()
+                    .map(|(id, size)| (tree.full_path(*id, &root).unwrap_or_default(), *size)),
+            );
         }
     }
 

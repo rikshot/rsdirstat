@@ -20,10 +20,10 @@ use rsdirstat_core::layout::{self, LayoutConfig};
 use rsdirstat_core::protocol::{self, ClientMessage, ScanEvent};
 use rsdirstat_core::tree::FilterConfig;
 
-#[cfg(target_os = "macos")]
-use rsdirstat_macos as scanner;
 #[cfg(target_os = "linux")]
 use rsdirstat_linux as scanner;
+#[cfg(target_os = "macos")]
+use rsdirstat_macos as scanner;
 #[cfg(target_os = "windows")]
 use rsdirstat_windows as scanner;
 
@@ -354,7 +354,9 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
         let server = Arc::clone(&state);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            if server.connections.count.load(Ordering::Relaxed) == 0 && server.connections.had_any.load(Ordering::Relaxed) {
+            if server.connections.count.load(Ordering::Relaxed) == 0
+                && server.connections.had_any.load(Ordering::Relaxed)
+            {
                 std::process::exit(0);
             }
         });
@@ -374,10 +376,7 @@ fn reveal_in_file_manager(path: &std::path::Path) {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("explorer")
-            .arg("/select,")
-            .arg(path)
-            .spawn();
+        let _ = std::process::Command::new("explorer").arg("/select,").arg(path).spawn();
     }
 }
 

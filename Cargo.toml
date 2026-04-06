@@ -1,5 +1,6 @@
 [workspace]
-members = ["crates/cli", "crates/core", "crates/gui", "crates/linux", "crates/macos", "crates/windows"]
+members = ["crates/*"]
+default-members = ["crates/cli", "crates/core", "crates/gui"]
 resolver = "3"
 
 [workspace.package]

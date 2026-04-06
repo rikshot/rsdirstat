@@ -88,7 +88,10 @@ impl<T> WorkQueue<T> {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if let Some(item) = inner.queue.pop() {
-                return Some(WorkGuard { queue: self, item: Some(item) });
+                return Some(WorkGuard {
+                    queue: self,
+                    item: Some(item),
+                });
             }
             if inner.pending == 0 {
                 self.condvar.notify_all();
