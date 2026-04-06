@@ -6,3 +6,6 @@ edition.workspace = true
 [dependencies]
 mime = "0.3"
 mime_guess = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

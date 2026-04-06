@@ -6,5 +6,7 @@ edition.workspace = true
 [dependencies]
 rsdirstat-core = { path = "../core" }
 anyhow = "1"
-dashmap = { version = "6", features = ["inline"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+dashmap = { version = "6", features = ["inline"] }

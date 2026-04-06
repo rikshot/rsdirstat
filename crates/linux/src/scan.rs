@@ -22,19 +22,19 @@ mod imp {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
     use std::path::Path;
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use anyhow::{Context, Result};
     use dashmap::DashSet;
     use rsdirstat_core::protocol::ScanEvent;
+    use rsdirstat_core::scan::{WorkQueue, raise_fd_limit};
 
     const DT_DIR: u8 = 4;
     const DT_REG: u8 = 8;
 
     const BUF_SIZE: usize = 1024 * 1024;
 
-    // statx constants (stable kernel ABI, not always in libc for musl)
     const STATX_TYPE: u32 = 0x0001;
     const STATX_MODE: u32 = 0x0002;
     const STATX_SIZE: u32 = 0x0200;
@@ -115,85 +115,6 @@ mod imp {
         path: String,
     }
 
-    struct WorkQueueInner {
-        queue: Vec<WorkItem>,
-        pending: usize,
-    }
-
-    struct WorkQueue {
-        inner: Mutex<WorkQueueInner>,
-        condvar: Condvar,
-    }
-
-    impl WorkQueue {
-        fn new() -> Self {
-            Self {
-                inner: Mutex::new(WorkQueueInner {
-                    queue: Vec::new(),
-                    pending: 0,
-                }),
-                condvar: Condvar::new(),
-            }
-        }
-
-        fn push(&self, items: Vec<WorkItem>) {
-            if items.is_empty() {
-                return;
-            }
-            let mut inner = self.inner.lock().unwrap();
-            let count = items.len();
-            inner.pending += count;
-            inner.queue.extend(items);
-            if count == 1 {
-                self.condvar.notify_one();
-            } else {
-                self.condvar.notify_all();
-            }
-        }
-
-        fn take(&self) -> Option<WorkItem> {
-            let mut inner = self.inner.lock().unwrap();
-            loop {
-                if let Some(item) = inner.queue.pop() {
-                    return Some(item);
-                }
-                if inner.pending == 0 {
-                    self.condvar.notify_all();
-                    return None;
-                }
-                inner = self.condvar.wait(inner).unwrap();
-            }
-        }
-
-        fn finish_one(&self) {
-            let mut inner = self.inner.lock().unwrap();
-            inner.pending -= 1;
-            if inner.pending == 0 {
-                self.condvar.notify_all();
-            }
-        }
-
-        fn pending(&self) -> usize {
-            self.inner.lock().unwrap().pending
-        }
-
-        fn cancel(&self) {
-            let mut inner = self.inner.lock().unwrap();
-            inner.pending = 0;
-            inner.queue.clear();
-            self.condvar.notify_all();
-        }
-    }
-
-    fn raise_fd_limit() {
-        unsafe {
-            let mut rlim: libc::rlimit = std::mem::zeroed();
-            libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim);
-            rlim.rlim_cur = rlim.rlim_max;
-            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
-        }
-    }
-
     struct RootInfo {
         path: std::path::PathBuf,
         ino: u64,
@@ -258,7 +179,8 @@ mod imp {
                 thread::spawn(move || {
                     let mut buffer = vec![0u8; BUF_SIZE];
 
-                    while let Some(item) = work.take() {
+                    while let Some(guard) = work.take() {
+                        let item = guard.into_inner();
                         *active[tid].lock().unwrap() = item.path.clone();
                         scan_directory(
                             item.fd,
@@ -273,39 +195,20 @@ mod imp {
                             &visited,
                             &item.path,
                         );
-                        work.finish_one();
                     }
                 })
             })
             .collect();
 
-        let mut stall_count = 0u32;
-        let mut last_pending = usize::MAX;
-        loop {
-            thread::sleep(std::time::Duration::from_millis(200));
-            let pending = work.pending();
-            if pending == 0 {
-                break;
-            }
-            if pending == last_pending {
-                stall_count += 1;
-                if stall_count >= 15 {
-                    eprintln!("Scan stalled with {pending} items pending, finishing with partial results");
-                    eprintln!("Stuck directories:");
-                    for dir in active_dirs.iter() {
-                        let name = dir.lock().unwrap();
-                        if !name.is_empty() {
-                            eprintln!("  {name}");
-                        }
-                    }
-                    work.cancel();
-                    break;
+        work.wait_with_stall_detection(|| {
+            eprintln!("Stuck directories:");
+            for dir in active_dirs.iter() {
+                let name = dir.lock().unwrap();
+                if !name.is_empty() {
+                    eprintln!("  {name}");
                 }
-            } else {
-                stall_count = 0;
             }
-            last_pending = pending;
-        }
+        });
 
         let _ = tx.send(ScanEvent::ScanDone);
         Ok(())
@@ -320,7 +223,7 @@ mod imp {
         root_mnt_id: u64,
         cross_filesystems: bool,
         buffer: &mut [u8],
-        work: &WorkQueue,
+        work: &WorkQueue<WorkItem>,
         tx: &std::sync::mpsc::Sender<ScanEvent>,
         visited: &DashSet<u64>,
         dir_path: &str,
