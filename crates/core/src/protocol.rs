@@ -1,3 +1,6 @@
+use crate::layout::LayoutRect;
+use crate::tree::BreadcrumbEntry;
+
 /// Scanner → server internal events (not sent over WebSocket).
 pub enum ScanEvent {
     ScanStart {
@@ -49,6 +52,55 @@ const MSG_FILTER_EXT: u8 = 8;
 const MSG_FILTER_SIZE: u8 = 9;
 const MSG_FILTER_NAME: u8 = 10;
 const MSG_CLEAR_FILTER: u8 = 11;
+
+pub fn encode_scan_start(path: &str) -> Vec<u8> {
+    let path_bytes = path.as_bytes();
+    let mut buf = Vec::with_capacity(3 + path_bytes.len());
+    buf.push(MSG_SCAN_START);
+    buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(path_bytes);
+    buf
+}
+
+pub fn encode_layout(
+    root_size: u64,
+    dir_count: u32,
+    scan_done: bool,
+    breadcrumb: &[BreadcrumbEntry],
+    rects: &[LayoutRect],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(24 + breadcrumb.len() * 20 + rects.len() * 68);
+    buf.push(MSG_LAYOUT);
+    buf.extend_from_slice(&root_size.to_le_bytes());
+    buf.extend_from_slice(&dir_count.to_le_bytes());
+    buf.push(scan_done as u8);
+    buf.extend_from_slice(&(breadcrumb.len() as u16).to_le_bytes());
+    for entry in breadcrumb {
+        buf.extend_from_slice(&entry.id.to_le_bytes());
+        let name_bytes = entry.name.as_bytes();
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+    }
+    buf.extend_from_slice(&(rects.len() as u32).to_le_bytes());
+    for rect in rects {
+        buf.extend_from_slice(&rect.id.to_le_bytes());
+        buf.extend_from_slice(&rect.parent_id.to_le_bytes());
+        buf.extend_from_slice(&(rect.x as f32).to_le_bytes());
+        buf.extend_from_slice(&(rect.y as f32).to_le_bytes());
+        buf.extend_from_slice(&(rect.w as f32).to_le_bytes());
+        buf.extend_from_slice(&(rect.h as f32).to_le_bytes());
+        buf.extend_from_slice(&rect.hue.to_le_bytes());
+        buf.extend_from_slice(&rect.size.to_le_bytes());
+        buf.push(rect.depth);
+        buf.push((rect.is_container as u8) | ((rect.is_files as u8) << 1) | ((rect.is_file as u8) << 2));
+        buf.extend_from_slice(&(rect.header_height as f32).to_le_bytes());
+        buf.extend_from_slice(&rect.mtime.to_le_bytes());
+        let name_bytes = rect.name.as_bytes();
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+    }
+    buf
+}
 
 impl ClientMessage {
     pub fn decode(data: &[u8]) -> Option<Self> {

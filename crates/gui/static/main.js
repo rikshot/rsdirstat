@@ -6,7 +6,7 @@ import {
   interpolateRects,
   easeOut,
 } from "./render.js";
-import { parseLayout } from "./parser.js";
+import { parseLayout } from "./protocol.js";
 import { setupEvents } from "./events.js";
 import { setupToolbar } from "./toolbar.js";
 

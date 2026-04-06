@@ -763,11 +763,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsdirstat-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "humansize",
+ "rsdirstat-core",
+ "rsdirstat-linux",
+ "rsdirstat-macos",
+ "rsdirstat-windows",
+]
+
+[[package]]
 name = "rsdirstat-core"
 version = "0.1.0"
 dependencies = [
  "mime",
  "mime_guess",
+]
+
+[[package]]
+name = "rsdirstat-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "mimalloc",
+ "open",
+ "rsdirstat-core",
+ "rsdirstat-linux",
+ "rsdirstat-macos",
+ "rsdirstat-windows",
+ "tokio",
+ "tower-http",
+]
+
+[[package]]
+name = "rsdirstat-linux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rsdirstat-core",
 ]
 
 [[package]]
@@ -781,19 +819,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsdirstat-server"
+name = "rsdirstat-windows"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
- "clap",
- "humansize",
- "mimalloc",
- "open",
  "rsdirstat-core",
- "rsdirstat-macos",
- "tokio",
- "tower-http",
 ]
 
 [[package]]

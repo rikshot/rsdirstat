@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::color::{hash_name, hue_for_extension};
-use crate::layout::{BreadcrumbEntry, FilterConfig};
 
 pub struct FileEntry {
     pub name: Box<str>,
@@ -22,6 +21,56 @@ pub struct DirNode {
     pub mtime: i64,
 }
 
+#[derive(Clone, Default)]
+pub struct FilterConfig {
+    pub extensions: Vec<Box<str>>,
+    pub min_size: u64,
+    pub max_size: u64,
+    pub name_pattern: String,
+}
+
+impl FilterConfig {
+    pub fn is_active(&self) -> bool {
+        !self.extensions.is_empty() || self.min_size > 0 || self.max_size > 0 || !self.name_pattern.is_empty()
+    }
+
+    pub fn matches_file(&self, name: &str, size: u64) -> bool {
+        if self.min_size > 0 && size < self.min_size {
+            return false;
+        }
+        if self.max_size > 0 && size > self.max_size {
+            return false;
+        }
+        if !self.name_pattern.is_empty() {
+            let pattern = self.name_pattern.as_bytes();
+            if !name
+                .as_bytes()
+                .windows(pattern.len())
+                .any(|window| window.eq_ignore_ascii_case(pattern))
+            {
+                return false;
+            }
+        }
+        if !self.extensions.is_empty() {
+            let extension = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+            if !self
+                .extensions
+                .iter()
+                .any(|e| e.as_ref().eq_ignore_ascii_case(extension))
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[derive(Clone)]
+pub struct BreadcrumbEntry {
+    pub id: u64,
+    pub name: String,
+}
+
 pub struct DirTree {
     pub nodes: HashMap<u64, DirNode>,
     pub root_id: Option<u64>,
@@ -29,6 +78,12 @@ pub struct DirTree {
     pub scan_path: String,
     pub mtime_range: (i64, i64),
     hue_cache: HashMap<Box<str>, u16>,
+}
+
+impl Default for DirTree {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DirTree {

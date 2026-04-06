@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::color::{COLOR_MODE_AGE, age_hue, hash_id_to_hue};
-pub use crate::tree::DirTree;
+pub use crate::tree::{BreadcrumbEntry, DirTree, FilterConfig};
 
 const NEST_HEADER: f64 = 18.0;
 const MIN_NEST_PX: f64 = 40.0;
@@ -14,50 +14,6 @@ fn header_height(width: f64, height: f64) -> f64 {
         }
     }
     0.0
-}
-
-#[derive(Clone, Default)]
-pub struct FilterConfig {
-    pub extensions: Vec<Box<str>>,
-    pub min_size: u64,
-    pub max_size: u64,
-    pub name_pattern: String,
-}
-
-impl FilterConfig {
-    pub fn is_active(&self) -> bool {
-        !self.extensions.is_empty() || self.min_size > 0 || self.max_size > 0 || !self.name_pattern.is_empty()
-    }
-
-    pub fn matches_file(&self, name: &str, size: u64) -> bool {
-        if self.min_size > 0 && size < self.min_size {
-            return false;
-        }
-        if self.max_size > 0 && size > self.max_size {
-            return false;
-        }
-        if !self.name_pattern.is_empty() {
-            let pattern = self.name_pattern.as_bytes();
-            if !name
-                .as_bytes()
-                .windows(pattern.len())
-                .any(|window| window.eq_ignore_ascii_case(pattern))
-            {
-                return false;
-            }
-        }
-        if !self.extensions.is_empty() {
-            let extension = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-            if !self
-                .extensions
-                .iter()
-                .any(|e| e.as_ref().eq_ignore_ascii_case(extension))
-            {
-                return false;
-            }
-        }
-        true
-    }
 }
 
 pub struct LayoutConfig {
@@ -83,12 +39,6 @@ pub struct LayoutRect {
     pub is_files: bool,
     pub is_file: bool,
     pub mtime: i64,
-}
-
-#[derive(Clone)]
-pub struct BreadcrumbEntry {
-    pub id: u64,
-    pub name: String,
 }
 
 pub fn compute_layout(
