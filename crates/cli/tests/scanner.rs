@@ -74,9 +74,9 @@ fn scanner_finds_all_directories() {
     assert!(tree.root_id.is_some());
 
     let names: Vec<&str> = tree.nodes.values().map(|n| &*n.name).collect();
-    assert!(names.iter().any(|n| *n == "src"), "missing src in {names:?}");
-    assert!(names.iter().any(|n| *n == "docs"), "missing docs in {names:?}");
-    assert!(names.iter().any(|n| *n == "nested"), "missing nested in {names:?}");
+    assert!(names.contains(&"src"), "missing src in {names:?}");
+    assert!(names.contains(&"docs"), "missing docs in {names:?}");
+    assert!(names.contains(&"nested"), "missing nested in {names:?}");
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn scanner_handles_empty_directory() {
 
     assert!(tree.root_id.is_some());
     let names: Vec<&str> = tree.nodes.values().map(|n| &*n.name).collect();
-    assert!(names.iter().any(|n| *n == "empty"));
+    assert!(names.contains(&"empty"));
     assert!(files.is_empty());
 }
 
@@ -202,10 +202,7 @@ fn scanner_unicode_filenames() {
     let (tree, files) = scan_to_tree(dir.path());
 
     let dir_names: Vec<&str> = tree.nodes.values().map(|n| &*n.name).collect();
-    assert!(
-        dir_names.iter().any(|n| *n == "données"),
-        "missing unicode dir in {dir_names:?}"
-    );
+    assert!(dir_names.contains(&"données"), "missing unicode dir in {dir_names:?}");
 
     let file_names: Vec<&str> = files.iter().map(|(_, name, _)| name.as_str()).collect();
     assert!(

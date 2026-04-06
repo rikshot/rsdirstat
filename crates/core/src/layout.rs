@@ -745,7 +745,7 @@ mod tests {
         let mut tree = DirTree::new();
         tree.insert_dir(1, 0, "root", 0, 100);
         for i in 2..=21u64 {
-            tree.insert_dir(i, 1, &format!("dir{i}"), (i * 100) as u64, 100);
+            tree.insert_dir(i, 1, &format!("dir{i}"), i * 100, 100);
         }
 
         let config = default_config();

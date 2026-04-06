@@ -22,9 +22,12 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
             continue;
         }
 
-        let block_size = stat.f_frsize as u64;
-        let total = stat.f_blocks as u64 * block_size;
-        let free = stat.f_bavail as u64 * block_size;
+        #[allow(clippy::useless_conversion)]
+        let block_size: u64 = stat.f_frsize.into();
+        #[allow(clippy::useless_conversion)]
+        let total: u64 = u64::from(stat.f_blocks) * block_size;
+        #[allow(clippy::useless_conversion)]
+        let free: u64 = u64::from(stat.f_bavail) * block_size;
 
         let name = path
             .file_name()
@@ -57,4 +60,37 @@ fn fs_type_for(c_path: &CString) -> String {
         .map(|&b| b as u8)
         .collect();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_volumes_finds_root() {
+        let volumes = list_volumes();
+        assert!(!volumes.is_empty(), "should find at least one volume");
+        // On macOS, / should appear (via /Volumes/Macintosh HD firmlink)
+        let has_root = volumes.iter().any(|v| v.mount_point == "/");
+        assert!(
+            has_root,
+            "should find root volume, got: {:?}",
+            volumes.iter().map(|v| &v.mount_point).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn volumes_have_valid_sizes() {
+        for vol in list_volumes() {
+            assert!(vol.total_bytes > 0, "{}: total should be > 0", vol.name);
+            assert!(vol.used_bytes <= vol.total_bytes, "{}: used > total", vol.name);
+        }
+    }
+
+    #[test]
+    fn root_volume_has_fs_type() {
+        let volumes = list_volumes();
+        let root = volumes.iter().find(|v| v.mount_point == "/").unwrap();
+        assert!(!root.fs_type.is_empty(), "root should have a fs type");
+    }
 }

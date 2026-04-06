@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -10,10 +12,17 @@ pub struct TestServer {
 
 impl TestServer {
     pub fn start(scan_path: &Path) -> Self {
+        Self::spawn(&["--port", "0", "--no-open", scan_path.to_str().unwrap()])
+    }
+
+    pub fn start_picker() -> Self {
+        Self::spawn(&["--port", "0", "--no-open"])
+    }
+
+    fn spawn(args: &[&str]) -> Self {
         let bin = env!("CARGO_BIN_EXE_rsdirstat-gui");
         let mut child = Command::new(bin)
-            .args(["--port", "0", "--no-open"])
-            .arg(scan_path)
+            .args(args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
@@ -30,11 +39,9 @@ impl TestServer {
                     Ok(l) => l,
                     Err(_) => break,
                 };
-                if !sent {
-                    if let Some(u) = line.strip_prefix("Listening on ") {
-                        let _ = tx.send(u.to_string());
-                        sent = true;
-                    }
+                if !sent && let Some(u) = line.strip_prefix("Listening on ") {
+                    let _ = tx.send(u.to_string());
+                    sent = true;
                 }
             }
         });
@@ -79,14 +86,34 @@ pub fn create_test_dir() -> tempfile::TempDir {
     dir
 }
 
+pub async fn launch_browser(
+    browser_name: &str,
+) -> (playwright_rs::Playwright, playwright_rs::Browser, playwright_rs::Page) {
+    let pw = playwright_rs::Playwright::launch().await.unwrap();
+    let browser = match browser_name {
+        "chromium" => pw.chromium().launch().await.unwrap(),
+        "firefox" => pw.firefox().launch().await.unwrap(),
+        "webkit" => pw.webkit().launch().await.unwrap(),
+        _ => panic!("unknown browser: {browser_name}"),
+    };
+    let page = browser.new_page().await.unwrap();
+    page.set_viewport_size(playwright_rs::Viewport {
+        width: 1280,
+        height: 720,
+    })
+    .await
+    .unwrap();
+    (pw, browser, page)
+}
+
 pub async fn wait_for_scan_done(page: &playwright_rs::Page) {
     let status = page.locator("#status").await;
     for _ in 0..100 {
-        if let Ok(Some(text)) = status.text_content().await {
-            if text.contains(" dirs") {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                return;
-            }
+        if let Ok(Some(text)) = status.text_content().await
+            && text.contains(" dirs")
+        {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

@@ -451,4 +451,24 @@ mod tests {
         assert_eq!(&*extensions[1], "toml");
         assert_eq!(&*extensions[2], "json");
     }
+
+    #[test]
+    fn decode_scan_path() {
+        let path = b"/home/user";
+        let mut data = vec![MSG_SCAN_PATH];
+        data.extend_from_slice(&(path.len() as u16).to_le_bytes());
+        data.extend_from_slice(path);
+        let Some(ClientMessage::ScanPath { path }) = ClientMessage::decode(&data) else {
+            panic!("expected ScanPath");
+        };
+        assert_eq!(path, "/home/user");
+    }
+
+    #[test]
+    fn decode_truncated_scan_path_returns_none() {
+        let mut data = vec![MSG_SCAN_PATH];
+        data.extend_from_slice(&50u16.to_le_bytes());
+        data.extend_from_slice(b"short");
+        assert!(ClientMessage::decode(&data).is_none());
+    }
 }

@@ -269,6 +269,8 @@ async fn shutdown_signal(state: Arc<AppState>) {
 }
 
 fn start_scan(state: &Arc<AppState>) {
+    state.scan.done.store(false, Ordering::Relaxed);
+    state.scan.started.store(true, Ordering::Relaxed);
     let (tx, rx) = std::sync::mpsc::channel::<ScanEvent>();
 
     let relay_state = Arc::clone(state);
@@ -317,7 +319,6 @@ fn start_scan(state: &Arc<AppState>) {
         }
     });
 
-    state.scan.started.store(true, Ordering::Relaxed);
     let path = state.scan.root.lock().unwrap().clone();
     let cross_filesystems = state.scan.cross_filesystems;
     tokio::task::spawn_blocking(move || {
@@ -503,17 +504,30 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
 }
 
 fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c < '\u{20}' => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 async fn volumes_handler(
     axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
 ) -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
-    let volumes = scanner::volumes::list_volumes();
+    let volumes = tokio::task::spawn_blocking(scanner::volumes::list_volumes)
+        .await
+        .unwrap_or_default();
     let entries: Vec<String> = volumes
         .iter()
         .map(|v| {

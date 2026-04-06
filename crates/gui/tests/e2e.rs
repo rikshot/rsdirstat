@@ -2,43 +2,51 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestServer, create_test_dir, wait_for_scan_done};
-use playwright_rs::{Playwright, Viewport};
+use common::{TestServer, create_test_dir, launch_browser, wait_for_scan_done};
 
 async fn setup_with(
     browser_name: &str,
 ) -> (
     tempfile::TempDir,
     TestServer,
-    Playwright,
+    playwright_rs::Playwright,
     playwright_rs::Browser,
     playwright_rs::Page,
 ) {
     let dir = create_test_dir();
     let server = TestServer::start(dir.path());
-
-    let pw = Playwright::launch().await.unwrap();
-    let browser = match browser_name {
-        "chromium" => pw.chromium().launch().await.unwrap(),
-        "firefox" => pw.firefox().launch().await.unwrap(),
-        "webkit" => pw.webkit().launch().await.unwrap(),
-        _ => panic!("unknown browser: {browser_name}"),
-    };
-    let page = browser.new_page().await.unwrap();
-    page.set_viewport_size(Viewport {
-        width: 1280,
-        height: 720,
-    })
-    .await
-    .unwrap();
+    let (pw, browser, page) = launch_browser(browser_name).await;
     page.goto(&server.url, None).await.unwrap();
     wait_for_scan_done(&page).await;
-
     (dir, server, pw, browser, page)
 }
 
 async fn run(browser_name: &str, f: impl AsyncFn(&playwright_rs::Page)) {
     let (_dir, _server, _pw, browser, page) = setup_with(browser_name).await;
+    f(&page).await;
+    let _ = browser.close().await;
+}
+
+async fn setup_picker() -> (
+    TestServer,
+    playwright_rs::Playwright,
+    playwright_rs::Browser,
+    playwright_rs::Page,
+) {
+    let server = TestServer::start_picker();
+    let (pw, browser, page) = launch_browser("chromium").await;
+    page.goto(&format!("{}/?picker", server.url), None).await.unwrap();
+    for _ in 0..50 {
+        if page.locator("#picker").await.is_visible().await.unwrap_or(false) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    (server, pw, browser, page)
+}
+
+async fn run_picker(f: impl AsyncFn(&playwright_rs::Page)) {
+    let (_server, _pw, browser, page) = setup_picker().await;
     f(&page).await;
     let _ = browser.close().await;
 }
@@ -227,6 +235,66 @@ async fn breadcrumb_click_navigates_back(page: &playwright_rs::Page) {
     );
 }
 
+async fn picker_volume_click_starts_scan(page: &playwright_rs::Page) {
+    page.locator(".volume-card:first-child")
+        .await
+        .click(None)
+        .await
+        .unwrap();
+
+    // Just wait for the treemap view to appear (MSG_SCAN_START triggers this immediately,
+    // before the actual scan produces results — safe for CI regardless of disk size)
+    for _ in 0..100 {
+        if page.locator("#treemap-view").await.is_visible().await.unwrap_or(false) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("treemap view did not appear after clicking volume");
+}
+
+async fn picker_has_volume_details(page: &playwright_rs::Page) {
+    assert!(page.locator("#picker").await.is_visible().await.unwrap());
+    assert!(
+        page.locator(".volume-card:first-child")
+            .await
+            .is_visible()
+            .await
+            .unwrap(),
+        "should show at least one volume card"
+    );
+
+    let name = page
+        .locator(".volume-card:first-child .volume-name")
+        .await
+        .text_content()
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    assert!(!name.is_empty(), "volume card should have a name");
+
+    let path = page
+        .locator(".volume-card:first-child .volume-path")
+        .await
+        .text_content()
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        path.starts_with('/') || path.contains(":\\"),
+        "volume should have a mount path: {path}"
+    );
+
+    let sizes = page
+        .locator(".volume-card:first-child .volume-sizes")
+        .await
+        .text_content()
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    assert!(sizes.contains("used of"), "should show usage: {sizes}");
+}
+
 async fn rescan_button_works(page: &playwright_rs::Page) {
     let rescan = page.locator("#rescan").await;
     let classes = rescan.evaluate::<String, ()>("el => el.className", None).await.unwrap();
@@ -411,4 +479,14 @@ async fn e2e_breadcrumb_back_webkit() {
 #[tokio::test]
 async fn e2e_rescan_webkit() {
     run("webkit", rescan_button_works).await;
+}
+
+// Picker mode tests (chromium only — testing server/UI logic, not browser compat)
+#[tokio::test]
+async fn e2e_picker_volume_details() {
+    run_picker(picker_has_volume_details).await;
+}
+#[tokio::test]
+async fn e2e_picker_click_starts_scan() {
+    run_picker(picker_volume_click_starts_scan).await;
 }

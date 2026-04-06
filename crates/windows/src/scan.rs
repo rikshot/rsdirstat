@@ -214,8 +214,10 @@ fn scan_directory(
 
             // Read variable-length filename
             let name_ptr = unsafe {
-                (buffer.as_ptr().add(offset) as *const u8).add(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName))
-                    as *const u16
+                buffer
+                    .as_ptr()
+                    .add(offset)
+                    .add(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName)) as *const u16
             };
             let name_slice = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
             let name = String::from_utf16_lossy(name_slice);
