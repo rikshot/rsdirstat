@@ -153,7 +153,7 @@ body {
 }
 
 .hidden {
-    display: none;
+    display: none !important;
 }
 
 .action-button {
@@ -172,6 +172,121 @@ body {
 
 canvas {
     display: block;
+}
+
+/* Picker */
+
+#picker {
+    position: fixed;
+    inset: 0;
+    background: var(--bg);
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 48px 24px 24px;
+    overflow-y: auto;
+}
+
+.picker-header {
+    text-align: center;
+    margin-bottom: 32px;
+
+    & h1 {
+        font-size: 28px;
+        font-weight: 600;
+        color: var(--text);
+        margin-bottom: 8px;
+    }
+    & p {
+        font-size: 14px;
+        color: var(--text-muted);
+    }
+}
+
+.picker-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 12px;
+    width: 100%;
+    max-width: 900px;
+}
+
+.picker-loading {
+    grid-column: 1 / -1;
+    text-align: center;
+    color: var(--text-muted);
+    padding: 32px;
+    font-size: 14px;
+}
+
+.volume-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+
+    &:hover {
+        border-color: var(--link);
+        background: var(--accent);
+    }
+}
+
+.volume-name {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 4px;
+}
+
+.volume-path {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 10px;
+    word-break: break-all;
+}
+
+.volume-bar {
+    height: 6px;
+    background: var(--accent);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-bottom: 6px;
+}
+
+.volume-bar-fill {
+    height: 100%;
+    background: var(--link);
+    border-radius: 3px;
+    min-width: 2px;
+}
+
+.volume-sizes {
+    font-size: 12px;
+    color: var(--text-dim);
+}
+
+.volume-fs {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+.picker-refresh {
+    margin-top: 20px;
+    background: var(--accent);
+    color: var(--link);
+    border: 1px solid var(--border-dim);
+    border-radius: 5px;
+    padding: 6px 16px;
+    cursor: pointer;
+    font-size: 13px;
+
+    &:hover {
+        background: var(--accent-hover);
+    }
 }
 
 #path-bar {

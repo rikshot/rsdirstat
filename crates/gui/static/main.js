@@ -9,6 +9,7 @@ import {
 import { parseLayout } from "./protocol.js";
 import { setupEvents } from "./events.js";
 import { setupToolbar } from "./toolbar.js";
+import { setupPicker, loadVolumes } from "./picker.js";
 
 const BACKGROUND = "#1a1a2e";
 const BREADCRUMB_HEIGHT = 32;
@@ -30,6 +31,9 @@ class TreemapApp {
     this.tooltipSize = this.tooltipElement.querySelector(".tip-size");
     this.tooltipPercent = this.tooltipElement.querySelector(".tip-percent");
     this.tooltipMtime = this.tooltipElement.querySelector(".tip-mtime");
+    this.treemapView = $("treemap-view");
+    this.pickerElement = $("picker");
+    this.changeButton = $("change");
     this.bufferCanvas = document.createElement("canvas");
     this.bufferContext = this.bufferCanvas.getContext("2d", contextOptions);
 
@@ -60,6 +64,7 @@ class TreemapApp {
 
     setupEvents(this);
     setupToolbar(this);
+    setupPicker(this);
     this.resize();
     this.connect();
     this.scheduleTick();
@@ -186,6 +191,25 @@ class TreemapApp {
     return parts.join("/").replace(/\/+/g, "/");
   }
 
+  // Picker
+
+  showPicker() {
+    this.treemapView.classList.add("hidden");
+    this.pickerElement.classList.remove("hidden");
+    loadVolumes(this);
+  }
+
+  hidePicker() {
+    this.pickerElement.classList.add("hidden");
+    this.treemapView.classList.remove("hidden");
+    this.resize();
+  }
+
+  scanPath(path) {
+    this.hidePicker();
+    this.sendBinary(P.encodeScanPath(path));
+  }
+
   // Navigation & hover
 
   clearHover() {
@@ -300,7 +324,10 @@ class TreemapApp {
       let offset = 0;
       const type = view.getUint8(offset++);
 
-      if (type === P.MSG_SCAN_START) {
+      if (type === P.MSG_PICKER_MODE) {
+        this.showPicker();
+      } else if (type === P.MSG_SCAN_START) {
+        this.hidePicker();
         this.layoutRects = [];
         this.breadcrumb = [];
         this.viewRootSize = 0;
@@ -313,7 +340,9 @@ class TreemapApp {
         }
         this.startScanTimer();
         this.buildBreadcrumb();
+        this.changeButton.classList.add("hidden");
       } else if (type === P.MSG_LAYOUT) {
+        this.treemapView.classList.remove("hidden");
         this._handleLayout(parseLayout(view, offset, buffer));
       }
     };
@@ -362,6 +391,7 @@ class TreemapApp {
     this.scheduleTick();
 
     $("rescan").classList.toggle("hidden", !newScanDone);
+    this.changeButton.classList.toggle("hidden", !newScanDone);
     if (!newScanDone) {
       this.startScanTimer();
     } else if (!this.scanDone) {

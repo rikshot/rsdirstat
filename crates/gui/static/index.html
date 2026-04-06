@@ -11,8 +11,10 @@
         <link rel="modulepreload" href="/render.js" />
         <link rel="modulepreload" href="/events.js" />
         <link rel="modulepreload" href="/toolbar.js" />
+        <link rel="modulepreload" href="/picker.js" />
     </head>
     <body>
+        <div id="treemap-view" class="hidden">
         <div id="breadcrumb-bar">
             <div id="crumbs"></div>
             <span id="status">Connecting...</span>
@@ -56,11 +58,21 @@
                 <button id="filter-clear">Clear</button>
             </div>
             <button id="rescan" class="hidden">Rescan</button>
+            <button id="change" class="hidden">Change</button>
         </div>
         <canvas id="treemap"></canvas>
         <div id="path-bar">
             <span id="path-text"></span>
             <span id="path-size"></span>
+        </div>
+        </div>
+        <div id="picker" class="hidden">
+            <div class="picker-header">
+                <h1>rsdirstat</h1>
+                <p>Select a volume to scan</p>
+            </div>
+            <div class="picker-grid"></div>
+            <button class="picker-refresh">Refresh</button>
         </div>
         <div id="tooltip">
             <div class="tip-name"></div>

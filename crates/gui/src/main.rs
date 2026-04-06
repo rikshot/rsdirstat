@@ -12,7 +12,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::routing::get;
 use clap::Parser;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, broadcast, watch};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
 
@@ -30,9 +30,8 @@ use rsdirstat_windows as scanner;
 #[derive(Parser)]
 #[command(name = "rsdirstat-gui", about = "Interactive treemap disk usage visualizer")]
 struct Args {
-    /// Path to scan
-    #[arg(default_value = ".")]
-    path: PathBuf,
+    /// Path to scan (omit to show volume picker)
+    path: Option<PathBuf>,
 
     /// Cross filesystem boundaries
     #[arg(long)]
@@ -64,7 +63,8 @@ struct ScanState {
     tree: RwLock<layout::DirTree>,
     version: AtomicU64,
     done: AtomicBool,
-    root: PathBuf,
+    started: AtomicBool,
+    root: Mutex<PathBuf>,
     cross_filesystems: bool,
 }
 
@@ -85,7 +85,8 @@ struct AppState {
     layout: LayoutBroadcast,
     connections: ConnectionTracker,
     start: Notify,
-    shutdown: Notify,
+    shutdown: watch::Sender<bool>,
+    picker_mode: bool,
 }
 
 impl AppState {
@@ -101,16 +102,24 @@ fn main() -> Result<()> {
     rt.block_on(run_server(args.path, args.all, args.port, args.no_open, args.wait))
 }
 
-async fn run_server(path: PathBuf, cross_filesystems: bool, port: u16, no_open: bool, wait: bool) -> Result<()> {
+async fn run_server(
+    path: Option<PathBuf>,
+    cross_filesystems: bool,
+    port: u16,
+    no_open: bool,
+    wait: bool,
+) -> Result<()> {
     let (layout_tx, _) = broadcast::channel::<Vec<u8>>(64);
-    let scan_root = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let picker_mode = path.is_none();
+    let scan_root = path.map(|p| std::fs::canonicalize(&p).unwrap_or(p)).unwrap_or_default();
 
     let state = Arc::new(AppState {
         scan: ScanState {
             tree: RwLock::new(layout::DirTree::new()),
             version: AtomicU64::new(0),
             done: AtomicBool::new(false),
-            root: scan_root,
+            started: AtomicBool::new(false),
+            root: Mutex::new(scan_root),
             cross_filesystems,
         },
         view: Mutex::new(ViewConfig {
@@ -130,7 +139,8 @@ async fn run_server(path: PathBuf, cross_filesystems: bool, port: u16, no_open: 
             had_any: AtomicBool::new(false),
         },
         start: Notify::new(),
-        shutdown: Notify::new(),
+        shutdown: watch::channel(false).0,
+        picker_mode,
     });
 
     let scan_state = Arc::clone(&state);
@@ -197,7 +207,7 @@ async fn run_server(path: PathBuf, cross_filesystems: bool, port: u16, no_open: 
         }
     });
 
-    if !wait {
+    if !picker_mode && !wait {
         state.start.notify_one();
     }
 
@@ -206,6 +216,7 @@ async fn run_server(path: PathBuf, cross_filesystems: bool, port: u16, no_open: 
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/start", get(start_handler))
+        .route("/volumes", get(volumes_handler))
         .with_state(Arc::clone(&state))
         .fallback_service(ServeDir::new(&static_dir))
         .layer(CompressionLayer::new());
@@ -215,7 +226,9 @@ async fn run_server(path: PathBuf, cross_filesystems: bool, port: u16, no_open: 
     eprintln!("Listening on http://localhost:{actual_port}");
 
     if !no_open {
-        let url = if wait {
+        let url = if picker_mode {
+            format!("http://localhost:{actual_port}/?picker")
+        } else if wait {
             format!("http://localhost:{actual_port}/?wait")
         } else {
             format!("http://localhost:{actual_port}")
@@ -233,6 +246,7 @@ async fn run_server(path: PathBuf, cross_filesystems: bool, port: u16, no_open: 
 }
 
 async fn shutdown_signal(state: Arc<AppState>) {
+    let mut rx = state.shutdown.subscribe();
     #[cfg(unix)]
     {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -240,16 +254,18 @@ async fn shutdown_signal(state: Arc<AppState>) {
         tokio::select! {
             _ = sigterm.recv() => {},
             _ = tokio::signal::ctrl_c() => {},
-            _ = state.shutdown.notified() => {},
+            _ = rx.changed() => {},
         }
     }
     #[cfg(not(unix))]
     {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
-            _ = state.shutdown.notified() => {},
+            _ = rx.changed() => {},
         }
     }
+    // Signal all WS handlers to close
+    let _ = state.shutdown.send(true);
 }
 
 fn start_scan(state: &Arc<AppState>) {
@@ -301,7 +317,8 @@ fn start_scan(state: &Arc<AppState>) {
         }
     });
 
-    let path = state.scan.root.clone();
+    state.scan.started.store(true, Ordering::Relaxed);
+    let path = state.scan.root.lock().unwrap().clone();
     let cross_filesystems = state.scan.cross_filesystems;
     tokio::task::spawn_blocking(move || {
         if let Err(e) = scanner::scan::scan(&path, cross_filesystems, tx) {
@@ -342,13 +359,22 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     state.connections.had_any.store(true, Ordering::Relaxed);
 
     let last = state.layout.last.lock().unwrap().clone();
-    if let Some(message) = last
-        && socket.send(Message::Binary(message.into())).await.is_err()
+    if let Some(message) = last {
+        if socket.send(Message::Binary(message.into())).await.is_err() {
+            return;
+        }
+    } else if state.picker_mode
+        && !state.scan.started.load(Ordering::Relaxed)
+        && socket
+            .send(Message::Binary(protocol::encode_picker_mode().into()))
+            .await
+            .is_err()
     {
         return;
     }
 
     let mut layout_rx = state.layout.tx.subscribe();
+    let mut shutdown_rx = state.shutdown.subscribe();
 
     loop {
         tokio::select! {
@@ -372,6 +398,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
                     Err(_) => break,
                 }
             }
+            _ = shutdown_rx.changed() => break,
         }
     }
 
@@ -382,7 +409,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
             if server.connections.count.load(Ordering::Relaxed) == 0
                 && server.connections.had_any.load(Ordering::Relaxed)
             {
-                server.shutdown.notify_one();
+                let _ = server.shutdown.send(true);
             }
         });
     }
@@ -417,15 +444,17 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
             state.invalidate_layout();
         }
         ClientMessage::RevealDir { id } => {
+            let root = state.scan.root.lock().unwrap().clone();
             let tree = state.scan.tree.read().unwrap();
-            if let Some(path) = tree.full_path(id, &state.scan.root) {
+            if let Some(path) = tree.full_path(id, &root) {
                 drop(tree);
                 reveal_in_file_manager(&path);
             }
         }
         ClientMessage::RevealFile { dir_id, name } => {
+            let root = state.scan.root.lock().unwrap().clone();
             let tree = state.scan.tree.read().unwrap();
-            if let Some(path) = tree.full_path(dir_id, &state.scan.root).map(|p| p.join(name)) {
+            if let Some(path) = tree.full_path(dir_id, &root).map(|p| p.join(name)) {
                 drop(tree);
                 reveal_in_file_manager(&path);
             }
@@ -462,5 +491,44 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
             state.view.lock().unwrap().filter = FilterConfig::default();
             state.invalidate_layout();
         }
+        ClientMessage::ScanPath { path } => {
+            let can_start = !state.scan.started.load(Ordering::Relaxed) || state.scan.done.load(Ordering::Relaxed);
+            if can_start {
+                let scan_root = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
+                *state.scan.root.lock().unwrap() = scan_root;
+                start_scan(state);
+            }
+        }
     }
+}
+
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+async fn volumes_handler(
+    axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
+) -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
+    let volumes = scanner::volumes::list_volumes();
+    let entries: Vec<String> = volumes
+        .iter()
+        .map(|v| {
+            format!(
+                r#"{{"name":"{}","mountPoint":"{}","totalBytes":{},"usedBytes":{},"fsType":"{}"}}"#,
+                json_escape(&v.name),
+                json_escape(&v.mount_point),
+                v.total_bytes,
+                v.used_bytes,
+                json_escape(&v.fs_type),
+            )
+        })
+        .collect();
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        format!("[{}]", entries.join(",")),
+    )
 }

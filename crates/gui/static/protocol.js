@@ -2,6 +2,7 @@ import { applyColors } from "./util.js";
 
 export const MSG_SCAN_START = 1;
 export const MSG_LAYOUT = 2;
+export const MSG_PICKER_MODE = 3;
 
 const MSG_VIEWPORT = 1;
 const MSG_NAVIGATE = 2;
@@ -14,6 +15,7 @@ const MSG_FILTER_EXT = 8;
 const MSG_FILTER_SIZE = 9;
 const MSG_FILTER_NAME = 10;
 const MSG_CLEAR_FILTER = 11;
+const MSG_SCAN_PATH = 12;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -80,6 +82,15 @@ export function encodeFilterSize(min, max) {
   msg.setUint8(0, MSG_FILTER_SIZE);
   msg.setBigUint64(1, BigInt(min), true);
   msg.setBigUint64(9, BigInt(max), true);
+  return new Uint8Array(msg.buffer);
+}
+
+export function encodeScanPath(path) {
+  const pathBytes = textEncoder.encode(path);
+  const msg = new DataView(new ArrayBuffer(3 + pathBytes.length));
+  msg.setUint8(0, MSG_SCAN_PATH);
+  msg.setUint16(1, pathBytes.length, true);
+  new Uint8Array(msg.buffer).set(pathBytes, 3);
   return new Uint8Array(msg.buffer);
 }
 

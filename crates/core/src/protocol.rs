@@ -26,6 +26,7 @@ pub enum ScanEvent {
 // Server → client message tags
 pub const MSG_SCAN_START: u8 = 1;
 pub const MSG_LAYOUT: u8 = 2;
+pub const MSG_PICKER_MODE: u8 = 3;
 
 /// Client → server WebSocket messages.
 #[derive(Debug)]
@@ -41,6 +42,7 @@ pub enum ClientMessage {
     FilterSize { min: u64, max: u64 },
     FilterName { pattern: String },
     ClearFilter,
+    ScanPath { path: String },
 }
 
 const MSG_VIEWPORT: u8 = 1;
@@ -54,6 +56,11 @@ const MSG_FILTER_EXT: u8 = 8;
 const MSG_FILTER_SIZE: u8 = 9;
 const MSG_FILTER_NAME: u8 = 10;
 const MSG_CLEAR_FILTER: u8 = 11;
+const MSG_SCAN_PATH: u8 = 12;
+
+pub fn encode_picker_mode() -> Vec<u8> {
+    vec![MSG_PICKER_MODE]
+}
 
 pub fn encode_scan_start(path: &str) -> Vec<u8> {
     let path_bytes = path.as_bytes();
@@ -171,6 +178,14 @@ impl ClientMessage {
                 Some(ClientMessage::FilterName { pattern })
             }
             MSG_CLEAR_FILTER => Some(ClientMessage::ClearFilter),
+            MSG_SCAN_PATH if data.len() >= 3 => {
+                let len = u16::from_le_bytes(data[1..3].try_into().ok()?) as usize;
+                if data.len() < 3 + len {
+                    return None;
+                }
+                let path = std::str::from_utf8(&data[3..3 + len]).ok()?.to_string();
+                Some(ClientMessage::ScanPath { path })
+            }
             _ => None,
         }
     }
