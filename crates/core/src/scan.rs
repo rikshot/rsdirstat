@@ -22,36 +22,6 @@ pub struct WorkQueue<T> {
     condvar: Condvar,
 }
 
-pub struct WorkGuard<'a, T> {
-    queue: &'a WorkQueue<T>,
-    item: Option<T>,
-}
-
-impl<T> WorkGuard<'_, T> {
-    pub fn into_inner(mut self) -> T {
-        self.item.take().unwrap()
-    }
-}
-
-impl<T> std::ops::Deref for WorkGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        self.item.as_ref().unwrap()
-    }
-}
-
-impl<T> std::ops::DerefMut for WorkGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        self.item.as_mut().unwrap()
-    }
-}
-
-impl<T> Drop for WorkGuard<'_, T> {
-    fn drop(&mut self) {
-        self.queue.finish_one();
-    }
-}
-
 impl<T> Default for WorkQueue<T> {
     fn default() -> Self {
         Self::new()
@@ -84,14 +54,14 @@ impl<T> WorkQueue<T> {
         }
     }
 
-    pub fn take(&self) -> Option<WorkGuard<'_, T>> {
+    /// Takes the next item from the queue, blocking until one is available.
+    /// Returns `None` when all work is done (queue empty and pending == 0).
+    /// The caller MUST call `finish_one()` after processing the item.
+    pub fn take(&self) -> Option<T> {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if let Some(item) = inner.queue.pop() {
-                return Some(WorkGuard {
-                    queue: self,
-                    item: Some(item),
-                });
+                return Some(item);
             }
             if inner.pending == 0 {
                 self.condvar.notify_all();
@@ -101,7 +71,9 @@ impl<T> WorkQueue<T> {
         }
     }
 
-    fn finish_one(&self) {
+    /// Signals that one work item has been fully processed.
+    /// Must be called AFTER processing is complete and any child items have been pushed.
+    pub fn finish_one(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.pending -= 1;
         if inner.pending == 0 {
@@ -159,9 +131,12 @@ mod tests {
     fn push_and_take_lifo() {
         let q = WorkQueue::new();
         q.push(vec![1, 2, 3]);
-        assert_eq!(*q.take().unwrap(), 3);
-        assert_eq!(*q.take().unwrap(), 2);
-        assert_eq!(*q.take().unwrap(), 1);
+        assert_eq!(q.take().unwrap(), 3);
+        q.finish_one();
+        assert_eq!(q.take().unwrap(), 2);
+        q.finish_one();
+        assert_eq!(q.take().unwrap(), 1);
+        q.finish_one();
     }
 
     #[test]
@@ -170,25 +145,17 @@ mod tests {
         q.push(vec![10, 20, 30]);
         assert_eq!(q.pending(), 3);
 
-        let guard = q.take().unwrap();
+        let _ = q.take().unwrap();
         assert_eq!(q.pending(), 3);
-
-        drop(guard);
+        q.finish_one();
         assert_eq!(q.pending(), 2);
 
-        drop(q.take().unwrap());
+        let _ = q.take().unwrap();
+        q.finish_one();
         assert_eq!(q.pending(), 1);
-        drop(q.take().unwrap());
-        assert_eq!(q.pending(), 0);
-    }
 
-    #[test]
-    fn into_inner() {
-        let q = WorkQueue::new();
-        q.push(vec![42]);
-        let guard = q.take().unwrap();
-        let val = guard.into_inner();
-        assert_eq!(val, 42);
+        let _ = q.take().unwrap();
+        q.finish_one();
         assert_eq!(q.pending(), 0);
     }
 
@@ -212,17 +179,6 @@ mod tests {
     }
 
     #[test]
-    fn deref_and_deref_mut() {
-        let q = WorkQueue::new();
-        q.push(vec![String::from("hello")]);
-
-        let mut guard = q.take().unwrap();
-        assert_eq!(guard.len(), 5);
-        guard.push_str(" world");
-        assert_eq!(&*guard, "hello world");
-    }
-
-    #[test]
     fn take_returns_none_when_empty_and_no_pending() {
         let q: WorkQueue<i32> = WorkQueue::new();
         assert!(q.take().is_none());
@@ -241,9 +197,9 @@ mod tests {
                 let q = Arc::clone(&q);
                 let collected = Arc::clone(&collected);
                 thread::spawn(move || {
-                    while let Some(guard) = q.take() {
-                        let val = guard.into_inner();
+                    while let Some(val) = q.take() {
                         collected.lock().unwrap().push(val);
+                        q.finish_one();
                     }
                 })
             })
@@ -266,15 +222,57 @@ mod tests {
         let q = Arc::new(WorkQueue::new());
         q.push(vec![1]);
 
-        let guard = q.take().unwrap();
-        assert_eq!(*guard, 1);
+        let val = q.take().unwrap();
+        assert_eq!(val, 1);
 
         let q2 = Arc::clone(&q);
         let handle = thread::spawn(move || q2.take().is_none());
 
-        drop(guard);
+        q.finish_one();
 
         assert!(handle.join().unwrap());
         assert_eq!(q.pending(), 0);
+    }
+
+    /// Regression test: workers must stay alive while items spawn child items.
+    /// If finish_one() is called before child items are pushed, other workers
+    /// see pending==0 and exit, collapsing the scan to single-threaded.
+    #[test]
+    fn workers_stay_alive_during_child_spawning() {
+        let q = Arc::new(WorkQueue::new());
+        let thread_ids = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        // Push one root item that will spawn children
+        q.push(vec![0u32]);
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let q = Arc::clone(&q);
+                let thread_ids = Arc::clone(&thread_ids);
+                thread::spawn(move || {
+                    while let Some(depth) = q.take() {
+                        thread_ids.lock().unwrap().insert(thread::current().id());
+
+                        // Simulate I/O work that discovers children
+                        thread::sleep(Duration::from_micros(100));
+                        if depth < 3 {
+                            q.push(vec![depth + 1; 4]);
+                        }
+                        q.finish_one();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(q.pending(), 0);
+        let unique_threads = thread_ids.lock().unwrap().len();
+        assert!(
+            unique_threads >= 2,
+            "only {unique_threads} thread(s) participated — work queue lost parallelism"
+        );
     }
 }

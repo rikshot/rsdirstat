@@ -109,8 +109,7 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
             thread::spawn(move || {
                 let mut buffer = vec![0u8; BUF_SIZE];
 
-                while let Some(guard) = work.take() {
-                    let item = guard.into_inner();
+                while let Some(item) = work.take() {
                     *active[tid].lock().unwrap() = item.path.clone();
                     scan_directory(
                         item.fd,
@@ -125,6 +124,7 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
                         &visited,
                         &item.path,
                     );
+                    work.finish_one();
                 }
             })
         })
