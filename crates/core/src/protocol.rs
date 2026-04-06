@@ -2,6 +2,7 @@ use crate::layout::LayoutRect;
 use crate::tree::BreadcrumbEntry;
 
 /// Scanner → server internal events (not sent over WebSocket).
+#[derive(Debug)]
 pub enum ScanEvent {
     ScanStart {
         path: String,
@@ -27,6 +28,7 @@ pub const MSG_SCAN_START: u8 = 1;
 pub const MSG_LAYOUT: u8 = 2;
 
 /// Client → server WebSocket messages.
+#[derive(Debug)]
 pub enum ClientMessage {
     Viewport { width: f32, height: f32 },
     Navigate { id: u64 },
@@ -171,5 +173,267 @@ impl ClientMessage {
             MSG_CLEAR_FILTER => Some(ClientMessage::ClearFilter),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::LayoutRect;
+    use crate::tree::BreadcrumbEntry;
+
+    #[test]
+    fn encode_scan_start_basic() {
+        let buf = encode_scan_start("/home/user");
+        assert_eq!(buf[0], MSG_SCAN_START);
+        let len = u16::from_le_bytes([buf[1], buf[2]]);
+        assert_eq!(len, 10);
+        assert_eq!(&buf[3..], b"/home/user");
+    }
+
+    #[test]
+    fn encode_scan_start_empty_path() {
+        let buf = encode_scan_start("");
+        assert_eq!(buf[0], MSG_SCAN_START);
+        let len = u16::from_le_bytes([buf[1], buf[2]]);
+        assert_eq!(len, 0);
+        assert_eq!(buf.len(), 3);
+    }
+
+    #[test]
+    fn encode_layout_header_fields() {
+        let breadcrumb = vec![BreadcrumbEntry {
+            id: 42,
+            name: "root".into(),
+        }];
+        let rects = vec![LayoutRect {
+            id: -1,
+            parent_id: 0,
+            x: 1.0,
+            y: 2.0,
+            w: 100.0,
+            h: 50.0,
+            name: "dir".into(),
+            hue: 120,
+            size: 9999,
+            depth: 3,
+            is_container: true,
+            is_files: false,
+            is_file: false,
+            header_height: 20.0,
+            mtime: 1700000000,
+        }];
+        let buf = encode_layout(5000, 7, true, &breadcrumb, &rects);
+
+        assert_eq!(buf[0], MSG_LAYOUT);
+        assert_eq!(u64::from_le_bytes(buf[1..9].try_into().unwrap()), 5000);
+        assert_eq!(u32::from_le_bytes(buf[9..13].try_into().unwrap()), 7);
+        assert_eq!(buf[13], 1);
+        assert_eq!(u16::from_le_bytes(buf[14..16].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), 42);
+        assert_eq!(u16::from_le_bytes(buf[24..26].try_into().unwrap()), 4);
+        assert_eq!(&buf[26..30], b"root");
+        assert_eq!(u32::from_le_bytes(buf[30..34].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn decode_viewport() {
+        let mut data = vec![MSG_VIEWPORT];
+        data.extend_from_slice(&320.0f32.to_le_bytes());
+        data.extend_from_slice(&240.0f32.to_le_bytes());
+        let Some(ClientMessage::Viewport { width, height }) = ClientMessage::decode(&data) else {
+            panic!("expected Viewport, got {:?}", ClientMessage::decode(&data));
+        };
+        assert_eq!(width, 320.0);
+        assert_eq!(height, 240.0);
+    }
+
+    #[test]
+    fn decode_navigate() {
+        let mut data = vec![MSG_NAVIGATE];
+        data.extend_from_slice(&77u64.to_le_bytes());
+        let Some(ClientMessage::Navigate { id }) = ClientMessage::decode(&data) else {
+            panic!("expected Navigate");
+        };
+        assert_eq!(id, 77);
+    }
+
+    #[test]
+    fn decode_reveal_dir() {
+        let mut data = vec![MSG_REVEAL_DIR];
+        data.extend_from_slice(&99u64.to_le_bytes());
+        let Some(ClientMessage::RevealDir { id }) = ClientMessage::decode(&data) else {
+            panic!("expected RevealDir");
+        };
+        assert_eq!(id, 99);
+    }
+
+    #[test]
+    fn decode_reveal_file() {
+        let mut data = vec![MSG_REVEAL_FILE];
+        data.extend_from_slice(&5u64.to_le_bytes());
+        let name = b"hello.txt";
+        data.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        data.extend_from_slice(name);
+        let Some(ClientMessage::RevealFile { dir_id, name }) = ClientMessage::decode(&data) else {
+            panic!("expected RevealFile");
+        };
+        assert_eq!(dir_id, 5);
+        assert_eq!(name, "hello.txt");
+    }
+
+    #[test]
+    fn decode_rescan() {
+        assert!(matches!(
+            ClientMessage::decode(&[MSG_RESCAN]),
+            Some(ClientMessage::Rescan)
+        ));
+    }
+
+    #[test]
+    fn decode_set_depth() {
+        let data = vec![MSG_SET_DEPTH, 5];
+        let Some(ClientMessage::SetDepth { depth }) = ClientMessage::decode(&data) else {
+            panic!("expected SetDepth");
+        };
+        assert_eq!(depth, 5);
+    }
+
+    #[test]
+    fn decode_color_mode() {
+        let data = vec![MSG_COLOR_MODE, 2];
+        let Some(ClientMessage::ColorMode { mode }) = ClientMessage::decode(&data) else {
+            panic!("expected ColorMode");
+        };
+        assert_eq!(mode, 2);
+    }
+
+    #[test]
+    fn decode_filter_ext_single() {
+        let mut data = vec![MSG_FILTER_EXT, 1];
+        data.push(2);
+        data.extend_from_slice(b"rs");
+        let Some(ClientMessage::FilterExt { extensions }) = ClientMessage::decode(&data) else {
+            panic!("expected FilterExt");
+        };
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(&*extensions[0], "rs");
+    }
+
+    #[test]
+    fn decode_filter_size() {
+        let mut data = vec![MSG_FILTER_SIZE];
+        data.extend_from_slice(&1024u64.to_le_bytes());
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+        let Some(ClientMessage::FilterSize { min, max }) = ClientMessage::decode(&data) else {
+            panic!("expected FilterSize");
+        };
+        assert_eq!(min, 1024);
+        assert_eq!(max, u64::MAX);
+    }
+
+    #[test]
+    fn decode_filter_name() {
+        let pattern = b"Foo";
+        let mut data = vec![MSG_FILTER_NAME];
+        data.extend_from_slice(&(pattern.len() as u16).to_le_bytes());
+        data.extend_from_slice(pattern);
+        let Some(ClientMessage::FilterName { pattern }) = ClientMessage::decode(&data) else {
+            panic!("expected FilterName");
+        };
+        assert_eq!(pattern, "foo");
+    }
+
+    #[test]
+    fn decode_clear_filter() {
+        assert!(matches!(
+            ClientMessage::decode(&[MSG_CLEAR_FILTER]),
+            Some(ClientMessage::ClearFilter)
+        ));
+    }
+
+    #[test]
+    fn decode_empty_data_returns_none() {
+        assert!(ClientMessage::decode(&[]).is_none());
+    }
+
+    #[test]
+    fn decode_unknown_tag_returns_none() {
+        assert!(ClientMessage::decode(&[255]).is_none());
+    }
+
+    #[test]
+    fn decode_truncated_viewport_returns_none() {
+        let mut data = vec![MSG_VIEWPORT];
+        data.extend_from_slice(&100.0f32.to_le_bytes());
+        assert!(ClientMessage::decode(&data).is_none());
+    }
+
+    #[test]
+    fn decode_truncated_navigate_returns_none() {
+        let data = vec![MSG_NAVIGATE, 0, 0, 0, 0];
+        assert!(ClientMessage::decode(&data).is_none());
+    }
+
+    #[test]
+    fn decode_truncated_reveal_file_name_returns_none() {
+        let mut data = vec![MSG_REVEAL_FILE];
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&100u16.to_le_bytes());
+        data.extend_from_slice(b"abc");
+        assert!(ClientMessage::decode(&data).is_none());
+    }
+
+    #[test]
+    fn decode_truncated_filter_name_returns_none() {
+        let mut data = vec![MSG_FILTER_NAME];
+        data.extend_from_slice(&50u16.to_le_bytes());
+        assert!(ClientMessage::decode(&data).is_none());
+    }
+
+    #[test]
+    fn set_depth_clamped_zero_to_one() {
+        let data = vec![MSG_SET_DEPTH, 0];
+        let Some(ClientMessage::SetDepth { depth }) = ClientMessage::decode(&data) else {
+            panic!("expected SetDepth");
+        };
+        assert_eq!(depth, 1);
+    }
+
+    #[test]
+    fn set_depth_clamped_255_to_10() {
+        let data = vec![MSG_SET_DEPTH, 255];
+        let Some(ClientMessage::SetDepth { depth }) = ClientMessage::decode(&data) else {
+            panic!("expected SetDepth");
+        };
+        assert_eq!(depth, 10);
+    }
+
+    #[test]
+    fn filter_name_lowercases_input() {
+        let pattern = b"FooBar.TXT";
+        let mut data = vec![MSG_FILTER_NAME];
+        data.extend_from_slice(&(pattern.len() as u16).to_le_bytes());
+        data.extend_from_slice(pattern);
+        let Some(ClientMessage::FilterName { pattern }) = ClientMessage::decode(&data) else {
+            panic!("expected FilterName");
+        };
+        assert_eq!(pattern, "foobar.txt");
+    }
+
+    #[test]
+    fn filter_ext_multiple_extensions() {
+        let mut data = vec![MSG_FILTER_EXT, 3];
+        for ext in &[b"rs" as &[u8], b"toml", b"json"] {
+            data.push(ext.len() as u8);
+            data.extend_from_slice(ext);
+        }
+        let Some(ClientMessage::FilterExt { extensions }) = ClientMessage::decode(&data) else {
+            panic!("expected FilterExt");
+        };
+        assert_eq!(extensions.len(), 3);
+        assert_eq!(&*extensions[0], "rs");
+        assert_eq!(&*extensions[1], "toml");
+        assert_eq!(&*extensions[2], "json");
     }
 }

@@ -287,3 +287,415 @@ impl DirTree {
         Some(path)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Build sample tree:
+    ///   root (id=1, size=0)
+    ///     dir_a (id=2, size=100)
+    ///       dir_c (id=4, size=50)
+    ///     dir_b (id=3, size=200)
+    fn sample_tree() -> DirTree {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 1000);
+        tree.insert_dir(2, 1, "dir_a", 100, 2000);
+        tree.insert_dir(3, 1, "dir_b", 200, 3000);
+        tree.insert_dir(4, 2, "dir_c", 50, 4000);
+        tree
+    }
+
+    #[test]
+    fn filter_default_is_inactive() {
+        let f = FilterConfig::default();
+        assert!(!f.is_active());
+    }
+
+    #[test]
+    fn filter_active_with_extensions() {
+        let f = FilterConfig {
+            extensions: vec!["rs".into()],
+            ..Default::default()
+        };
+        assert!(f.is_active());
+    }
+
+    #[test]
+    fn filter_active_with_min_size() {
+        let f = FilterConfig {
+            min_size: 1,
+            ..Default::default()
+        };
+        assert!(f.is_active());
+    }
+
+    #[test]
+    fn filter_active_with_max_size() {
+        let f = FilterConfig {
+            max_size: 100,
+            ..Default::default()
+        };
+        assert!(f.is_active());
+    }
+
+    #[test]
+    fn filter_active_with_name_pattern() {
+        let f = FilterConfig {
+            name_pattern: "foo".into(),
+            ..Default::default()
+        };
+        assert!(f.is_active());
+    }
+
+    #[test]
+    fn filter_default_matches_everything() {
+        let f = FilterConfig::default();
+        assert!(f.matches_file("anything.txt", 0));
+        assert!(f.matches_file("anything.txt", u64::MAX));
+    }
+
+    #[test]
+    fn filter_min_size() {
+        let f = FilterConfig {
+            min_size: 100,
+            ..Default::default()
+        };
+        assert!(!f.matches_file("a.txt", 99));
+        assert!(f.matches_file("a.txt", 100));
+        assert!(f.matches_file("a.txt", 101));
+    }
+
+    #[test]
+    fn filter_max_size() {
+        let f = FilterConfig {
+            max_size: 100,
+            ..Default::default()
+        };
+        assert!(f.matches_file("a.txt", 99));
+        assert!(f.matches_file("a.txt", 100));
+        assert!(!f.matches_file("a.txt", 101));
+    }
+
+    #[test]
+    fn filter_size_range() {
+        let f = FilterConfig {
+            min_size: 50,
+            max_size: 150,
+            ..Default::default()
+        };
+        assert!(!f.matches_file("a.txt", 49));
+        assert!(f.matches_file("a.txt", 50));
+        assert!(f.matches_file("a.txt", 100));
+        assert!(f.matches_file("a.txt", 150));
+        assert!(!f.matches_file("a.txt", 151));
+    }
+
+    #[test]
+    fn filter_extension_case_insensitive() {
+        let f = FilterConfig {
+            extensions: vec!["rs".into(), "toml".into()],
+            ..Default::default()
+        };
+        assert!(f.matches_file("main.rs", 10));
+        assert!(f.matches_file("main.RS", 10));
+        assert!(f.matches_file("Cargo.TOML", 10));
+        assert!(!f.matches_file("readme.md", 10));
+        assert!(!f.matches_file("noext", 10));
+    }
+
+    #[test]
+    fn filter_name_pattern_case_insensitive_substring() {
+        let f = FilterConfig {
+            name_pattern: "read".into(),
+            ..Default::default()
+        };
+        assert!(f.matches_file("README.md", 10));
+        assert!(f.matches_file("read.txt", 10));
+        assert!(f.matches_file("unreadable.rs", 10));
+        assert!(!f.matches_file("write.rs", 10));
+    }
+
+    #[test]
+    fn filter_combined_extension_and_size() {
+        let f = FilterConfig {
+            extensions: vec!["rs".into()],
+            min_size: 100,
+            ..Default::default()
+        };
+        // wrong extension
+        assert!(!f.matches_file("a.txt", 200));
+        // right extension, too small
+        assert!(!f.matches_file("a.rs", 50));
+        // both match
+        assert!(f.matches_file("a.rs", 100));
+    }
+
+    #[test]
+    fn new_tree_is_empty() {
+        let tree = DirTree::new();
+        assert!(tree.nodes.is_empty());
+        assert!(tree.root_id.is_none());
+        assert!(tree.recursive_sizes.is_empty());
+        assert!(tree.scan_path.is_empty());
+        assert_eq!(tree.mtime_range, (i64::MAX, 0));
+    }
+
+    #[test]
+    fn insert_root_dir() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 1000);
+        assert_eq!(tree.root_id, Some(1));
+        assert!(tree.nodes.contains_key(&1));
+        assert_eq!(&*tree.nodes[&1].name, "root");
+        assert_eq!(tree.nodes[&1].parent, 0);
+    }
+
+    #[test]
+    fn insert_child_dirs() {
+        let tree = sample_tree();
+        // root has two children
+        assert_eq!(tree.nodes[&1].children, vec![2, 3]);
+        // dir_a has one child
+        assert_eq!(tree.nodes[&2].children, vec![4]);
+        // dir_b and dir_c have no children
+        assert!(tree.nodes[&3].children.is_empty());
+        assert!(tree.nodes[&4].children.is_empty());
+    }
+
+    #[test]
+    fn insert_out_of_order_creates_parent_placeholder() {
+        let mut tree = DirTree::new();
+        // insert child before parent exists
+        tree.insert_dir(5, 2, "child", 10, 100);
+        // parent node 2 should exist as a placeholder with child 5
+        assert!(tree.nodes.contains_key(&2));
+        assert_eq!(tree.nodes[&2].children, vec![5]);
+        // now insert the actual parent
+        tree.insert_dir(2, 1, "dir_a", 100, 200);
+        assert_eq!(&*tree.nodes[&2].name, "dir_a");
+        assert_eq!(tree.nodes[&2].direct_size, 100);
+        // child link preserved
+        assert!(tree.nodes[&2].children.contains(&5));
+    }
+
+    #[test]
+    fn insert_file_adds_to_parent() {
+        let mut tree = sample_tree();
+        tree.insert_file(2, "hello.rs", 75, 5000);
+        tree.insert_file(2, "world.txt", 25, 5001);
+        assert_eq!(tree.nodes[&2].files.len(), 2);
+        assert_eq!(&*tree.nodes[&2].files[0].name, "hello.rs");
+        assert_eq!(tree.nodes[&2].files[0].size, 75);
+        assert_eq!(&*tree.nodes[&2].files[1].name, "world.txt");
+    }
+
+    #[test]
+    fn propagate_size_on_insert() {
+        let tree = sample_tree();
+        // dir_c(50) is under dir_a(100), both under root(0)
+        // root = 0 + 100 + 200 + 50 = 350
+        assert_eq!(tree.recursive_sizes[&1], 350);
+        // dir_a = 100 + 50 = 150
+        assert_eq!(tree.recursive_sizes[&2], 150);
+        // dir_b = 200
+        assert_eq!(tree.recursive_sizes[&3], 200);
+        // dir_c = 50
+        assert_eq!(tree.recursive_sizes[&4], 50);
+    }
+
+    #[test]
+    fn recompute_sizes_matches_propagated() {
+        let mut tree = sample_tree();
+        // Manually corrupt recursive_sizes, then recompute
+        tree.recursive_sizes.clear();
+        tree.recompute_sizes();
+        assert_eq!(tree.recursive_sizes[&1], 350);
+        assert_eq!(tree.recursive_sizes[&2], 150);
+        assert_eq!(tree.recursive_sizes[&3], 200);
+        assert_eq!(tree.recursive_sizes[&4], 50);
+    }
+
+    #[test]
+    fn recompute_sizes_empty_tree() {
+        let mut tree = DirTree::new();
+        tree.recompute_sizes();
+        assert!(tree.recursive_sizes.is_empty());
+    }
+
+    #[test]
+    fn bottom_up_order_contains_all_nodes() {
+        let tree = sample_tree();
+        let order = tree.bottom_up_order();
+        assert_eq!(order.len(), 4);
+        // root is first (top-down BFS-like via stack)
+        assert_eq!(order[0], 1);
+        // all nodes present
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn bottom_up_order_empty_tree() {
+        let tree = DirTree::new();
+        assert!(tree.bottom_up_order().is_empty());
+    }
+
+    #[test]
+    fn bottom_up_order_reversed_is_leaves_first() {
+        let tree = sample_tree();
+        let order = tree.bottom_up_order();
+        // When reversed, leaves must come before their parents.
+        let mut rev = order.clone();
+        rev.reverse();
+        let pos = |id: u64| rev.iter().position(|&x| x == id).unwrap();
+        // dir_c before dir_a
+        assert!(pos(4) < pos(2));
+        // dir_a and dir_b before root
+        assert!(pos(2) < pos(1));
+        assert!(pos(3) < pos(1));
+    }
+
+    #[test]
+    fn full_path_root_returns_root_path() {
+        let tree = sample_tree();
+        let p = tree.full_path(1, Path::new("/home/user")).unwrap();
+        assert_eq!(p, PathBuf::from("/home/user"));
+    }
+
+    #[test]
+    fn full_path_single_level() {
+        let tree = sample_tree();
+        let p = tree.full_path(2, Path::new("/home/user")).unwrap();
+        assert_eq!(p, PathBuf::from("/home/user/dir_a"));
+    }
+
+    #[test]
+    fn full_path_multi_level() {
+        let tree = sample_tree();
+        let p = tree.full_path(4, Path::new("/home/user")).unwrap();
+        assert_eq!(p, PathBuf::from("/home/user/dir_a/dir_c"));
+    }
+
+    #[test]
+    fn full_path_no_root_returns_none() {
+        let tree = DirTree::new();
+        assert!(tree.full_path(1, Path::new("/tmp")).is_none());
+    }
+
+    #[test]
+    fn full_path_missing_node_returns_none() {
+        let tree = sample_tree();
+        assert!(tree.full_path(999, Path::new("/tmp")).is_none());
+    }
+
+    #[test]
+    fn breadcrumb_from_leaf() {
+        let tree = sample_tree();
+        let crumbs = tree.breadcrumb(4);
+        let names: Vec<&str> = crumbs.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["root", "dir_a", "dir_c"]);
+        assert_eq!(crumbs[0].id, 1);
+        assert_eq!(crumbs[1].id, 2);
+        assert_eq!(crumbs[2].id, 4);
+    }
+
+    #[test]
+    fn breadcrumb_from_root() {
+        let tree = sample_tree();
+        let crumbs = tree.breadcrumb(1);
+        assert_eq!(crumbs.len(), 1);
+        assert_eq!(crumbs[0].id, 1);
+        assert_eq!(crumbs[0].name, "root");
+    }
+
+    #[test]
+    fn breadcrumb_root_uses_scan_path_when_name_empty() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "", 0, 100);
+        tree.scan_path = "/mnt/data".into();
+        let crumbs = tree.breadcrumb(1);
+        assert_eq!(crumbs[0].name, "/mnt/data");
+    }
+
+    #[test]
+    fn clear_resets_everything() {
+        let mut tree = sample_tree();
+        tree.scan_path = "/some/path".into();
+        tree.clear();
+        assert!(tree.nodes.is_empty());
+        assert!(tree.root_id.is_none());
+        assert!(tree.recursive_sizes.is_empty());
+        assert!(tree.scan_path.is_empty());
+        assert_eq!(tree.mtime_range, (i64::MAX, 0));
+    }
+
+    #[test]
+    fn mtime_range_tracks_min_max() {
+        let tree = sample_tree();
+        // mtimes: 1000, 2000, 3000, 4000
+        assert_eq!(tree.mtime_range, (1000, 4000));
+    }
+
+    #[test]
+    fn mtime_range_ignores_zero() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 0);
+        // zero mtime ignored, range stays at initial
+        assert_eq!(tree.mtime_range, (i64::MAX, 0));
+        tree.insert_dir(2, 1, "child", 10, 500);
+        assert_eq!(tree.mtime_range, (500, 500));
+    }
+
+    #[test]
+    fn mtime_range_ignores_negative() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, -1);
+        assert_eq!(tree.mtime_range, (i64::MAX, 0));
+        tree.insert_dir(2, 1, "child", 10, 100);
+        assert_eq!(tree.mtime_range, (100, 100));
+    }
+
+    #[test]
+    fn mtime_range_from_files() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 500);
+        tree.insert_file(1, "a.txt", 10, 100);
+        tree.insert_file(1, "b.txt", 20, 900);
+        assert_eq!(tree.mtime_range, (100, 900));
+    }
+
+    #[test]
+    fn compute_filtered_sizes_with_extension_filter() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_dir(2, 1, "src", 0, 100);
+        tree.insert_file(2, "main.rs", 500, 100);
+        tree.insert_file(2, "lib.rs", 300, 100);
+        tree.insert_file(2, "notes.txt", 200, 100);
+
+        let filter = FilterConfig {
+            extensions: vec!["rs".into()],
+            ..Default::default()
+        };
+        let sizes = tree.compute_filtered_sizes(&filter);
+        // src dir: main.rs(500) + lib.rs(300) = 800
+        assert_eq!(sizes[&2], 800);
+        // root: sum of children = 800
+        assert_eq!(sizes[&1], 800);
+    }
+
+    #[test]
+    fn compute_filtered_sizes_no_filter_sums_all_files() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_file(1, "a.txt", 100, 100);
+        tree.insert_file(1, "b.rs", 200, 100);
+
+        let filter = FilterConfig::default();
+        let sizes = tree.compute_filtered_sizes(&filter);
+        assert_eq!(sizes[&1], 300);
+    }
+}

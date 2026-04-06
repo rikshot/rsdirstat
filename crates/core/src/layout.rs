@@ -439,3 +439,337 @@ fn squarify_slice(
         squarify_slice(items, split, hi, x, y + row_h, w, h - row_h, area_left - row_area, out);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_config() -> LayoutConfig {
+        LayoutConfig {
+            max_depth: 3,
+            color_mode: 0,
+            filter: FilterConfig::default(),
+            mtime_range: (0, 0),
+        }
+    }
+
+    #[test]
+    fn header_height_zero_for_small_rect() {
+        assert_eq!(header_height(60.0, 100.0), 0.0);
+        assert_eq!(header_height(100.0, 30.0), 0.0);
+        assert_eq!(header_height(50.0, 20.0), 0.0);
+    }
+
+    #[test]
+    fn header_height_capped_at_18() {
+        assert_eq!(header_height(200.0, 200.0), 18.0);
+    }
+
+    #[test]
+    fn header_height_proportional_in_mid_range() {
+        assert_eq!(header_height(200.0, 100.0), 15.0);
+    }
+
+    #[test]
+    fn header_height_zero_when_below_min() {
+        assert_eq!(header_height(200.0, 40.0), 0.0);
+    }
+
+    #[test]
+    fn empty_tree_produces_empty_layout() {
+        let tree = DirTree::new();
+        let config = default_config();
+        let rects = compute_layout(&tree, 0, 800.0, 600.0, &config);
+        assert!(rects.is_empty());
+    }
+
+    #[test]
+    fn single_root_no_children_produces_empty_layout() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 100, 100);
+        let config = default_config();
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+        assert!(rects.is_empty());
+    }
+
+    #[test]
+    fn two_equal_children_split_canvas() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_dir(2, 1, "a", 500, 100);
+        tree.insert_dir(3, 1, "b", 500, 100);
+
+        let config = default_config();
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+
+        let top_level: Vec<&LayoutRect> = rects.iter().filter(|r| r.depth == 0).collect();
+        assert_eq!(top_level.len(), 2);
+
+        let area_a = top_level[0].w * top_level[0].h;
+        let area_b = top_level[1].w * top_level[1].h;
+        let ratio = area_a / area_b;
+        assert!(
+            (0.9..=1.1).contains(&ratio),
+            "Equal children should have similar areas, got ratio {ratio}"
+        );
+    }
+
+    #[test]
+    fn larger_child_gets_more_area() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_dir(2, 1, "big", 900, 100);
+        tree.insert_dir(3, 1, "small", 100, 100);
+
+        let config = default_config();
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+
+        let top_level: Vec<&LayoutRect> = rects.iter().filter(|r| r.depth == 0).collect();
+        assert_eq!(top_level.len(), 2);
+
+        let big = top_level.iter().find(|r| r.name == "big").unwrap();
+        let small = top_level.iter().find(|r| r.name == "small").unwrap();
+
+        let area_big = big.w * big.h;
+        let area_small = small.w * small.h;
+        assert!(
+            area_big > area_small * 2.0,
+            "big ({area_big}) should be significantly larger than small ({area_small})"
+        );
+    }
+
+    fn rects_overlap(a: &LayoutRect, b: &LayoutRect) -> bool {
+        let eps = 0.01;
+        let x_overlap = a.x + eps < b.x + b.w && b.x + eps < a.x + a.w;
+        let y_overlap = a.y + eps < b.y + b.h && b.y + eps < a.y + a.h;
+        x_overlap && y_overlap
+    }
+
+    #[test]
+    fn sibling_rects_do_not_overlap() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_dir(2, 1, "a", 400, 100);
+        tree.insert_dir(3, 1, "b", 300, 100);
+        tree.insert_dir(4, 1, "c", 200, 100);
+        tree.insert_dir(5, 1, "d", 100, 100);
+
+        let config = default_config();
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+
+        let siblings: Vec<&LayoutRect> = rects.iter().filter(|r| r.depth == 0).collect();
+        for i in 0..siblings.len() {
+            for j in (i + 1)..siblings.len() {
+                assert!(
+                    !rects_overlap(siblings[i], siblings[j]),
+                    "Rects '{}' and '{}' overlap",
+                    siblings[i].name,
+                    siblings[j].name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_rects_fit_within_canvas() {
+        let canvas_w = 1024.0;
+        let canvas_h = 768.0;
+
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_dir(2, 1, "a", 500, 100);
+        tree.insert_dir(3, 1, "b", 300, 100);
+        tree.insert_dir(4, 1, "c", 200, 100);
+
+        let config = default_config();
+        let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config);
+
+        let eps = 0.01;
+        for r in &rects {
+            assert!(r.x >= -eps, "Rect '{}' has x={} < 0", r.name, r.x);
+            assert!(r.y >= -eps, "Rect '{}' has y={} < 0", r.name, r.y);
+            assert!(
+                r.x + r.w <= canvas_w + eps,
+                "Rect '{}' extends past canvas width: x+w={} > {canvas_w}",
+                r.name,
+                r.x + r.w
+            );
+            assert!(
+                r.y + r.h <= canvas_h + eps,
+                "Rect '{}' extends past canvas height: y+h={} > {canvas_h}",
+                r.name,
+                r.y + r.h
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_area_approximately_matches_canvas() {
+        let canvas_w = 800.0;
+        let canvas_h = 600.0;
+        let canvas_area = canvas_w * canvas_h;
+
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_dir(2, 1, "a", 600, 100);
+        tree.insert_dir(3, 1, "b", 300, 100);
+        tree.insert_dir(4, 1, "c", 100, 100);
+
+        let config = default_config();
+        let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config);
+
+        let top_area: f64 = rects.iter().filter(|r| r.depth == 0).map(|r| r.w * r.h).sum();
+
+        let ratio = top_area / canvas_area;
+        assert!(
+            (0.99..=1.01).contains(&ratio),
+            "Top-level area ({top_area}) should match canvas area ({canvas_area}), ratio={ratio}"
+        );
+    }
+
+    #[test]
+    fn layout_includes_file_rects() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_file(1, "big.txt", 5000, 200);
+        tree.insert_file(1, "huge.rs", 10000, 300);
+        *tree.recursive_sizes.entry(1).or_insert(0) += 15000;
+
+        let config = default_config();
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+
+        let file_rects: Vec<&LayoutRect> = rects.iter().filter(|r| r.is_file).collect();
+        assert!(
+            file_rects.len() >= 2,
+            "Expected at least 2 file rects, got {}",
+            file_rects.len()
+        );
+
+        let names: Vec<&str> = file_rects.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"big.txt"), "Missing big.txt in {names:?}");
+        assert!(names.contains(&"huge.rs"), "Missing huge.rs in {names:?}");
+
+        for r in &file_rects {
+            assert!(r.id < 0, "File rect should have negative id, got {}", r.id);
+        }
+    }
+
+    #[test]
+    fn filter_affects_layout() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_dir(2, 1, "src", 0, 100);
+        tree.insert_dir(3, 1, "docs", 0, 100);
+        tree.insert_file(2, "main.rs", 5000, 200);
+        tree.insert_file(2, "lib.rs", 3000, 200);
+        tree.insert_file(3, "readme.txt", 4000, 200);
+        tree.recursive_sizes.insert(2, 8000);
+        tree.recursive_sizes.insert(3, 4000);
+        tree.recursive_sizes.insert(1, 12000);
+
+        let config_no_filter = default_config();
+        let rects_no_filter = compute_layout(&tree, 1, 800.0, 600.0, &config_no_filter);
+        let dirs_no_filter: Vec<&str> = rects_no_filter
+            .iter()
+            .filter(|r| r.depth == 0 && !r.is_file && !r.is_files)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(dirs_no_filter.contains(&"src"));
+        assert!(dirs_no_filter.contains(&"docs"));
+
+        let config_filtered = LayoutConfig {
+            max_depth: 3,
+            color_mode: 0,
+            filter: FilterConfig {
+                extensions: vec!["rs".into()],
+                min_size: 0,
+                max_size: 0,
+                name_pattern: String::new(),
+            },
+            mtime_range: (0, 0),
+        };
+        let rects_filtered = compute_layout(&tree, 1, 800.0, 600.0, &config_filtered);
+
+        let filtered_names: Vec<&str> = rects_filtered
+            .iter()
+            .filter(|r| r.depth == 0 && !r.is_file && !r.is_files)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(filtered_names.contains(&"src"), "src should be visible with .rs filter");
+        assert!(
+            !filtered_names.contains(&"docs"),
+            "docs should be hidden with .rs filter (no .rs files)"
+        );
+    }
+
+    #[test]
+    fn max_depth_limits_nesting() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_dir(2, 1, "level1", 0, 100);
+        tree.insert_dir(3, 2, "level2", 0, 100);
+        tree.insert_dir(4, 3, "level3", 500, 100);
+
+        let config_shallow = LayoutConfig {
+            max_depth: 1,
+            color_mode: 0,
+            filter: FilterConfig::default(),
+            mtime_range: (0, 0),
+        };
+        let rects_shallow = compute_layout(&tree, 1, 800.0, 600.0, &config_shallow);
+        let max_depth = rects_shallow.iter().map(|r| r.depth).max().unwrap_or(0);
+        assert!(
+            max_depth <= 1,
+            "With max_depth=1, deepest rect depth should be <= 1, got {max_depth}"
+        );
+
+        let config_deep = LayoutConfig {
+            max_depth: 10,
+            color_mode: 0,
+            filter: FilterConfig::default(),
+            mtime_range: (0, 0),
+        };
+        let rects_deep = compute_layout(&tree, 1, 800.0, 600.0, &config_deep);
+        let max_depth_deep = rects_deep.iter().map(|r| r.depth).max().unwrap_or(0);
+        assert!(
+            max_depth_deep > 1,
+            "With max_depth=10, should nest deeper than 1, got {max_depth_deep}"
+        );
+    }
+
+    #[test]
+    fn many_children_no_overlap_and_fit() {
+        let canvas_w = 1920.0;
+        let canvas_h = 1080.0;
+
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        for i in 2..=21u64 {
+            tree.insert_dir(i, 1, &format!("dir{i}"), (i * 100) as u64, 100);
+        }
+
+        let config = default_config();
+        let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config);
+
+        let top_level: Vec<&LayoutRect> = rects.iter().filter(|r| r.depth == 0).collect();
+        assert_eq!(top_level.len(), 20);
+
+        for i in 0..top_level.len() {
+            for j in (i + 1)..top_level.len() {
+                assert!(
+                    !rects_overlap(top_level[i], top_level[j]),
+                    "Overlap between '{}' and '{}'",
+                    top_level[i].name,
+                    top_level[j].name
+                );
+            }
+        }
+
+        let eps = 0.01;
+        for r in &top_level {
+            assert!(r.x >= -eps && r.y >= -eps);
+            assert!(r.x + r.w <= canvas_w + eps);
+            assert!(r.y + r.h <= canvas_h + eps);
+        }
+    }
+}
