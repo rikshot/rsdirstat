@@ -85,6 +85,7 @@ struct AppState {
     layout: LayoutBroadcast,
     connections: ConnectionTracker,
     start: Notify,
+    shutdown: Notify,
 }
 
 impl AppState {
@@ -129,6 +130,7 @@ async fn run_server(path: PathBuf, cross_filesystems: bool, port: u16, no_open: 
             had_any: AtomicBool::new(false),
         },
         start: Notify::new(),
+        shutdown: Notify::new(),
     });
 
     let scan_state = Arc::clone(&state);
@@ -223,8 +225,31 @@ async fn run_server(path: PathBuf, cross_filesystems: bool, port: u16, no_open: 
         }
     }
 
-    axum::serve(listener, app).await?;
+    let shutdown = Arc::clone(&state);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown))
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal(state: Arc<AppState>) {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = sigterm.recv() => {},
+            _ = tokio::signal::ctrl_c() => {},
+            _ = state.shutdown.notified() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = state.shutdown.notified() => {},
+        }
+    }
 }
 
 fn start_scan(state: &Arc<AppState>) {
@@ -357,7 +382,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
             if server.connections.count.load(Ordering::Relaxed) == 0
                 && server.connections.had_any.load(Ordering::Relaxed)
             {
-                std::process::exit(0);
+                server.shutdown.notify_one();
             }
         });
     }

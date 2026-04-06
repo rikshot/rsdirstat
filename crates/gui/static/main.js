@@ -19,7 +19,7 @@ const ZOOM_DURATION = 300;
 class TreemapApp {
   constructor() {
     this.canvas = $("treemap");
-    const contextOptions = { alpha: false, desynchronized: true };
+    const contextOptions = { alpha: false };
     this.ctx = this.canvas.getContext("2d", contextOptions);
     this.breadcrumbBar = $("crumbs");
     this.tooltipElement = $("tooltip");

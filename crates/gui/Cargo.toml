@@ -11,8 +11,15 @@ axum = { version = "0.8", features = ["ws"] }
 clap.workspace = true
 mimalloc = "0.1"
 open = "5"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "parking_lot"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "parking_lot"] }
 tower-http = { version = "0.6", features = ["fs", "compression-gzip"] }
+
+[dev-dependencies]
+playwright-rs = "0.9"
+tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rsdirstat-macos = { path = "../macos" }
