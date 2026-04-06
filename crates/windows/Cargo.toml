@@ -2,9 +2,10 @@
 name = "rsdirstat-windows"
 version = "0.1.0"
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
-rsdirstat-core = { path = "../core" }
-anyhow = "1"
+rsdirstat-core.workspace = true
+anyhow.workspace = true
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security"] }
-dashmap = { version = "6", features = ["inline"] }
+dashmap.workspace = true
