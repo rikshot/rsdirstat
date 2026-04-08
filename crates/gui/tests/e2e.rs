@@ -295,6 +295,44 @@ async fn picker_has_volume_details(page: &playwright_rs::Page) {
     assert!(sizes.contains("used of"), "should show usage: {sizes}");
 }
 
+async fn click_leaf_directory_navigates(browser_name: &str) {
+    // Regression test: clicking a directory with no subdirectories (a "leaf" in the
+    // tree) should navigate into it. Before the fix, findNavigableContainer required
+    // isContainer=true, which is only set on directories large enough to show nested
+    // children. Leaf directories aren't containers, so clicking them fell through to
+    // the parent — navigating up instead of into the clicked directory.
+    //
+    // We use a dedicated test dir where the single largest directory ("big") has no
+    // subdirectories, ensuring the center click lands on a non-container rect.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("big")).unwrap();
+    std::fs::write(root.join("big").join("a.bin"), vec![0u8; 10_000_000]).unwrap();
+    std::fs::create_dir(root.join("small")).unwrap();
+    std::fs::write(root.join("small").join("b.bin"), vec![0u8; 1_000_000]).unwrap();
+
+    let server = TestServer::start(root);
+    let (_pw, browser, page) = launch_browser(browser_name).await;
+    page.goto(&server.url, None).await.unwrap();
+    wait_for_scan_done(&page).await;
+
+    let crumbs = page.locator("#crumbs").await;
+    let initial_text = crumbs.text_content().await.unwrap().unwrap();
+    let initial_parts: Vec<&str> = initial_text.split('/').collect();
+
+    page.locator("#treemap").await.click(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let after_text = crumbs.text_content().await.unwrap().unwrap();
+    let after_parts: Vec<&str> = after_text.split('/').collect();
+
+    assert!(
+        after_parts.len() > initial_parts.len(),
+        "clicking a leaf dir should navigate into it: before={initial_text}, after={after_text}"
+    );
+    let _ = browser.close().await;
+}
+
 async fn rescan_button_works(page: &playwright_rs::Page) {
     let rescan = page.locator("#rescan").await;
     let classes = rescan.evaluate::<String, ()>("el => el.className", None).await.unwrap();
@@ -363,6 +401,10 @@ async fn e2e_breadcrumb_back_chromium() {
     run("chromium", breadcrumb_click_navigates_back).await;
 }
 #[tokio::test]
+async fn e2e_click_leaf_dir_chromium() {
+    click_leaf_directory_navigates("chromium").await;
+}
+#[tokio::test]
 async fn e2e_rescan_chromium() {
     run("chromium", rescan_button_works).await;
 }
@@ -418,6 +460,10 @@ async fn e2e_navigate_firefox() {
 #[tokio::test]
 async fn e2e_breadcrumb_back_firefox() {
     run("firefox", breadcrumb_click_navigates_back).await;
+}
+#[tokio::test]
+async fn e2e_click_leaf_dir_firefox() {
+    click_leaf_directory_navigates("firefox").await;
 }
 #[tokio::test]
 async fn e2e_rescan_firefox() {
@@ -477,8 +523,37 @@ async fn e2e_breadcrumb_back_webkit() {
     run("webkit", breadcrumb_click_navigates_back).await;
 }
 #[tokio::test]
+async fn e2e_click_leaf_dir_webkit() {
+    click_leaf_directory_navigates("webkit").await;
+}
+#[tokio::test]
 async fn e2e_rescan_webkit() {
     run("webkit", rescan_button_works).await;
+}
+
+async fn js_unit_tests(page: &playwright_rs::Page) {
+    let result = page
+        .evaluate_value(
+            "async () => { const { runTests } = await import('./tests.js'); const r = runTests(); return r.failed === 0 ? `PASS ${r.total}` : `FAIL ${r.failed}/${r.total}: ${r.failures.join('; ')}`; }",
+        )
+        .await
+        .unwrap();
+
+    assert!(result.starts_with("PASS"), "JS unit tests failed: {result}");
+}
+
+// JS unit tests — run in browser via Playwright, testing actual JS modules
+#[tokio::test]
+async fn e2e_js_unit_tests_chromium() {
+    run("chromium", js_unit_tests).await;
+}
+#[tokio::test]
+async fn e2e_js_unit_tests_firefox() {
+    run("firefox", js_unit_tests).await;
+}
+#[tokio::test]
+async fn e2e_js_unit_tests_webkit() {
+    run("webkit", js_unit_tests).await;
 }
 
 // Picker mode tests (chromium only — testing server/UI logic, not browser compat)

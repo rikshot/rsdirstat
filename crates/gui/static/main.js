@@ -1,5 +1,5 @@
 import * as P from "./protocol.js";
-import { $, formatSize, hitTest } from "./util.js";
+import { $, formatSize, hitTest, findRect, findNavigableTarget } from "./util.js";
 import {
   drawRects,
   drawHoverOverlay,
@@ -227,27 +227,11 @@ class TreemapApp {
   }
 
   findRect(mouseX, mouseY) {
-    for (let index = this.layoutRects.length - 1; index >= 0; index--) {
-      if (hitTest(this.layoutRects[index], mouseX, mouseY))
-        return this.layoutRects[index];
-    }
-    return null;
+    return findRect(this.layoutRects, mouseX, mouseY);
   }
 
   findNavigableContainer(mouseX, mouseY) {
-    let target = null;
-    for (const rect of this.layoutRects) {
-      if (
-        hitTest(rect, mouseX, mouseY) &&
-        !rect.isFiles &&
-        !rect.isFile &&
-        rect.id > 0n &&
-        rect.isContainer
-      ) {
-        target = rect;
-      }
-    }
-    return target;
+    return findNavigableTarget(this.layoutRects, mouseX, mouseY);
   }
 
   recomputeHover() {

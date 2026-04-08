@@ -38,3 +38,25 @@ export function hitTest(rect, mouseX, mouseY) {
     mouseY < rect.y + rect.h
   );
 }
+
+export function findRect(rects, mouseX, mouseY) {
+  for (let i = rects.length - 1; i >= 0; i--) {
+    if (hitTest(rects[i], mouseX, mouseY)) return rects[i];
+  }
+  return null;
+}
+
+export function findNavigableTarget(rects, mouseX, mouseY) {
+  let target = null;
+  for (const rect of rects) {
+    if (
+      hitTest(rect, mouseX, mouseY) &&
+      !rect.isFiles &&
+      !rect.isFile &&
+      rect.id > 0n
+    ) {
+      target = rect;
+    }
+  }
+  return target;
+}
