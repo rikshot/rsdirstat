@@ -534,7 +534,7 @@ async fn e2e_rescan_webkit() {
 async fn js_unit_tests(page: &playwright_rs::Page) {
     let result = page
         .evaluate_value(
-            "async () => { const { runTests } = await import('./tests.js'); const r = runTests(); return r.failed === 0 ? `PASS ${r.total}` : `FAIL ${r.failed}/${r.total}: ${r.failures.join('; ')}`; }",
+            "async () => { const wasm = await import('./gen/rsdirstat_wasm.js'); const r = wasm.runBrowserTests(); return r.failed === 0 ? `PASS ${r.total}` : `FAIL ${r.failed}/${r.total}: ${r.failures.join('; ')}`; }",
         )
         .await
         .unwrap();
@@ -542,7 +542,7 @@ async fn js_unit_tests(page: &playwright_rs::Page) {
     assert!(result.starts_with("PASS"), "JS unit tests failed: {result}");
 }
 
-// JS unit tests — run in browser via Playwright, testing actual JS modules
+// Browser unit tests — run in browser via Playwright, testing actual wasm exports
 #[tokio::test]
 async fn e2e_js_unit_tests_chromium() {
     run("chromium", js_unit_tests).await;

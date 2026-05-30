@@ -20,13 +20,13 @@ impl TestServer {
     }
 
     fn spawn(args: &[&str]) -> Self {
-        let bin = env!("CARGO_BIN_EXE_rsdirstat-gui");
+        let bin = env!("CARGO_BIN_EXE_rsdirstat-server");
         let mut child = Command::new(bin)
             .args(args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
-            .expect("failed to start rsdirstat-gui");
+            .expect("failed to start rsdirstat-server");
 
         let stderr = child.stderr.take().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();

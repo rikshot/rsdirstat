@@ -7,8 +7,8 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use dashmap::DashSet;
-use rsdirstat_core::protocol::ScanEvent;
 use rsdirstat_core::scan::{WorkQueue, raise_fd_limit};
+use rsdirstat_protocol::ScanEvent;
 
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;

@@ -5,11 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "rsdirstat"
+name = "rsdirstat-cli"
 path = "src/main.rs"
 
 [dependencies]
 rsdirstat-core.workspace = true
+rsdirstat-protocol.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 humansize = "2"

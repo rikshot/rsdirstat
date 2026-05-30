@@ -7,8 +7,8 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use dashmap::DashSet;
-use rsdirstat_core::protocol::ScanEvent;
 use rsdirstat_core::scan::WorkQueue;
+use rsdirstat_protocol::ScanEvent;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,

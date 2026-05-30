@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 use humansize::{BINARY, format_size};
-use rsdirstat_core::protocol::ScanEvent;
 use rsdirstat_core::tree::DirTree;
+use rsdirstat_protocol::ScanEvent;
 
 #[cfg(target_os = "linux")]
 use rsdirstat_linux as scanner;
@@ -14,7 +14,7 @@ use rsdirstat_macos as scanner;
 use rsdirstat_windows as scanner;
 
 #[derive(Parser)]
-#[command(name = "rsdirstat", about = "Blazing fast disk usage scanner for macOS")]
+#[command(name = "rsdirstat-cli", about = "Blazing fast disk usage scanner")]
 struct Args {
     /// Path to scan
     #[arg(default_value = ".")]
@@ -79,7 +79,7 @@ fn main() -> Result<()> {
         if top > 0 {
             file_entries.select_nth_unstable_by(top - 1, |a, b| b.2.cmp(&a.2));
             file_entries.truncate(top);
-            file_entries.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+            file_entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.2));
             print_entries(file_entries.iter().map(|(parent, name, size)| {
                 let mut path = tree.full_path(*parent, &root).unwrap_or_default();
                 path.push(name);
@@ -92,7 +92,7 @@ fn main() -> Result<()> {
         if top > 0 {
             dir_list.select_nth_unstable_by(top - 1, |a, b| b.1.cmp(&a.1));
             dir_list.truncate(top);
-            dir_list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            dir_list.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
             print_entries(
                 dir_list
                     .iter()

@@ -1,5 +1,36 @@
-use crate::layout::LayoutRect;
-use crate::tree::BreadcrumbEntry;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BreadcrumbEntry {
+    pub id: u64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayoutRect {
+    pub id: i64,
+    pub parent_id: u64,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub name: String,
+    pub hue: u16,
+    pub size: u64,
+    pub depth: u8,
+    pub is_container: bool,
+    pub header_height: f32,
+    pub is_files: bool,
+    pub is_file: bool,
+    pub mtime: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayoutPayload {
+    pub root_size: u64,
+    pub dir_count: u32,
+    pub scan_done: bool,
+    pub breadcrumb: Vec<BreadcrumbEntry>,
+    pub rects: Vec<LayoutRect>,
+}
 
 /// Scanner → server internal events (not sent over WebSocket).
 #[derive(Debug)]
@@ -28,8 +59,15 @@ pub const MSG_SCAN_START: u8 = 1;
 pub const MSG_LAYOUT: u8 = 2;
 pub const MSG_PICKER_MODE: u8 = 3;
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ServerMessage {
+    ScanStart { path: String },
+    Layout(LayoutPayload),
+    PickerMode,
+}
+
 /// Client → server WebSocket messages.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ClientMessage {
     Viewport { width: f32, height: f32 },
     Navigate { id: u64 },
@@ -45,6 +83,11 @@ pub enum ClientMessage {
     ScanPath { path: String },
 }
 
+/// Minimum encoded size of a breadcrumb entry (u64 id + u16 name length, empty name).
+const BREADCRUMB_MIN_BYTES: usize = 8 + 2;
+/// Minimum encoded size of a layout rect (all fixed fields + u16 name length, empty name).
+const RECT_MIN_BYTES: usize = 8 + 8 + 4 + 4 + 4 + 4 + 2 + 8 + 1 + 1 + 4 + 8 + 2;
+
 const MSG_VIEWPORT: u8 = 1;
 const MSG_NAVIGATE: u8 = 2;
 const MSG_REVEAL_DIR: u8 = 3;
@@ -58,17 +101,119 @@ const MSG_FILTER_NAME: u8 = 10;
 const MSG_CLEAR_FILTER: u8 = 11;
 const MSG_SCAN_PATH: u8 = 12;
 
+fn encode_u16_string(tag: u8, value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut buf = Vec::with_capacity(3 + bytes.len());
+    buf.push(tag);
+    buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(bytes);
+    buf
+}
+
+fn decode_u16_string(data: &[u8], offset: &mut usize) -> Option<String> {
+    if *offset + 2 > data.len() {
+        return None;
+    }
+    let len = u16::from_le_bytes(data[*offset..*offset + 2].try_into().ok()?) as usize;
+    *offset += 2;
+    if *offset + len > data.len() {
+        return None;
+    }
+    let value = std::str::from_utf8(&data[*offset..*offset + len]).ok()?.to_string();
+    *offset += len;
+    Some(value)
+}
+
+pub fn encode_viewport(width: f32, height: f32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(9);
+    buf.push(MSG_VIEWPORT);
+    buf.extend_from_slice(&width.to_le_bytes());
+    buf.extend_from_slice(&height.to_le_bytes());
+    buf
+}
+
+pub fn encode_navigate(id: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(9);
+    buf.push(MSG_NAVIGATE);
+    buf.extend_from_slice(&id.to_le_bytes());
+    buf
+}
+
+pub fn encode_reveal_dir(id: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(9);
+    buf.push(MSG_REVEAL_DIR);
+    buf.extend_from_slice(&id.to_le_bytes());
+    buf
+}
+
+pub fn encode_reveal_file(parent_id: u64, name: &str) -> Vec<u8> {
+    let name_bytes = name.as_bytes();
+    let mut buf = Vec::with_capacity(11 + name_bytes.len());
+    buf.push(MSG_REVEAL_FILE);
+    buf.extend_from_slice(&parent_id.to_le_bytes());
+    buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(name_bytes);
+    buf
+}
+
+pub fn encode_rescan() -> Vec<u8> {
+    vec![MSG_RESCAN]
+}
+
+pub fn encode_set_depth(depth: u8) -> Vec<u8> {
+    vec![MSG_SET_DEPTH, depth]
+}
+
+pub fn encode_color_mode(mode: u8) -> Vec<u8> {
+    vec![MSG_COLOR_MODE, mode]
+}
+
+pub fn encode_filter_ext<S: AsRef<str>>(extensions: &[S]) -> Vec<u8> {
+    // The count and each length are u8-prefixed, so drop extensions that don't fit rather than
+    // truncating a length byte and desyncing the rest of the frame.
+    let kept: Vec<&[u8]> = extensions
+        .iter()
+        .map(|ext| ext.as_ref().as_bytes())
+        .filter(|bytes| bytes.len() <= u8::MAX as usize)
+        .take(u8::MAX as usize)
+        .collect();
+    let payload_len = kept.iter().map(|bytes| 1 + bytes.len()).sum::<usize>();
+    let mut buf = Vec::with_capacity(2 + payload_len);
+    buf.push(MSG_FILTER_EXT);
+    buf.push(kept.len() as u8);
+    for bytes in kept {
+        buf.push(bytes.len() as u8);
+        buf.extend_from_slice(bytes);
+    }
+    buf
+}
+
+pub fn encode_filter_size(min: u64, max: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(17);
+    buf.push(MSG_FILTER_SIZE);
+    buf.extend_from_slice(&min.to_le_bytes());
+    buf.extend_from_slice(&max.to_le_bytes());
+    buf
+}
+
+pub fn encode_filter_name(pattern: &str) -> Vec<u8> {
+    encode_u16_string(MSG_FILTER_NAME, pattern)
+}
+
+pub fn encode_clear_filter() -> Vec<u8> {
+    vec![MSG_CLEAR_FILTER]
+}
+
+pub fn encode_scan_path(path: &str) -> Vec<u8> {
+    encode_u16_string(MSG_SCAN_PATH, path)
+}
+
 pub fn encode_picker_mode() -> Vec<u8> {
     vec![MSG_PICKER_MODE]
 }
 
 pub fn encode_scan_start(path: &str) -> Vec<u8> {
-    let path_bytes = path.as_bytes();
-    let mut buf = Vec::with_capacity(3 + path_bytes.len());
-    buf.push(MSG_SCAN_START);
-    buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(path_bytes);
-    buf
+    encode_u16_string(MSG_SCAN_START, path)
 }
 
 pub fn encode_layout(
@@ -94,21 +239,129 @@ pub fn encode_layout(
     for rect in rects {
         buf.extend_from_slice(&rect.id.to_le_bytes());
         buf.extend_from_slice(&rect.parent_id.to_le_bytes());
-        buf.extend_from_slice(&(rect.x as f32).to_le_bytes());
-        buf.extend_from_slice(&(rect.y as f32).to_le_bytes());
-        buf.extend_from_slice(&(rect.w as f32).to_le_bytes());
-        buf.extend_from_slice(&(rect.h as f32).to_le_bytes());
+        buf.extend_from_slice(&rect.x.to_le_bytes());
+        buf.extend_from_slice(&rect.y.to_le_bytes());
+        buf.extend_from_slice(&rect.w.to_le_bytes());
+        buf.extend_from_slice(&rect.h.to_le_bytes());
         buf.extend_from_slice(&rect.hue.to_le_bytes());
         buf.extend_from_slice(&rect.size.to_le_bytes());
         buf.push(rect.depth);
         buf.push((rect.is_container as u8) | ((rect.is_files as u8) << 1) | ((rect.is_file as u8) << 2));
-        buf.extend_from_slice(&(rect.header_height as f32).to_le_bytes());
+        buf.extend_from_slice(&rect.header_height.to_le_bytes());
         buf.extend_from_slice(&rect.mtime.to_le_bytes());
         let name_bytes = rect.name.as_bytes();
         buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(name_bytes);
     }
     buf
+}
+
+pub fn decode_server_message(data: &[u8]) -> Option<ServerMessage> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let mut offset = 1;
+    match data[0] {
+        MSG_SCAN_START => Some(ServerMessage::ScanStart {
+            path: decode_u16_string(data, &mut offset)?,
+        }),
+        MSG_PICKER_MODE => Some(ServerMessage::PickerMode),
+        MSG_LAYOUT => {
+            if offset + 8 + 4 + 1 + 2 > data.len() {
+                return None;
+            }
+
+            let root_size = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+            offset += 8;
+            let dir_count = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+            offset += 4;
+            let scan_done = data[offset] != 0;
+            offset += 1;
+
+            let breadcrumb_count = u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?) as usize;
+            offset += 2;
+            // Cap the reservation against the bytes that remain so a bogus count can't trigger a
+            // huge allocation; the per-entry bounds checks below still reject a truncated frame.
+            let breadcrumb_cap = breadcrumb_count.min((data.len() - offset) / BREADCRUMB_MIN_BYTES + 1);
+            let mut breadcrumb = Vec::with_capacity(breadcrumb_cap);
+            for _ in 0..breadcrumb_count {
+                if offset + 8 > data.len() {
+                    return None;
+                }
+                let id = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+                offset += 8;
+                let name = decode_u16_string(data, &mut offset)?;
+                breadcrumb.push(BreadcrumbEntry { id, name });
+            }
+
+            if offset + 4 > data.len() {
+                return None;
+            }
+            let rect_count = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+            offset += 4;
+            let rect_cap = rect_count.min((data.len() - offset) / RECT_MIN_BYTES + 1);
+            let mut rects = Vec::with_capacity(rect_cap);
+            for _ in 0..rect_count {
+                if offset + 8 + 8 + 4 + 4 + 4 + 4 + 2 + 8 + 1 + 1 + 4 + 8 + 2 > data.len() {
+                    return None;
+                }
+
+                let id = i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+                offset += 8;
+                let parent_id = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+                offset += 8;
+                let x = f32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+                offset += 4;
+                let y = f32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+                offset += 4;
+                let w = f32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+                offset += 4;
+                let h = f32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+                offset += 4;
+                let hue = u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?);
+                offset += 2;
+                let size = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+                offset += 8;
+                let depth = data[offset];
+                offset += 1;
+                let flags = data[offset];
+                offset += 1;
+                let header_height = f32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+                offset += 4;
+                let mtime = i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+                offset += 8;
+                let name = decode_u16_string(data, &mut offset)?;
+
+                rects.push(LayoutRect {
+                    id,
+                    parent_id,
+                    x,
+                    y,
+                    w,
+                    h,
+                    name,
+                    hue,
+                    size,
+                    depth,
+                    is_container: (flags & 1) != 0,
+                    header_height,
+                    is_files: (flags & 2) != 0,
+                    is_file: (flags & 4) != 0,
+                    mtime,
+                });
+            }
+
+            Some(ServerMessage::Layout(LayoutPayload {
+                root_size,
+                dir_count,
+                scan_done,
+                breadcrumb,
+                rects,
+            }))
+        }
+        _ => None,
+    }
 }
 
 impl ClientMessage {
@@ -143,7 +396,10 @@ impl ClientMessage {
             MSG_SET_DEPTH if data.len() >= 2 => Some(ClientMessage::SetDepth {
                 depth: data[1].clamp(1, 10),
             }),
-            MSG_COLOR_MODE if data.len() >= 2 => Some(ClientMessage::ColorMode { mode: data[1] }),
+            MSG_COLOR_MODE if data.len() >= 2 => Some(ClientMessage::ColorMode {
+                // Only Type (0) and Age (1) are defined; treat anything else as Type.
+                mode: if data[1] <= 1 { data[1] } else { 0 },
+            }),
             MSG_FILTER_EXT if data.len() >= 2 => {
                 let count = data[1] as usize;
                 let mut offset = 2;
@@ -194,8 +450,27 @@ impl ClientMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::LayoutRect;
-    use crate::tree::BreadcrumbEntry;
+
+    #[test]
+    fn encode_viewport_round_trips_through_decoder() {
+        let message = encode_viewport(800.0, 600.0);
+        assert_eq!(
+            ClientMessage::decode(&message),
+            Some(ClientMessage::Viewport {
+                width: 800.0,
+                height: 600.0,
+            })
+        );
+    }
+
+    #[test]
+    fn encode_navigate_round_trips_through_decoder() {
+        let message = encode_navigate(42);
+        assert_eq!(
+            ClientMessage::decode(&message),
+            Some(ClientMessage::Navigate { id: 42 })
+        );
+    }
 
     #[test]
     fn encode_scan_start_basic() {
@@ -252,25 +527,75 @@ mod tests {
     }
 
     #[test]
-    fn decode_viewport() {
-        let mut data = vec![MSG_VIEWPORT];
-        data.extend_from_slice(&320.0f32.to_le_bytes());
-        data.extend_from_slice(&240.0f32.to_le_bytes());
-        let Some(ClientMessage::Viewport { width, height }) = ClientMessage::decode(&data) else {
-            panic!("expected Viewport, got {:?}", ClientMessage::decode(&data));
-        };
-        assert_eq!(width, 320.0);
-        assert_eq!(height, 240.0);
+    fn decode_scan_start_message() {
+        assert_eq!(
+            decode_server_message(&encode_scan_start("/tmp/test")),
+            Some(ServerMessage::ScanStart {
+                path: "/tmp/test".into(),
+            })
+        );
     }
 
     #[test]
-    fn decode_navigate() {
-        let mut data = vec![MSG_NAVIGATE];
-        data.extend_from_slice(&77u64.to_le_bytes());
-        let Some(ClientMessage::Navigate { id }) = ClientMessage::decode(&data) else {
-            panic!("expected Navigate");
+    fn decode_picker_mode_message() {
+        assert_eq!(
+            decode_server_message(&encode_picker_mode()),
+            Some(ServerMessage::PickerMode)
+        );
+    }
+
+    #[test]
+    fn decode_layout_message_round_trip() {
+        let breadcrumb = vec![BreadcrumbEntry {
+            id: 7,
+            name: "root".into(),
+        }];
+        let rects = vec![LayoutRect {
+            id: 42,
+            parent_id: 7,
+            x: 10.5,
+            y: 20.5,
+            w: 100.0,
+            h: 200.0,
+            name: "src".into(),
+            hue: 120,
+            size: 5000,
+            depth: 2,
+            is_container: true,
+            header_height: 18.0,
+            is_files: false,
+            is_file: false,
+            mtime: 1_700_000_000,
+        }];
+
+        let encoded = encode_layout(10_000, 3, true, &breadcrumb, &rects);
+        let Some(ServerMessage::Layout(decoded)) = decode_server_message(&encoded) else {
+            panic!("expected layout message");
         };
-        assert_eq!(id, 77);
+
+        assert_eq!(decoded.root_size, 10_000);
+        assert_eq!(decoded.dir_count, 3);
+        assert!(decoded.scan_done);
+        assert_eq!(decoded.breadcrumb, breadcrumb);
+        assert_eq!(decoded.rects, rects);
+    }
+
+    #[test]
+    fn decode_truncated_layout_message_returns_none() {
+        let encoded = encode_layout(10_000, 3, true, &[], &[]);
+        let truncated = &encoded[..encoded.len() - 1];
+        assert!(decode_server_message(truncated).is_none());
+    }
+
+    #[test]
+    fn encode_scan_path_unicode_round_trips() {
+        let message = encode_scan_path("/tmp/日本語");
+        assert_eq!(
+            ClientMessage::decode(&message),
+            Some(ClientMessage::ScanPath {
+                path: "/tmp/日本語".into(),
+            })
+        );
     }
 
     #[test]
@@ -316,11 +641,20 @@ mod tests {
 
     #[test]
     fn decode_color_mode() {
-        let data = vec![MSG_COLOR_MODE, 2];
+        let data = vec![MSG_COLOR_MODE, 1];
         let Some(ClientMessage::ColorMode { mode }) = ClientMessage::decode(&data) else {
             panic!("expected ColorMode");
         };
-        assert_eq!(mode, 2);
+        assert_eq!(mode, 1);
+    }
+
+    #[test]
+    fn decode_color_mode_clamps_unknown_to_type() {
+        let data = vec![MSG_COLOR_MODE, 7];
+        let Some(ClientMessage::ColorMode { mode }) = ClientMessage::decode(&data) else {
+            panic!("expected ColorMode");
+        };
+        assert_eq!(mode, 0);
     }
 
     #[test]
@@ -450,6 +784,17 @@ mod tests {
         assert_eq!(&*extensions[0], "rs");
         assert_eq!(&*extensions[1], "toml");
         assert_eq!(&*extensions[2], "json");
+    }
+
+    #[test]
+    fn encode_filter_ext_drops_overlong_extension() {
+        let long = "a".repeat(300);
+        let message = encode_filter_ext(&[long.as_str(), "rs"]);
+        let Some(ClientMessage::FilterExt { extensions }) = ClientMessage::decode(&message) else {
+            panic!("expected FilterExt");
+        };
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(&*extensions[0], "rs");
     }
 
     #[test]

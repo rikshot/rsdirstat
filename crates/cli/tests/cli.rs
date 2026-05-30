@@ -2,7 +2,7 @@ use std::fs;
 use std::process::Command;
 
 fn rsdirstat_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rsdirstat"))
+    Command::new(env!("CARGO_BIN_EXE_rsdirstat-cli"))
 }
 
 fn create_test_dir() -> tempfile::TempDir {

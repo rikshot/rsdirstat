@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/*"]
-default-members = ["crates/cli", "crates/core", "crates/gui"]
+default-members = ["crates/cli", "crates/core", "crates/protocol", "crates/server"]
 resolver = "3"
 
 [workspace.package]
@@ -11,6 +11,7 @@ repository = "https://github.com/rikshot/rsdirstat"
 
 [workspace.dependencies]
 rsdirstat-core = { path = "crates/core" }
+rsdirstat-protocol = { path = "crates/protocol" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dashmap = { version = "6", features = ["inline"] }

@@ -1,3 +1,4 @@
 /target
 /docs
-crates/gui/tests/snapshots/*.png
+crates/server/tests/snapshots/*.png
+crates/server/static/gen/

@@ -31,6 +31,10 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
+          target: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.122
       - run: cargo clippy --all-targets --no-deps -- -D warnings
 
   test:
@@ -42,7 +46,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: taiki-e/install-action@nextest
+        with:
+          target: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest,wasm-bindgen-cli@0.2.122
       - run: cargo nextest run --profile ci -E 'not test(/^visual/) and not test(/^e2e/)'
 
   build:
@@ -54,6 +62,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.122
       - run: cargo build --release
 
   browser:
@@ -65,7 +78,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: taiki-e/install-action@nextest
+        with:
+          target: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest,wasm-bindgen-cli@0.2.122
       - uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -84,10 +101,10 @@ jobs:
       - uses: actions/cache@v5
         with:
           key: visual-baselines-v1-${{ matrix.os }}
-          path: crates/gui/tests/snapshots/
+          path: crates/server/tests/snapshots/
       - run: cargo nextest run --profile ci -E 'test(/^visual/) or test(/^e2e/)'
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: visual-snapshots-${{ matrix.os }}
-          path: crates/gui/tests/snapshots/
+          path: crates/server/tests/snapshots/

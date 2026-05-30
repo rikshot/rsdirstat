@@ -2,8 +2,8 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -11,14 +11,15 @@ use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::routing::get;
 use clap::Parser;
+use parking_lot::{Mutex, RwLock};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, broadcast, watch};
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
 
 use rsdirstat_core::layout::{self, LayoutConfig};
-use rsdirstat_core::protocol::{self, ClientMessage, ScanEvent};
 use rsdirstat_core::tree::FilterConfig;
+use rsdirstat_protocol::{self as wire, ClientMessage, ScanEvent};
 
 #[cfg(target_os = "linux")]
 use rsdirstat_linux as scanner;
@@ -28,7 +29,7 @@ use rsdirstat_macos as scanner;
 use rsdirstat_windows as scanner;
 
 #[derive(Parser)]
-#[command(name = "rsdirstat-gui", about = "Interactive treemap disk usage visualizer")]
+#[command(name = "rsdirstat-server", about = "Interactive treemap disk usage server")]
 struct Args {
     /// Path to scan (omit to show volume picker)
     path: Option<PathBuf>,
@@ -59,11 +60,19 @@ struct ViewConfig {
     filter: FilterConfig,
 }
 
+/// Grace period after the last client disconnects before the server exits. Long enough to
+/// survive a page reload (which briefly drops the WebSocket) without shutting down underneath
+/// the user.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 struct ScanState {
     tree: RwLock<layout::DirTree>,
     version: AtomicU64,
     done: AtomicBool,
     started: AtomicBool,
+    /// Bumped each time a scan starts; lets a superseded scan's relay task detect it has been
+    /// replaced and stop writing into the shared tree.
+    generation: AtomicU64,
     root: Mutex<PathBuf>,
     cross_filesystems: bool,
 }
@@ -91,7 +100,9 @@ struct AppState {
 
 impl AppState {
     fn invalidate_layout(&self) {
-        self.scan.version.fetch_add(1, Ordering::Relaxed);
+        // Release so the layout loop's Acquire load of `version` also observes the tree and
+        // `done` writes that happened before this call.
+        self.scan.version.fetch_add(1, Ordering::Release);
         self.layout.notify.notify_one();
     }
 }
@@ -119,6 +130,7 @@ async fn run_server(
             version: AtomicU64::new(0),
             done: AtomicBool::new(false),
             started: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             root: Mutex::new(scan_root),
             cross_filesystems,
         },
@@ -160,8 +172,8 @@ async fn run_server(
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {},
             }
 
-            let current_version = layout_state.scan.version.load(Ordering::Relaxed);
-            let scan_done = layout_state.scan.done.load(Ordering::Relaxed);
+            let current_version = layout_state.scan.version.load(Ordering::Acquire);
+            let scan_done = layout_state.scan.done.load(Ordering::Acquire);
 
             if current_version == last_version || layout_state.connections.count.load(Ordering::Relaxed) == 0 {
                 continue;
@@ -170,13 +182,13 @@ async fn run_server(
                 continue;
             }
 
-            let view = layout_state.view.lock().unwrap().clone();
+            let view = layout_state.view.lock().clone();
             let (vw, vh) = view.viewport;
             if vw <= 0.0 || vh <= 0.0 {
                 continue;
             }
 
-            let tree = layout_state.scan.tree.read().unwrap();
+            let tree = layout_state.scan.tree.read();
             let root_id = match tree.root_id {
                 Some(id) => id,
                 None => continue,
@@ -198,8 +210,8 @@ async fn run_server(
             let dir_count = tree.nodes.len() as u32;
             drop(tree);
 
-            let message = protocol::encode_layout(root_size, dir_count, scan_done, &breadcrumb, &rects);
-            *layout_state.layout.last.lock().unwrap() = Some(message.clone());
+            let message = encode_layout_message(root_size, dir_count, scan_done, &breadcrumb, &rects);
+            *layout_state.layout.last.lock() = Some(message.clone());
             let _ = layout_state.layout.tx.send(message);
 
             last_version = current_version;
@@ -269,6 +281,9 @@ async fn shutdown_signal(state: Arc<AppState>) {
 }
 
 fn start_scan(state: &Arc<AppState>) {
+    // Supersede any in-flight scan: a new generation makes the previous relay task bail before
+    // it writes more events into the shared tree.
+    let generation = state.scan.generation.fetch_add(1, Ordering::Relaxed) + 1;
     state.scan.done.store(false, Ordering::Relaxed);
     state.scan.started.store(true, Ordering::Relaxed);
     let (tx, rx) = std::sync::mpsc::channel::<ScanEvent>();
@@ -276,20 +291,23 @@ fn start_scan(state: &Arc<AppState>) {
     let relay_state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         while let Ok(event) = rx.recv() {
+            if relay_state.scan.generation.load(Ordering::Relaxed) != generation {
+                break;
+            }
             let mut events = vec![event];
             while let Ok(extra) = rx.try_recv() {
                 events.push(extra);
             }
 
-            let mut tree = relay_state.scan.tree.write().unwrap();
+            let mut tree = relay_state.scan.tree.write();
             for event in events {
                 match event {
                     ScanEvent::ScanStart { path } => {
                         tree.clear();
                         tree.scan_path = path.clone();
-                        relay_state.view.lock().unwrap().view_root = None;
+                        relay_state.view.lock().view_root = None;
                         relay_state.scan.done.store(false, Ordering::Relaxed);
-                        let _ = relay_state.layout.tx.send(protocol::encode_scan_start(&path));
+                        let _ = relay_state.layout.tx.send(wire::encode_scan_start(&path));
                     }
                     ScanEvent::Dir {
                         id,
@@ -319,7 +337,7 @@ fn start_scan(state: &Arc<AppState>) {
         }
     });
 
-    let path = state.scan.root.lock().unwrap().clone();
+    let path = state.scan.root.lock().clone();
     let cross_filesystems = state.scan.cross_filesystems;
     tokio::task::spawn_blocking(move || {
         if let Err(e) = scanner::scan::scan(&path, cross_filesystems, tx) {
@@ -359,7 +377,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     state.connections.count.fetch_add(1, Ordering::Relaxed);
     state.connections.had_any.store(true, Ordering::Relaxed);
 
-    let last = state.layout.last.lock().unwrap().clone();
+    let last = state.layout.last.lock().clone();
     if let Some(message) = last {
         if socket.send(Message::Binary(message.into())).await.is_err() {
             return;
@@ -367,7 +385,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     } else if state.picker_mode
         && !state.scan.started.load(Ordering::Relaxed)
         && socket
-            .send(Message::Binary(protocol::encode_picker_mode().into()))
+            .send(Message::Binary(wire::encode_picker_mode().into()))
             .await
             .is_err()
     {
@@ -406,7 +424,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     if state.connections.count.fetch_sub(1, Ordering::Relaxed) == 1 {
         let server = Arc::clone(&state);
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
             if server.connections.count.load(Ordering::Relaxed) == 0
                 && server.connections.had_any.load(Ordering::Relaxed)
             {
@@ -433,28 +451,65 @@ fn reveal_in_file_manager(path: &std::path::Path) {
     }
 }
 
+fn encode_layout_message(
+    root_size: u64,
+    dir_count: u32,
+    scan_done: bool,
+    breadcrumb: &[layout::BreadcrumbEntry],
+    rects: &[layout::LayoutRect],
+) -> Vec<u8> {
+    let breadcrumb = breadcrumb
+        .iter()
+        .map(|entry| wire::BreadcrumbEntry {
+            id: entry.id,
+            name: entry.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let rects = rects
+        .iter()
+        .map(|rect| wire::LayoutRect {
+            id: rect.id,
+            parent_id: rect.parent_id,
+            x: rect.x as f32,
+            y: rect.y as f32,
+            w: rect.w as f32,
+            h: rect.h as f32,
+            name: rect.name.clone(),
+            hue: rect.hue,
+            size: rect.size,
+            depth: rect.depth,
+            is_container: rect.is_container,
+            header_height: rect.header_height as f32,
+            is_files: rect.is_files,
+            is_file: rect.is_file,
+            mtime: rect.mtime,
+        })
+        .collect::<Vec<_>>();
+    wire::encode_layout(root_size, dir_count, scan_done, &breadcrumb, &rects)
+}
+
 fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
     let Some(msg) = ClientMessage::decode(data) else { return };
     match msg {
         ClientMessage::Viewport { width, height } => {
-            state.view.lock().unwrap().viewport = (width as f64, height as f64);
+            state.view.lock().viewport = (width as f64, height as f64);
             state.invalidate_layout();
         }
         ClientMessage::Navigate { id } => {
-            state.view.lock().unwrap().view_root = Some(id);
+            state.view.lock().view_root = Some(id);
             state.invalidate_layout();
         }
         ClientMessage::RevealDir { id } => {
-            let root = state.scan.root.lock().unwrap().clone();
-            let tree = state.scan.tree.read().unwrap();
+            let root = state.scan.root.lock().clone();
+            let tree = state.scan.tree.read();
             if let Some(path) = tree.full_path(id, &root) {
                 drop(tree);
                 reveal_in_file_manager(&path);
             }
         }
         ClientMessage::RevealFile { dir_id, name } => {
-            let root = state.scan.root.lock().unwrap().clone();
-            let tree = state.scan.tree.read().unwrap();
+            let root = state.scan.root.lock().clone();
+            let tree = state.scan.tree.read();
             if let Some(path) = tree.full_path(dir_id, &root).map(|p| p.join(name)) {
                 drop(tree);
                 reveal_in_file_manager(&path);
@@ -466,37 +521,37 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
             }
         }
         ClientMessage::SetDepth { depth } => {
-            state.view.lock().unwrap().max_depth = depth;
+            state.view.lock().max_depth = depth;
             state.invalidate_layout();
         }
         ClientMessage::ColorMode { mode } => {
-            state.view.lock().unwrap().color_mode = mode;
+            state.view.lock().color_mode = mode;
             state.invalidate_layout();
         }
         ClientMessage::FilterExt { extensions } => {
-            state.view.lock().unwrap().filter.extensions = extensions;
+            state.view.lock().filter.extensions = extensions;
             state.invalidate_layout();
         }
         ClientMessage::FilterSize { min, max } => {
-            let mut view = state.view.lock().unwrap();
+            let mut view = state.view.lock();
             view.filter.min_size = min;
             view.filter.max_size = max;
             drop(view);
             state.invalidate_layout();
         }
         ClientMessage::FilterName { pattern } => {
-            state.view.lock().unwrap().filter.name_pattern = pattern;
+            state.view.lock().filter.name_pattern = pattern;
             state.invalidate_layout();
         }
         ClientMessage::ClearFilter => {
-            state.view.lock().unwrap().filter = FilterConfig::default();
+            state.view.lock().filter = FilterConfig::default();
             state.invalidate_layout();
         }
         ClientMessage::ScanPath { path } => {
             let can_start = !state.scan.started.load(Ordering::Relaxed) || state.scan.done.load(Ordering::Relaxed);
             if can_start {
                 let scan_root = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
-                *state.scan.root.lock().unwrap() = scan_root;
+                *state.scan.root.lock() = scan_root;
                 start_scan(state);
             }
         }

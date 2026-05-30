@@ -1,0 +1,42 @@
+[package]
+name = "rsdirstat-wasm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+js-sys = "0.3"
+rsdirstat-protocol.workspace = true
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "CanvasRenderingContext2d",
+    "CloseEvent",
+    "CssStyleDeclaration",
+    "Document",
+    "DomTokenList",
+    "DomRect",
+    "Element",
+    "Event",
+    "EventTarget",
+    "HtmlButtonElement",
+    "HtmlCanvasElement",
+    "HtmlDivElement",
+    "HtmlElement",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "Location",
+    "MessageEvent",
+    "MouseEvent",
+    "Performance",
+    "Response",
+    "Node",
+    "TextMetrics",
+    "UrlSearchParams",
+    "WebSocket",
+    "Window",
+] }

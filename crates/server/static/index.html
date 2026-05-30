@@ -5,13 +5,8 @@
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>rsdirstat</title>
         <link rel="stylesheet" href="/main.css" />
-        <link rel="modulepreload" href="/main.js" />
-        <link rel="modulepreload" href="/protocol.js" />
-        <link rel="modulepreload" href="/util.js" />
-        <link rel="modulepreload" href="/render.js" />
-        <link rel="modulepreload" href="/events.js" />
-        <link rel="modulepreload" href="/toolbar.js" />
-        <link rel="modulepreload" href="/picker.js" />
+        <link rel="modulepreload" href="/wasm-init.js" />
+        <link rel="modulepreload" href="/gen/rsdirstat_wasm.js" />
     </head>
     <body>
         <div id="treemap-view" class="hidden">
@@ -80,6 +75,6 @@
             <div class="tip-percent"></div>
             <div class="tip-mtime"></div>
         </div>
-        <script type="module" src="/main.js"></script>
+        <script type="module" src="/wasm-init.js"></script>
     </body>
 </html>

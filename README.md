@@ -21,7 +21,7 @@ Requires [Rust](https://rustup.rs/) (edition 2024).
 
 ```sh
 cargo install --path crates/cli
-cargo install --path crates/gui
+cargo install --path crates/server
 ```
 
 ## Usage
@@ -29,17 +29,17 @@ cargo install --path crates/gui
 ### GUI
 
 ```sh
-rsdirstat-gui [path]          # opens browser with treemap
-rsdirstat-gui --all [path]    # cross filesystem boundaries
+rsdirstat-server [path]          # opens browser with treemap
+rsdirstat-server --all [path]    # cross filesystem boundaries
 ```
 
 ### CLI
 
 ```sh
-rsdirstat [path]              # top 10 directories by size
-rsdirstat --files [path]      # top 10 files by size
-rsdirstat --top 20 [path]     # show more results
-rsdirstat --all [path]        # cross filesystem boundaries
+rsdirstat-cli [path]          # top 10 directories by size
+rsdirstat-cli --files [path]  # top 10 files by size
+rsdirstat-cli --top 20 [path] # show more results
+rsdirstat-cli --all [path]    # cross filesystem boundaries
 ```
 
 ## Building
@@ -47,6 +47,18 @@ rsdirstat --all [path]        # cross filesystem boundaries
 ```sh
 cargo build --release
 ```
+
+Building the server compiles the browser frontend to WebAssembly automatically, so the
+wasm toolchain is required:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli
+```
+
+The generated bundle lands in `crates/server/static/gen/` (git-ignored). If the toolchain
+is unavailable, the build falls back to a previously generated bundle when one is present;
+set `RSDIRSTAT_BUILD_WASM=1` to force a rebuild.
 
 Only the native platform scanner is compiled. Cross-compilation:
 
@@ -62,9 +74,11 @@ cargo xwin build --release --target x86_64-pc-windows-msvc
 
 ```
 crates/
-  core/       Shared library: treemap layout, binary protocol, work queue
+  core/       Shared library: treemap layout, work queue
+  protocol/   Shared wire protocol for server and wasm frontend
   cli/        Command-line interface
-  gui/        Web-based treemap GUI (axum + WebSocket)
+  server/     Web-based treemap server (axum + WebSocket)
+  wasm/       Browser frontend compiled to WebAssembly
   macos/      macOS scanner
   linux/      Linux scanner
   windows/    Windows scanner
