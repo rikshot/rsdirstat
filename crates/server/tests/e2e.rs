@@ -534,7 +534,7 @@ async fn e2e_rescan_webkit() {
 async fn js_unit_tests(page: &playwright_rs::Page) {
     let result = page
         .evaluate_value(
-            "async () => { const wasm = await import('./gen/rsdirstat_wasm.js'); const r = wasm.runBrowserTests(); return r.failed === 0 ? `PASS ${r.total}` : `FAIL ${r.failed}/${r.total}: ${r.failures.join('; ')}`; }",
+            "() => { const r = window.wasmBindings.runBrowserTests(); return r.failed === 0 ? `PASS ${r.total}` : `FAIL ${r.failed}/${r.total}: ${r.failures.join('; ')}`; }",
         )
         .await
         .unwrap();

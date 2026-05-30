@@ -1,0 +1,10 @@
+[build]
+# Run trunk from the project root; the frontend lives in the wasm crate.
+target = "crates/wasm/index.html"
+dist = "crates/wasm/dist"
+# Stable asset names (no content hash): the e2e harness imports the bundle at a
+# fixed path, the axum server serves predictable files, and cache-busting is
+# pointless for a freshly-built, locally-served dev tool.
+filehash = false
+# Note: trunk's bundled JS minifier can't parse the wasm-bindgen glue, and the server
+# gzips all static assets at runtime, so `minify` is intentionally left off.

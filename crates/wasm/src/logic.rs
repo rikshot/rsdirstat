@@ -21,6 +21,7 @@ pub(crate) struct RenderRect {
     pub is_files: bool,
     pub is_file: bool,
     pub mtime: i64,
+    pub depth: u8,
     pub color_dark: String,
     pub color_border: String,
     pub color_background: Option<String>,
@@ -47,6 +48,7 @@ impl RenderRect {
             is_files: rect.is_files,
             is_file: rect.is_file,
             mtime: rect.mtime,
+            depth: rect.depth,
         }
     }
 }
@@ -248,6 +250,7 @@ mod tests {
             is_files: false,
             is_file: false,
             mtime: 0,
+            depth: 1,
             color_dark: String::new(),
             color_border: String::new(),
             color_background: None,

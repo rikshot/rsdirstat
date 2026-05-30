@@ -30,6 +30,10 @@ const PATH_BAR_HEIGHT: f64 = 24.0;
 const ZOOM_DURATION: f64 = 300.0;
 const GAP: f64 = 0.5;
 const RADIUS: f64 = 3.0;
+/// Rects smaller than this in either dimension are filled with a plain (square, non-anti-aliased)
+/// `fillRect` instead of a rounded `fill()` path — the corner radius is invisible at small sizes
+/// and the rounded-path rasterization is the dominant render cost.
+const ROUND_MIN: f64 = 16.0;
 const FONT: &str = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
 
 thread_local! {
@@ -56,6 +60,9 @@ impl ZoomAnim {
     }
 }
 
+// Closures are held only to keep them alive for the WebSocket's lifetime (RAII); they are
+// invoked by JS, never read from Rust.
+#[allow(dead_code)]
 struct WebSocketCallbacks {
     onopen: Closure<dyn FnMut(Event)>,
     onmessage: Closure<dyn FnMut(MessageEvent)>,

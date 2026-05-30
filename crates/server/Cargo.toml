@@ -18,7 +18,7 @@ mimalloc = "0.1"
 open = "5"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "parking_lot"] }
-tower-http = { version = "0.6", features = ["fs", "compression-gzip"] }
+tower-http = { version = "0.6", features = ["fs", "compression-br", "compression-gzip", "compression-zstd"] }
 
 [dev-dependencies]
 playwright-rs = "0.9"

@@ -3,7 +3,25 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Once;
 use std::time::Duration;
+
+/// Build the trunk frontend bundle once per test run. The server serves it at runtime from
+/// `crates/wasm/dist`, so the e2e/visual tests need it present. This is test-only orchestration
+/// (it never runs during a normal `cargo build`), so it does not reintroduce a build script.
+fn ensure_frontend_built() {
+    static BUILT: Once = Once::new();
+    BUILT.call_once(|| {
+        // Trunk.toml lives at the workspace root (two levels up from this crate).
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let status = Command::new("trunk")
+            .arg("build")
+            .current_dir(&root)
+            .status()
+            .expect("failed to run `trunk build` — is trunk installed? (cargo install trunk)");
+        assert!(status.success(), "trunk build failed with status {status}");
+    });
+}
 
 pub struct TestServer {
     child: Child,
@@ -20,6 +38,7 @@ impl TestServer {
     }
 
     fn spawn(args: &[&str]) -> Self {
+        ensure_frontend_built();
         let bin = env!("CARGO_BIN_EXE_rsdirstat-server");
         let mut child = Command::new(bin)
             .args(args)

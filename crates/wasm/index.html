@@ -4,9 +4,8 @@
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>rsdirstat</title>
-        <link rel="stylesheet" href="/main.css" />
-        <link rel="modulepreload" href="/wasm-init.js" />
-        <link rel="modulepreload" href="/gen/rsdirstat_wasm.js" />
+        <link data-trunk rel="rust" data-wasm-opt="3" data-reference-types data-weak-refs />
+        <link data-trunk rel="css" href="main.css" />
     </head>
     <body>
         <div id="treemap-view" class="hidden">
@@ -75,6 +74,5 @@
             <div class="tip-percent"></div>
             <div class="tip-mtime"></div>
         </div>
-        <script type="module" src="/wasm-init.js"></script>
     </body>
 </html>

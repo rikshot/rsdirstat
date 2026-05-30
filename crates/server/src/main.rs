@@ -356,18 +356,20 @@ fn start_scan(state: &Arc<AppState>) {
     });
 }
 
+/// Locate the trunk-built frontend bundle. In a dev checkout it lives in the wasm crate's
+/// `dist/` (produced by `trunk build`); a deployed binary expects a `dist/` next to it.
 fn find_static_dir() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
-    if manifest.is_dir() {
-        return manifest;
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../wasm/dist");
+    if dev.is_dir() {
+        return dev;
     }
     if let Ok(exe) = std::env::current_exe() {
-        let dir = exe.parent().unwrap_or(std::path::Path::new(".")).join("static");
+        let dir = exe.parent().unwrap_or(std::path::Path::new(".")).join("dist");
         if dir.is_dir() {
             return dir;
         }
     }
-    eprintln!("Warning: 'static/' directory not found");
+    eprintln!("Warning: frontend 'dist/' not found; run `trunk build` in crates/wasm");
     PathBuf::from(".")
 }
 

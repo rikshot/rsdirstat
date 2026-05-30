@@ -31,10 +31,6 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
-          target: wasm32-unknown-unknown
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-bindgen-cli@0.2.122
       - run: cargo clippy --all-targets --no-deps -- -D warnings
 
   test:
@@ -46,11 +42,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          target: wasm32-unknown-unknown
       - uses: taiki-e/install-action@v2
         with:
-          tool: nextest,wasm-bindgen-cli@0.2.122
+          tool: nextest
       - run: cargo nextest run --profile ci -E 'not test(/^visual/) and not test(/^e2e/)'
 
   build:
@@ -66,7 +60,8 @@ jobs:
           target: wasm32-unknown-unknown
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen-cli@0.2.122
+          tool: trunk
+      - run: trunk build --release
       - run: cargo build --release
 
   browser:
@@ -82,7 +77,7 @@ jobs:
           target: wasm32-unknown-unknown
       - uses: taiki-e/install-action@v2
         with:
-          tool: nextest,wasm-bindgen-cli@0.2.122
+          tool: nextest,trunk
       - uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -100,7 +95,7 @@ jobs:
       - run: npx playwright@1.58.2 install --with-deps chromium firefox webkit
       - uses: actions/cache@v5
         with:
-          key: visual-baselines-v1-${{ matrix.os }}
+          key: visual-baselines-v2-${{ matrix.os }}
           path: crates/server/tests/snapshots/
       - run: cargo nextest run --profile ci -E 'test(/^visual/) or test(/^e2e/)'
       - uses: actions/upload-artifact@v7

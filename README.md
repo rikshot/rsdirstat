@@ -44,21 +44,24 @@ rsdirstat-cli --all [path]    # cross filesystem boundaries
 
 ## Building
 
-```sh
-cargo build --release
-```
-
-Building the server compiles the browser frontend to WebAssembly automatically, so the
-wasm toolchain is required:
+The browser frontend is a Rust/WASM app built with [trunk](https://trunkrs.dev), which
+drives `wasm-bindgen` and `wasm-opt` for you:
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli
+cargo install trunk
+
+# All trunk commands run from the project root (Trunk.toml lives there).
+# Build the frontend bundle (into crates/wasm/dist, git-ignored), then the server:
+trunk build --release
+cargo build --release
 ```
 
-The generated bundle lands in `crates/server/static/gen/` (git-ignored). If the toolchain
-is unavailable, the build falls back to a previously generated bundle when one is present;
-set `RSDIRSTAT_BUILD_WASM=1` to force a rebuild.
+The server serves the bundle from `crates/wasm/dist` in a dev checkout, or from a `dist/`
+directory next to the binary when deployed.
+
+For frontend development, run `trunk watch` (rebuilds `dist/` on change) alongside
+`cargo run -p rsdirstat-server`, and refresh the browser.
 
 Only the native platform scanner is compiled. Cross-compilation:
 
