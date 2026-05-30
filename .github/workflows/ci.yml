@@ -100,10 +100,12 @@ jobs:
       # Build the frontend once here: nextest runs each test in its own process, so leaving the
       # bundle to the test harness would launch many concurrent `trunk build`s that race.
       - run: trunk build
-      # Provision the playwright-rs driver once: it unzips a bundled driver into a shared cache on
-      # first launch, and a cold cache + parallel nextest processes race on that unzip (ServerNotFound).
-      # Running one test first warms the cache so the parallel run below reuses it.
-      - run: cargo nextest run --profile ci -E 'test(=e2e_page_title_chromium)'
+      # playwright-rs's build.rs downloads its driver into <workspace>/drivers and bakes that path
+      # into the binary, skipping the download when the dir already exists. A cached compile (Swatinem
+      # rust-cache) skips build.rs entirely, so when the separate `drivers` cache is cold/expired the
+      # driver goes missing and every test fails with ServerNotFound. Force build.rs to re-run so the
+      # driver is always provisioned (reusing the cached drivers/ when warm, downloading when cold).
+      - run: cargo clean -p playwright-rs
       - run: cargo nextest run --profile ci -E 'test(/^visual/) or test(/^e2e/)'
       - uses: actions/upload-artifact@v7
         if: always()
