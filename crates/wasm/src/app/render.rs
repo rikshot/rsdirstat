@@ -259,7 +259,10 @@ fn draw_leaf_label(
         return Ok(());
     }
     let font_size = 14.0_f64
-        .min(9.0_f64.max((available_width / (rect.name.len().max(1) as f64 * 0.6)).min(available_height * 0.45)))
+        .min(
+            9.0_f64
+                .max((available_width / (rect.name.chars().count().max(1) as f64 * 0.6)).min(available_height * 0.45)),
+        )
         .round() as i32;
     state.font(ctx, &format!("600 {font_size}px {FONT}"));
     state.fill(ctx, "rgba(255,255,255,0.92)");

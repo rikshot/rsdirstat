@@ -27,7 +27,9 @@ pub fn age_hue(mtime: i64, min_time: i64, max_time: i64) -> u16 {
     if max_time <= min_time || mtime <= 0 {
         return 60;
     }
-    let ratio = ((mtime - min_time) as f64) / ((max_time - min_time) as f64);
+    // Clamp: during a streaming scan the range can still be growing, so an mtime above the
+    // current max would otherwise push the hue past the intended 0..=120 band.
+    let ratio = (((mtime - min_time) as f64) / ((max_time - min_time) as f64)).clamp(0.0, 1.0);
     (ratio * 120.0) as u16
 }
 

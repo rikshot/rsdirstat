@@ -75,7 +75,11 @@ impl<T> WorkQueue<T> {
     /// Must be called AFTER processing is complete and any child items have been pushed.
     pub fn finish_one(&self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.pending -= 1;
+        // saturating: `cancel()` (stall recovery) zeroes `pending` while a worker is still
+        // processing an item, so this can be reached at pending == 0. A plain `-= 1` would panic
+        // in debug and wrap to usize::MAX in release, making `take()` never return None — the
+        // exact hang that stall recovery exists to prevent.
+        inner.pending = inner.pending.saturating_sub(1);
         if inner.pending == 0 {
             self.condvar.notify_all();
         }

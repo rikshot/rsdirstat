@@ -209,7 +209,11 @@ fn scan_directory(
                 break;
             }
 
-            let info = unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_ID_BOTH_DIR_INFO) };
+            // read_unaligned: `buffer` is a Vec<u8> (align 1) but FILE_ID_BOTH_DIR_INFO has 8-byte
+            // fields, so forming a `&` reference to it is UB even though entries are in practice
+            // 8-aligned. Copy the (Copy) header out by value; the variable-length name is read
+            // separately below from the still-in-buffer bytes.
+            let info = unsafe { std::ptr::read_unaligned(buffer.as_ptr().add(offset) as *const FILE_ID_BOTH_DIR_INFO) };
             let name_len = (info.FileNameLength as usize) / 2;
 
             // Read variable-length filename

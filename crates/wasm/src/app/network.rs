@@ -3,10 +3,10 @@ use super::*;
 
 impl TreemapApp {
     pub(super) fn send_message(&self, bytes: Vec<u8>) -> Result<(), JsValue> {
-        if let Some(ws) = &self.session.ws {
-            if ws.ready_state() == WebSocket::OPEN {
-                ws.send_with_u8_array(&bytes)?;
-            }
+        if let Some(ws) = &self.session.ws
+            && ws.ready_state() == WebSocket::OPEN
+        {
+            ws.send_with_u8_array(&bytes)?;
         }
         Ok(())
     }

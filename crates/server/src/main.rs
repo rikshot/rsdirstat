@@ -240,7 +240,10 @@ async fn run_server(
         .fallback_service(ServeDir::new(&static_dir))
         .layer(CompressionLayer::new());
 
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    // Bind loopback only: the UI is always pointed at localhost, and the server exposes full
+    // directory listings plus arbitrary-path scans with no auth — there's no reason to accept
+    // connections from other hosts on the network.
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let actual_port = listener.local_addr()?.port();
     eprintln!("Listening on http://localhost:{actual_port}");
 
@@ -389,6 +392,13 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     state.connections.count.fetch_add(1, Ordering::Relaxed);
     state.connections.had_any.store(true, Ordering::Relaxed);
 
+    // Subscribe before reading the snapshot: a layout produced between the snapshot read and the
+    // subscribe would otherwise be lost to this client (absent from the snapshot, broadcast before
+    // we were listening) — and if it were the final one, the client would be stuck on a stale view.
+    // A layout that lands in the overlap is merely delivered twice, which the client tolerates.
+    let mut layout_rx = state.layout.tx.subscribe();
+    let mut shutdown_rx = state.shutdown.subscribe();
+
     let last = state.layout.last.lock().clone();
     if let Some(message) = last {
         if socket.send(Message::Binary(message.into())).await.is_err() {
@@ -403,9 +413,6 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     {
         return;
     }
-
-    let mut layout_rx = state.layout.tx.subscribe();
-    let mut shutdown_rx = state.shutdown.subscribe();
 
     loop {
         tokio::select! {

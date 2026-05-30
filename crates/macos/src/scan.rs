@@ -27,7 +27,10 @@ static SCAN_ATTRS: libc::attrlist = libc::attrlist {
         | libc::ATTR_CMN_FILEID,
     volattr: 0,
     dirattr: 0,
-    fileattr: libc::ATTR_FILE_TOTALSIZE,
+    // DATALENGTH (logical data-fork length), not TOTALSIZE: the latter adds resource-fork bytes,
+    // which Linux (stx_size) and Windows (EndOfFile) don't count, so the same tree would total
+    // differently per platform. DATALENGTH matches their apparent-size semantics.
+    fileattr: libc::ATTR_FILE_DATALENGTH,
     forkattr: 0,
 };
 
@@ -173,7 +176,14 @@ fn scan_directory(
             )
         };
 
-        if count <= 0 {
+        if count < 0 {
+            eprintln!(
+                "getattrlistbulk failed for {dir_name}: {}",
+                std::io::Error::last_os_error()
+            );
+            break;
+        }
+        if count == 0 {
             break;
         }
 
@@ -264,56 +274,72 @@ struct ParsedEntry<'a> {
     mtime: i64,
 }
 
+/// Parse one `getattrlistbulk` entry. The layout is dynamic: a leading `attribute_set_t`
+/// (ATTR_CMN_RETURNED_ATTRS) reports which requested attributes were actually returned, and each
+/// attribute's bytes are present only if its bit is set, in ascending bit order per group. We must
+/// honor that bitmap rather than assume every field is present — a filesystem that omits one would
+/// otherwise shift every later field and corrupt the parse.
+// The final `field!` advances `pos` past the last attribute even though nothing reads it after —
+// the uniform macro is clearer than special-casing the tail.
+#[allow(unused_assignments)]
 fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
+    // entry[0..4] is the u32 entry length (used by the caller for framing); skip it.
     let mut pos = 4;
 
+    // ATTR_CMN_RETURNED_ATTRS: attribute_set_t = 5 × u32 (common, vol, dir, file, fork bitmaps).
     if pos + 20 > entry.len() {
         return None;
     }
+    let returned_common = u32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
+    let returned_file = u32::from_ne_bytes(entry[pos + 12..pos + 16].try_into().ok()?);
     pos += 20;
 
-    if pos + 8 > entry.len() {
-        return None;
-    }
-    let name_offset = i32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?) as usize;
-    let name_base = pos;
-    pos += 8;
+    let mut name = "";
+    let mut dev_id = 0i32;
+    let mut obj_type = 0u32;
+    let mut file_id = 0u64;
+    let mut mtime = 0i64;
+    let mut file_size = 0u64;
 
-    if pos + 4 > entry.len() {
-        return None;
+    // Read a fixed-width field only if its bit is set, advancing `pos` past the bytes it occupies.
+    macro_rules! field {
+        ($present:expr, $width:expr, $read:expr) => {
+            if $present {
+                if pos + $width > entry.len() {
+                    return None;
+                }
+                $read;
+                pos += $width;
+            }
+        };
     }
-    let dev_id = i32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
-    pos += 4;
 
-    if pos + 4 > entry.len() {
-        return None;
-    }
-    let obj_type = u32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
-    pos += 4;
-
-    if pos + 16 > entry.len() {
-        return None;
-    }
-    let mtime = i64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
-    pos += 16;
-
-    if pos + 8 > entry.len() {
-        return None;
-    }
-    let file_id = u64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
-    pos += 8;
-
-    let file_size = if obj_type == VREG && pos + 8 <= entry.len() {
-        u64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?)
-    } else {
-        0
-    };
-
-    let name_start = name_base + name_offset;
-    if name_start >= entry.len() {
-        return None;
-    }
-    let name = CStr::from_bytes_until_nul(&entry[name_start..]).ok()?.to_str().ok()?;
+    // ATTR_CMN_NAME: attrreference_t (i32 data offset relative to its own start + u32 length).
+    field!(returned_common & libc::ATTR_CMN_NAME != 0, 8, {
+        let name_offset = i32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?) as usize;
+        let name_start = pos + name_offset;
+        if name_start >= entry.len() {
+            return None;
+        }
+        name = CStr::from_bytes_until_nul(&entry[name_start..]).ok()?.to_str().ok()?;
+    });
+    field!(returned_common & libc::ATTR_CMN_DEVID != 0, 4, {
+        dev_id = i32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
+    });
+    field!(returned_common & libc::ATTR_CMN_OBJTYPE != 0, 4, {
+        obj_type = u32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
+    });
+    // ATTR_CMN_MODTIME: timespec (16 bytes); we only need tv_sec from the first 8.
+    field!(returned_common & libc::ATTR_CMN_MODTIME != 0, 16, {
+        mtime = i64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
+    });
+    field!(returned_common & libc::ATTR_CMN_FILEID != 0, 8, {
+        file_id = u64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
+    });
+    // File attributes only appear for files, so this bit is naturally clear for directories.
+    field!(returned_file & libc::ATTR_FILE_DATALENGTH != 0, 8, {
+        file_size = u64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
+    });
 
     Some(ParsedEntry {
         name,

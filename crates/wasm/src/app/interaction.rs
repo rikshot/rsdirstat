@@ -33,17 +33,16 @@ impl TreemapApp {
             self.view.last_mouse_x,
             self.view.last_mouse_y,
         );
-        self.view.hovered_index = hover.as_ref().and_then(|state| state.hovered_index);
-        self.view.hovered_ancestor_indices = hover
-            .as_ref()
-            .map(|state| state.hovered_ancestor_indices.clone())
-            .unwrap_or_default();
-        if let Some(hover) = hover {
-            self.chrome.path_text_element.set_text_content(Some(&hover.path_text));
+        if let Some(state) = hover {
+            self.view.hovered_index = state.hovered_index;
+            self.view.hovered_ancestor_indices = state.hovered_ancestor_indices;
+            self.chrome.path_text_element.set_text_content(Some(&state.path_text));
             self.chrome
                 .path_size_element
-                .set_text_content(Some(&format_size_impl(hover.size as f64)));
+                .set_text_content(Some(&format_size_impl(state.size as f64)));
         } else {
+            self.view.hovered_index = None;
+            self.view.hovered_ancestor_indices.clear();
             self.chrome.path_text_element.set_text_content(Some(""));
             self.chrome.path_size_element.set_text_content(Some(""));
         }

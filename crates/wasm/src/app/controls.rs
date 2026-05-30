@@ -238,6 +238,11 @@ impl TreemapApp {
     }
 
     pub(super) fn clear_filter(&mut self) -> Result<(), JsValue> {
+        // Cancel any debounced filter send still pending, or it would fire after the clear and
+        // re-send the (now empty) inputs.
+        if let Some(id) = self.session.filter_timer_id.take() {
+            self.window.clear_timeout_with_handle(id);
+        }
         self.chrome.filter_ext_input.set_value("");
         self.chrome.filter_name_input.set_value("");
         self.chrome.filter_min_input.set_value("");
