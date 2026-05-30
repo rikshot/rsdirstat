@@ -210,7 +210,14 @@ async fn run_server(
             let dir_count = tree.nodes.len() as u32;
             drop(tree);
 
-            let message = encode_layout_message(root_size, dir_count, scan_done, &breadcrumb, &rects);
+            let message = wire::ServerMessage::Layout(wire::LayoutPayload {
+                root_size,
+                dir_count,
+                scan_done,
+                breadcrumb,
+                rects,
+            })
+            .encode();
             *layout_state.layout.last.lock() = Some(message.clone());
             let _ = layout_state.layout.tx.send(message);
 
@@ -307,7 +314,10 @@ fn start_scan(state: &Arc<AppState>) {
                         tree.scan_path = path.clone();
                         relay_state.view.lock().view_root = None;
                         relay_state.scan.done.store(false, Ordering::Relaxed);
-                        let _ = relay_state.layout.tx.send(wire::encode_scan_start(&path));
+                        let _ = relay_state
+                            .layout
+                            .tx
+                            .send(wire::ServerMessage::ScanStart { path }.encode());
                     }
                     ScanEvent::Dir {
                         id,
@@ -385,7 +395,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     } else if state.picker_mode
         && !state.scan.started.load(Ordering::Relaxed)
         && socket
-            .send(Message::Binary(wire::encode_picker_mode().into()))
+            .send(Message::Binary(wire::ServerMessage::PickerMode.encode().into()))
             .await
             .is_err()
     {
@@ -449,43 +459,6 @@ fn reveal_in_file_manager(path: &std::path::Path) {
     {
         let _ = std::process::Command::new("explorer").arg("/select,").arg(path).spawn();
     }
-}
-
-fn encode_layout_message(
-    root_size: u64,
-    dir_count: u32,
-    scan_done: bool,
-    breadcrumb: &[layout::BreadcrumbEntry],
-    rects: &[layout::LayoutRect],
-) -> Vec<u8> {
-    let breadcrumb = breadcrumb
-        .iter()
-        .map(|entry| wire::BreadcrumbEntry {
-            id: entry.id,
-            name: entry.name.clone(),
-        })
-        .collect::<Vec<_>>();
-    let rects = rects
-        .iter()
-        .map(|rect| wire::LayoutRect {
-            id: rect.id,
-            parent_id: rect.parent_id,
-            x: rect.x as f32,
-            y: rect.y as f32,
-            w: rect.w as f32,
-            h: rect.h as f32,
-            name: rect.name.clone(),
-            hue: rect.hue,
-            size: rect.size,
-            depth: rect.depth,
-            is_container: rect.is_container,
-            header_height: rect.header_height as f32,
-            is_files: rect.is_files,
-            is_file: rect.is_file,
-            mtime: rect.mtime,
-        })
-        .collect::<Vec<_>>();
-    wire::encode_layout(root_size, dir_count, scan_done, &breadcrumb, &rects)
 }
 
 fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {

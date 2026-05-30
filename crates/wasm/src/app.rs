@@ -6,11 +6,10 @@ mod render;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::rc::Rc;
 
 use js_sys::{Array, ArrayBuffer, Date, Function, Reflect, Uint8Array};
-use rsdirstat_protocol::{self as wire, BreadcrumbEntry, LayoutPayload, LayoutRect, ServerMessage};
+use rsdirstat_protocol::{self as wire, BreadcrumbEntry, LayoutPayload, ServerMessage};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
@@ -21,8 +20,8 @@ use web_sys::{
 };
 
 use self::dom::{by_id, canvas_context, query, with_app};
-use crate::logic::{HoverState, RectLike, TreemapRect};
-use crate::{format_size_impl, hsl_impl};
+use crate::format_size_impl;
+use crate::logic::RenderRect;
 
 const BACKGROUND: &str = "#1a1a2e";
 const BREADCRUMB_HEIGHT: f64 = 32.0;
@@ -37,153 +36,23 @@ thread_local! {
     static APP: RefCell<Option<Rc<RefCell<TreemapApp>>>> = const { RefCell::new(None) };
 }
 
-#[derive(Clone)]
-struct RenderRect {
-    rect: TreemapRect,
-    color_dark: String,
-    color_border: String,
-    color_background: Option<String>,
-    color_header: Option<String>,
-}
-
-impl RenderRect {
-    fn from_wire(rect: LayoutRect) -> Self {
-        let color_dark = hsl_impl(rect.hue, 62, 38);
-        let color_border = hsl_impl(rect.hue, 60, 28);
-        let color_background = rect.is_container.then(|| hsl_impl(rect.hue, 25, 13));
-        let color_header = rect.is_container.then(|| hsl_impl(rect.hue, 35, 20));
-        let rect = TreemapRect {
-            id: rect.id,
-            parent_id: rect.parent_id,
-            x: rect.x as f64,
-            y: rect.y as f64,
-            w: rect.w as f64,
-            h: rect.h as f64,
-            name: rect.name,
-            size: rect.size,
-            is_container: rect.is_container,
-            header_height: rect.header_height as f64,
-            is_files: rect.is_files,
-            is_file: rect.is_file,
-            mtime: rect.mtime,
-        };
-        Self {
-            rect,
-            color_dark,
-            color_border,
-            color_background,
-            color_header,
-        }
-    }
-
-    fn with_geometry(&self, rect: TreemapRect) -> Self {
-        Self {
-            rect,
-            color_dark: self.color_dark.clone(),
-            color_border: self.color_border.clone(),
-            color_background: self.color_background.clone(),
-            color_header: self.color_header.clone(),
-        }
-    }
-}
-
-impl Deref for RenderRect {
-    type Target = TreemapRect;
-
-    fn deref(&self) -> &Self::Target {
-        &self.rect
-    }
-}
-
-impl RectLike for RenderRect {
-    fn id(&self) -> i64 {
-        self.rect.id
-    }
-
-    fn parent_id(&self) -> u64 {
-        self.rect.parent_id
-    }
-
-    fn x(&self) -> f64 {
-        self.rect.x
-    }
-
-    fn y(&self) -> f64 {
-        self.rect.y
-    }
-
-    fn w(&self) -> f64 {
-        self.rect.w
-    }
-
-    fn h(&self) -> f64 {
-        self.rect.h
-    }
-
-    fn name(&self) -> &str {
-        &self.rect.name
-    }
-
-    fn size(&self) -> u64 {
-        self.rect.size
-    }
-
-    fn is_container(&self) -> bool {
-        self.rect.is_container
-    }
-
-    fn header_height(&self) -> f64 {
-        self.rect.header_height
-    }
-
-    fn is_files(&self) -> bool {
-        self.rect.is_files
-    }
-
-    fn is_file(&self) -> bool {
-        self.rect.is_file
-    }
-
-    fn mtime(&self) -> i64 {
-        self.rect.mtime
-    }
-}
-
 struct ZoomAnim {
     plan: crate::logic::InterpolationPlan,
-    templates: HashMap<i64, RenderRect>,
     start_time: f64,
     duration: f64,
 }
 
 impl ZoomAnim {
     fn new(from: Vec<RenderRect>, to: &[RenderRect], start_time: f64) -> Self {
-        let plan = crate::logic::InterpolationPlan::new(&from, to);
-        let mut templates = HashMap::with_capacity(from.len() + to.len());
-        for rect in from {
-            templates.insert(rect.id, rect);
-        }
-        for rect in to {
-            templates.insert(rect.id, rect.clone());
-        }
         Self {
-            plan,
-            templates,
+            plan: crate::logic::InterpolationPlan::new(&from, to),
             start_time,
             duration: ZOOM_DURATION,
         }
     }
 
     fn interpolate(&self, progress: f64) -> Vec<RenderRect> {
-        self.plan
-            .interpolate(progress)
-            .into_iter()
-            .filter_map(|rect| {
-                self.templates
-                    .get(&rect.id)
-                    .map(|template| template.with_geometry(rect))
-            })
-            .collect()
+        self.plan.interpolate(progress)
     }
 }
 

@@ -139,7 +139,7 @@ impl TreemapApp {
         let mouse_y = event.client_y() as f64 - self.surface.canvas_top;
         if let Some(index) = find_navigable_target_index(&self.view.rects, mouse_x, mouse_y) {
             let id = self.view.rects[index].id as u64;
-            self.begin_navigation(wire::encode_navigate(id))?;
+            self.begin_navigation(wire::ClientMessage::Navigate { id }.encode())?;
         }
         Ok(())
     }
@@ -150,9 +150,15 @@ impl TreemapApp {
         if let Some(index) = find_rect_index(&self.view.rects, mouse_x, mouse_y) {
             let rect = &self.view.rects[index];
             if rect.is_file {
-                self.send_message(wire::encode_reveal_file(rect.parent_id, &rect.name))?;
+                self.send_message(
+                    wire::ClientMessage::RevealFile {
+                        dir_id: rect.parent_id,
+                        name: rect.name.clone(),
+                    }
+                    .encode(),
+                )?;
             } else if rect.id > 0 {
-                self.send_message(wire::encode_reveal_dir(rect.id as u64))?;
+                self.send_message(wire::ClientMessage::RevealDir { id: rect.id as u64 }.encode())?;
             }
         }
         Ok(())

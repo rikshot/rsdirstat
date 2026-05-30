@@ -168,7 +168,7 @@ impl TreemapApp {
 
         let rescan = Closure::wrap(Box::new(move |_event: Event| {
             with_app(|app| {
-                let _ = app.borrow().send_message(wire::encode_rescan());
+                let _ = app.borrow().send_message(wire::ClientMessage::Rescan.encode());
             });
         }) as Box<dyn FnMut(_)>);
         with_app(|app| {
@@ -213,12 +213,12 @@ impl TreemapApp {
 
     pub(super) fn handle_depth_change(&mut self) -> Result<(), JsValue> {
         let depth = self.chrome.depth_select.value().parse::<u8>().unwrap_or(5);
-        self.send_message(wire::encode_set_depth(depth))
+        self.send_message(wire::ClientMessage::SetDepth { depth }.encode())
     }
 
     pub(super) fn handle_color_mode_change(&mut self) -> Result<(), JsValue> {
         let mode = self.chrome.color_mode_select.value().parse::<u8>().unwrap_or(0);
-        self.send_message(wire::encode_color_mode(mode))
+        self.send_message(wire::ClientMessage::ColorMode { mode }.encode())
     }
 
     pub(super) fn schedule_filter_send(&mut self) -> Result<(), JsValue> {
@@ -241,31 +241,35 @@ impl TreemapApp {
         self.chrome.filter_ext_input.set_value("");
         self.chrome.filter_name_input.set_value("");
         self.chrome.filter_min_input.set_value("");
-        self.send_message(wire::encode_clear_filter())
+        self.send_message(wire::ClientMessage::ClearFilter.encode())
     }
 
     pub(super) fn send_filter_now(&mut self) -> Result<(), JsValue> {
         self.session.filter_timer_id = None;
         let ext_value = self.chrome.filter_ext_input.value().trim().to_string();
-        let extensions = if ext_value.is_empty() {
+        let extensions: Vec<Box<str>> = if ext_value.is_empty() {
             Vec::new()
         } else {
             ext_value
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
+                .map(Box::from)
+                .collect()
         };
-        self.send_message(wire::encode_filter_ext(&extensions))?;
+        self.send_message(wire::ClientMessage::FilterExt { extensions }.encode())?;
 
         let min_value = self.chrome.filter_min_input.value().parse::<f64>().unwrap_or(0.0);
         let min_unit = self.chrome.filter_min_unit_select.value().parse::<u64>().unwrap_or(1);
-        self.send_message(wire::encode_filter_size(
-            (min_value * min_unit as f64).floor() as u64,
-            0,
-        ))?;
-        self.send_message(wire::encode_filter_name(self.chrome.filter_name_input.value().trim()))
+        self.send_message(
+            wire::ClientMessage::FilterSize {
+                min: (min_value * min_unit as f64).floor() as u64,
+                max: 0,
+            }
+            .encode(),
+        )?;
+        let pattern = self.chrome.filter_name_input.value().trim().to_string();
+        self.send_message(wire::ClientMessage::FilterName { pattern }.encode())
     }
 
     pub(super) fn build_breadcrumb(&mut self) -> Result<(), JsValue> {
@@ -318,7 +322,12 @@ impl TreemapApp {
         if index + 1 >= self.view.breadcrumb.len() {
             return Ok(());
         }
-        self.begin_navigation(wire::encode_navigate(self.view.breadcrumb[index].id))
+        self.begin_navigation(
+            wire::ClientMessage::Navigate {
+                id: self.view.breadcrumb[index].id,
+            }
+            .encode(),
+        )
     }
 
     pub(super) fn show_picker(&mut self) -> Result<(), JsValue> {
@@ -430,6 +439,6 @@ impl TreemapApp {
 
     pub(super) fn scan_path(&mut self, path: String) -> Result<(), JsValue> {
         self.hide_picker()?;
-        self.send_message(wire::encode_scan_path(&path))
+        self.send_message(wire::ClientMessage::ScanPath { path }.encode())
     }
 }

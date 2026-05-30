@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use rsdirstat_protocol::BreadcrumbEntry;
+use rsdirstat_protocol::{BreadcrumbEntry, LayoutRect};
 
-use crate::{collapse_slashes, hit_test_impl};
+use crate::{collapse_slashes, hit_test_impl, hsl_impl};
 
+/// A laid-out rect ready to draw: geometry (in f64 layout space) plus the cached colour strings
+/// derived from its hue. This is the single rect representation used throughout the client.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct TreemapRect {
+pub(crate) struct RenderRect {
     pub id: i64,
     pub parent_id: u64,
     pub x: f64,
@@ -19,6 +21,34 @@ pub(crate) struct TreemapRect {
     pub is_files: bool,
     pub is_file: bool,
     pub mtime: i64,
+    pub color_dark: String,
+    pub color_border: String,
+    pub color_background: Option<String>,
+    pub color_header: Option<String>,
+}
+
+impl RenderRect {
+    pub(crate) fn from_wire(rect: LayoutRect) -> Self {
+        Self {
+            id: rect.id,
+            parent_id: rect.parent_id,
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+            color_dark: hsl_impl(rect.hue, 62, 38),
+            color_border: hsl_impl(rect.hue, 60, 28),
+            color_background: rect.is_container.then(|| hsl_impl(rect.hue, 25, 13)),
+            color_header: rect.is_container.then(|| hsl_impl(rect.hue, 35, 20)),
+            name: rect.name,
+            size: rect.size,
+            is_container: rect.is_container,
+            header_height: rect.header_height,
+            is_files: rect.is_files,
+            is_file: rect.is_file,
+            mtime: rect.mtime,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -31,9 +61,9 @@ pub(crate) struct HoverState {
 
 #[derive(Clone, Debug, PartialEq)]
 enum InterpolationStep {
-    Matched { from: TreemapRect, to: TreemapRect },
-    Entering { to: TreemapRect },
-    Exiting { from: TreemapRect },
+    Matched { from: RenderRect, to: RenderRect },
+    Entering { to: RenderRect },
+    Exiting { from: RenderRect },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,77 +71,7 @@ pub(crate) struct InterpolationPlan {
     steps: Vec<InterpolationStep>,
 }
 
-pub(crate) trait RectLike {
-    fn id(&self) -> i64;
-    fn parent_id(&self) -> u64;
-    fn x(&self) -> f64;
-    fn y(&self) -> f64;
-    fn w(&self) -> f64;
-    fn h(&self) -> f64;
-    fn name(&self) -> &str;
-    fn size(&self) -> u64;
-    fn is_container(&self) -> bool;
-    fn header_height(&self) -> f64;
-    fn is_files(&self) -> bool;
-    fn is_file(&self) -> bool;
-    fn mtime(&self) -> i64;
-}
-
-impl RectLike for TreemapRect {
-    fn id(&self) -> i64 {
-        self.id
-    }
-
-    fn parent_id(&self) -> u64 {
-        self.parent_id
-    }
-
-    fn x(&self) -> f64 {
-        self.x
-    }
-
-    fn y(&self) -> f64 {
-        self.y
-    }
-
-    fn w(&self) -> f64 {
-        self.w
-    }
-
-    fn h(&self) -> f64 {
-        self.h
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn size(&self) -> u64 {
-        self.size
-    }
-
-    fn is_container(&self) -> bool {
-        self.is_container
-    }
-
-    fn header_height(&self) -> f64 {
-        self.header_height
-    }
-
-    fn is_files(&self) -> bool {
-        self.is_files
-    }
-
-    fn is_file(&self) -> bool {
-        self.is_file
-    }
-
-    fn mtime(&self) -> i64 {
-        self.mtime
-    }
-}
-
-pub(crate) fn find_rect_index<R: RectLike>(rects: &[R], mouse_x: f64, mouse_y: f64) -> Option<usize> {
+pub(crate) fn find_rect_index(rects: &[RenderRect], mouse_x: f64, mouse_y: f64) -> Option<usize> {
     rects
         .iter()
         .enumerate()
@@ -119,21 +79,21 @@ pub(crate) fn find_rect_index<R: RectLike>(rects: &[R], mouse_x: f64, mouse_y: f
         .find_map(|(index, rect)| hit_test(rect, mouse_x, mouse_y).then_some(index))
 }
 
-pub(crate) fn find_navigable_target_index<R: RectLike>(rects: &[R], mouse_x: f64, mouse_y: f64) -> Option<usize> {
+pub(crate) fn find_navigable_target_index(rects: &[RenderRect], mouse_x: f64, mouse_y: f64) -> Option<usize> {
     let mut target = None;
     for (index, rect) in rects.iter().enumerate() {
-        if hit_test(rect, mouse_x, mouse_y) && !rect.is_files() && !rect.is_file() && rect.id() > 0 {
+        if hit_test(rect, mouse_x, mouse_y) && !rect.is_files && !rect.is_file && rect.id > 0 {
             target = Some(index);
         }
     }
     target
 }
 
-pub(crate) fn build_rect_index<R: RectLike>(rects: &[R]) -> HashMap<u64, usize> {
+pub(crate) fn build_rect_index(rects: &[RenderRect]) -> HashMap<u64, usize> {
     let mut id_to_index = HashMap::with_capacity(rects.len());
     for (index, rect) in rects.iter().enumerate() {
-        if rect.id() > 0 {
-            id_to_index.insert(rect.id() as u64, index);
+        if rect.id > 0 {
+            id_to_index.insert(rect.id as u64, index);
         }
     }
     id_to_index
@@ -152,8 +112,8 @@ pub(crate) fn build_breadcrumb_parts(breadcrumb: &[BreadcrumbEntry]) -> Vec<Stri
         .collect()
 }
 
-pub(crate) fn build_hover_state<R: RectLike>(
-    rects: &[R],
+pub(crate) fn build_hover_state(
+    rects: &[RenderRect],
     id_to_index: &HashMap<u64, usize>,
     breadcrumb_parts: &[String],
     mouse_x: f64,
@@ -161,125 +121,99 @@ pub(crate) fn build_hover_state<R: RectLike>(
 ) -> Option<HoverState> {
     let hovered_index = find_rect_index(rects, mouse_x, mouse_y)?;
     let hovered_rect = &rects[hovered_index];
-    let mut current_parent = hovered_rect.parent_id();
+    let mut current_parent = hovered_rect.parent_id;
     let mut hovered_ancestor_indices = Vec::new();
     while let Some(index) = id_to_index.get(&current_parent).copied() {
         let rect = &rects[index];
-        if rect.is_container() {
+        if rect.is_container {
             hovered_ancestor_indices.push(index);
         }
-        current_parent = rect.parent_id();
+        current_parent = rect.parent_id;
     }
 
     let mut parts = Vec::with_capacity(breadcrumb_parts.len() + hovered_ancestor_indices.len() + 1);
     parts.extend(breadcrumb_parts.iter().cloned());
     for index in hovered_ancestor_indices.iter().rev() {
-        parts.push(rects[*index].name().to_owned());
+        parts.push(rects[*index].name.clone());
     }
-    parts.push(hovered_rect.name().to_owned());
+    parts.push(hovered_rect.name.clone());
 
     Some(HoverState {
         hovered_index: Some(hovered_index),
         hovered_ancestor_indices,
         path_text: collapse_slashes(parts.join("/")),
-        size: hovered_rect.size(),
+        size: hovered_rect.size,
     })
 }
 
 impl InterpolationPlan {
-    pub(crate) fn new<R: RectLike>(from: &[R], to: &[R]) -> Self {
+    pub(crate) fn new(from: &[RenderRect], to: &[RenderRect]) -> Self {
         let mut from_by_id = HashMap::with_capacity(from.len());
         for rect in from {
-            from_by_id.insert(rect.id(), rect);
+            from_by_id.insert(rect.id, rect);
         }
         let mut seen = HashSet::with_capacity(to.len());
         let mut steps = Vec::with_capacity(to.len() + from.len());
 
         for to_rect in to {
-            seen.insert(to_rect.id());
-            if let Some(from_rect) = from_by_id.get(&to_rect.id()) {
+            seen.insert(to_rect.id);
+            if let Some(from_rect) = from_by_id.get(&to_rect.id) {
                 steps.push(InterpolationStep::Matched {
-                    from: clone_rect(*from_rect),
-                    to: clone_rect(to_rect),
+                    from: (*from_rect).clone(),
+                    to: to_rect.clone(),
                 });
             } else {
-                steps.push(InterpolationStep::Entering {
-                    to: clone_rect(to_rect),
-                });
+                steps.push(InterpolationStep::Entering { to: to_rect.clone() });
             }
         }
 
         for from_rect in from {
-            if seen.contains(&from_rect.id()) {
+            if seen.contains(&from_rect.id) {
                 continue;
             }
             steps.push(InterpolationStep::Exiting {
-                from: clone_rect(from_rect),
+                from: from_rect.clone(),
             });
         }
 
         Self { steps }
     }
 
-    pub(crate) fn interpolate(&self, progress: f64) -> Vec<TreemapRect> {
+    pub(crate) fn interpolate(&self, progress: f64) -> Vec<RenderRect> {
         let clamped_progress = progress.clamp(0.0, 1.0);
         let inverse = 1.0 - clamped_progress;
         let mut result = Vec::with_capacity(self.steps.len());
 
         for step in &self.steps {
-            match step {
+            // Each arm keeps the colours/name/flags of the rect it is animating toward (or, for
+            // exits, the one it is leaving) and only the geometry is interpolated.
+            let rect = match step {
                 InterpolationStep::Matched { from, to } => {
-                    result.push(TreemapRect {
-                        id: to.id,
-                        parent_id: to.parent_id,
-                        x: from.x + (to.x - from.x) * clamped_progress,
-                        y: from.y + (to.y - from.y) * clamped_progress,
-                        w: from.w + (to.w - from.w) * clamped_progress,
-                        h: from.h + (to.h - from.h) * clamped_progress,
-                        name: to.name.clone(),
-                        size: to.size,
-                        is_container: to.is_container,
-                        header_height: to.header_height,
-                        is_files: to.is_files,
-                        is_file: to.is_file,
-                        mtime: to.mtime,
-                    });
+                    let mut rect = to.clone();
+                    rect.x = from.x + (to.x - from.x) * clamped_progress;
+                    rect.y = from.y + (to.y - from.y) * clamped_progress;
+                    rect.w = from.w + (to.w - from.w) * clamped_progress;
+                    rect.h = from.h + (to.h - from.h) * clamped_progress;
+                    rect
                 }
                 InterpolationStep::Entering { to } => {
-                    result.push(TreemapRect {
-                        id: to.id,
-                        parent_id: to.parent_id,
-                        x: to.x + to.w * 0.5 * inverse,
-                        y: to.y + to.h * 0.5 * inverse,
-                        w: to.w * clamped_progress,
-                        h: to.h * clamped_progress,
-                        name: to.name.clone(),
-                        size: to.size,
-                        is_container: to.is_container,
-                        header_height: to.header_height,
-                        is_files: to.is_files,
-                        is_file: to.is_file,
-                        mtime: to.mtime,
-                    });
+                    let mut rect = to.clone();
+                    rect.x = to.x + to.w * 0.5 * inverse;
+                    rect.y = to.y + to.h * 0.5 * inverse;
+                    rect.w = to.w * clamped_progress;
+                    rect.h = to.h * clamped_progress;
+                    rect
                 }
                 InterpolationStep::Exiting { from } => {
-                    result.push(TreemapRect {
-                        id: from.id,
-                        parent_id: from.parent_id,
-                        x: from.x + from.w * 0.5 * clamped_progress,
-                        y: from.y + from.h * 0.5 * clamped_progress,
-                        w: from.w * inverse,
-                        h: from.h * inverse,
-                        name: from.name.clone(),
-                        size: from.size,
-                        is_container: from.is_container,
-                        header_height: from.header_height,
-                        is_files: from.is_files,
-                        is_file: from.is_file,
-                        mtime: from.mtime,
-                    });
+                    let mut rect = from.clone();
+                    rect.x = from.x + from.w * 0.5 * clamped_progress;
+                    rect.y = from.y + from.h * 0.5 * clamped_progress;
+                    rect.w = from.w * inverse;
+                    rect.h = from.h * inverse;
+                    rect
                 }
-            }
+            };
+            result.push(rect);
         }
 
         result
@@ -287,38 +221,20 @@ impl InterpolationPlan {
 }
 
 #[cfg(test)]
-fn interpolate_rects<R: RectLike>(from: &[R], to: &[R], progress: f64) -> Vec<TreemapRect> {
+fn interpolate_rects(from: &[RenderRect], to: &[RenderRect], progress: f64) -> Vec<RenderRect> {
     InterpolationPlan::new(from, to).interpolate(progress)
 }
 
-fn hit_test<R: RectLike>(rect: &R, mouse_x: f64, mouse_y: f64) -> bool {
-    hit_test_impl(rect.x(), rect.y(), rect.w(), rect.h(), mouse_x, mouse_y)
-}
-
-fn clone_rect<R: RectLike>(rect: &R) -> TreemapRect {
-    TreemapRect {
-        id: rect.id(),
-        parent_id: rect.parent_id(),
-        x: rect.x(),
-        y: rect.y(),
-        w: rect.w(),
-        h: rect.h(),
-        name: rect.name().to_owned(),
-        size: rect.size(),
-        is_container: rect.is_container(),
-        header_height: rect.header_height(),
-        is_files: rect.is_files(),
-        is_file: rect.is_file(),
-        mtime: rect.mtime(),
-    }
+fn hit_test(rect: &RenderRect, mouse_x: f64, mouse_y: f64) -> bool {
+    hit_test_impl(rect.x, rect.y, rect.w, rect.h, mouse_x, mouse_y)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn rect(id: i64, parent_id: u64, x: f64, y: f64, w: f64, h: f64, name: &str) -> TreemapRect {
-        TreemapRect {
+    fn rect(id: i64, parent_id: u64, x: f64, y: f64, w: f64, h: f64, name: &str) -> RenderRect {
+        RenderRect {
             id,
             parent_id,
             x,
@@ -332,7 +248,42 @@ mod tests {
             is_files: false,
             is_file: false,
             mtime: 0,
+            color_dark: String::new(),
+            color_border: String::new(),
+            color_background: None,
+            color_header: None,
         }
+    }
+
+    fn wire_rect(is_container: bool) -> LayoutRect {
+        LayoutRect {
+            id: 1,
+            parent_id: 0,
+            x: 0.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+            name: "x".into(),
+            hue: 120,
+            size: 1,
+            depth: 0,
+            is_container,
+            header_height: 0.0,
+            is_files: false,
+            is_file: !is_container,
+            mtime: 0,
+        }
+    }
+
+    #[test]
+    fn from_wire_colours_only_containers() {
+        let container = RenderRect::from_wire(wire_rect(true));
+        assert!(container.color_background.is_some());
+        assert!(container.color_header.is_some());
+
+        let file = RenderRect::from_wire(wire_rect(false));
+        assert!(file.color_background.is_none());
+        assert!(file.color_header.is_none());
     }
 
     #[test]
@@ -359,21 +310,11 @@ mod tests {
     fn build_hover_state_includes_breadcrumb_and_ancestors() {
         let root = rect(1, 0, 0.0, 0.0, 100.0, 100.0, "src");
         let child = rect(2, 1, 10.0, 10.0, 40.0, 40.0, "nested");
-        let leaf = TreemapRect {
-            id: 3,
-            parent_id: 2,
-            x: 15.0,
-            y: 15.0,
-            w: 10.0,
-            h: 10.0,
-            name: "main.rs".into(),
-            size: 42,
-            is_container: false,
-            header_height: 0.0,
-            is_files: false,
-            is_file: true,
-            mtime: 0,
-        };
+        let mut leaf = rect(3, 2, 15.0, 15.0, 10.0, 10.0, "main.rs");
+        leaf.size = 42;
+        leaf.is_container = false;
+        leaf.is_file = true;
+        leaf.header_height = 0.0;
         let breadcrumb = vec![BreadcrumbEntry {
             id: 0,
             name: "/tmp".into(),

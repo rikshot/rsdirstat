@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::color::{COLOR_MODE_AGE, age_hue, hash_id_to_hue};
 pub use crate::tree::{BreadcrumbEntry, DirTree, FilterConfig};
+pub use rsdirstat_protocol::LayoutRect;
 
 const NEST_HEADER: f64 = 18.0;
 const MIN_NEST_PX: f64 = 40.0;
@@ -21,24 +22,6 @@ pub struct LayoutConfig {
     pub color_mode: u8,
     pub filter: FilterConfig,
     pub mtime_range: (i64, i64),
-}
-
-pub struct LayoutRect {
-    pub id: i64,
-    pub parent_id: u64,
-    pub x: f64,
-    pub y: f64,
-    pub w: f64,
-    pub h: f64,
-    pub name: String,
-    pub hue: u16,
-    pub size: u64,
-    pub depth: u8,
-    pub is_container: bool,
-    pub header_height: f64,
-    pub is_files: bool,
-    pub is_file: bool,
-    pub mtime: i64,
 }
 
 pub fn compute_layout(

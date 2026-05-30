@@ -11,7 +11,7 @@ use std::collections::HashMap;
 #[cfg(target_arch = "wasm32")]
 use js_sys::{Array, Object, Reflect};
 #[cfg(any(target_arch = "wasm32", test))]
-use rsdirstat_protocol::{self as wire, BreadcrumbEntry, ClientMessage, LayoutRect, ServerMessage};
+use rsdirstat_protocol::{BreadcrumbEntry, ClientMessage, LayoutPayload, LayoutRect, ServerMessage};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
@@ -99,14 +99,14 @@ pub fn run_browser_tests_js() -> Result<JsValue, JsValue> {
     record(
         "viewport roundtrip",
         matches!(
-            ClientMessage::decode(&wire::encode_viewport(800.0, 600.0)),
+            ClientMessage::decode(&ClientMessage::Viewport { width: 800.0, height: 600.0 }.encode()),
             Some(ClientMessage::Viewport { width, height }) if width == 800.0 && height == 600.0
         ),
     );
     record(
         "navigate roundtrip",
         matches!(
-            ClientMessage::decode(&wire::encode_navigate(42)),
+            ClientMessage::decode(&ClientMessage::Navigate { id: 42 }.encode()),
             Some(ClientMessage::Navigate { id }) if id == 42
         ),
     );
@@ -132,8 +132,15 @@ pub fn run_browser_tests_js() -> Result<JsValue, JsValue> {
         is_file: false,
         mtime: 1_700_000_000,
     }];
+    let layout = ServerMessage::Layout(LayoutPayload {
+        root_size: 10_000,
+        dir_count: 3,
+        scan_done: true,
+        breadcrumb: breadcrumb.clone(),
+        rects: rects.clone(),
+    });
     let layout_ok = matches!(
-        wire::decode_server_message(&wire::encode_layout(10_000, 3, true, &breadcrumb, &rects)),
+        ServerMessage::decode(&layout.encode()),
         Some(ServerMessage::Layout(decoded))
             if decoded.root_size == 10_000
                 && decoded.dir_count == 3
@@ -160,11 +167,6 @@ pub fn start() -> Result<(), JsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn protocol_smoke_message_has_viewport_tag() {
-        assert_eq!(wire::encode_viewport(1280.0, 720.0)[0], 1);
-    }
 
     #[test]
     fn format_size_matches_existing_js_behavior() {
@@ -197,7 +199,7 @@ mod tests {
     #[test]
     fn viewport_message_roundtrip() {
         assert!(matches!(
-            ClientMessage::decode(&wire::encode_viewport(800.0, 600.0)),
+            ClientMessage::decode(&ClientMessage::Viewport { width: 800.0, height: 600.0 }.encode()),
             Some(ClientMessage::Viewport { width, height }) if width == 800.0 && height == 600.0
         ));
     }
@@ -205,7 +207,7 @@ mod tests {
     #[test]
     fn navigate_message_roundtrip() {
         assert!(matches!(
-            ClientMessage::decode(&wire::encode_navigate(42)),
+            ClientMessage::decode(&ClientMessage::Navigate { id: 42 }.encode()),
             Some(ClientMessage::Navigate { id }) if id == 42
         ));
     }
@@ -233,9 +235,16 @@ mod tests {
             is_file: false,
             mtime: 1_700_000_000,
         }];
+        let layout = ServerMessage::Layout(LayoutPayload {
+            root_size: 10_000,
+            dir_count: 3,
+            scan_done: true,
+            breadcrumb: breadcrumb.clone(),
+            rects: rects.clone(),
+        });
 
         assert!(matches!(
-            wire::decode_server_message(&wire::encode_layout(10_000, 3, true, &breadcrumb, &rects)),
+            ServerMessage::decode(&layout.encode()),
             Some(ServerMessage::Layout(decoded))
                 if decoded.root_size == 10_000
                     && decoded.dir_count == 3

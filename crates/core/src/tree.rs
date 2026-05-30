@@ -65,11 +65,7 @@ impl FilterConfig {
     }
 }
 
-#[derive(Clone)]
-pub struct BreadcrumbEntry {
-    pub id: u64,
-    pub name: String,
-}
+pub use rsdirstat_protocol::BreadcrumbEntry;
 
 pub struct DirTree {
     pub nodes: HashMap<u64, DirNode>,

@@ -15,10 +15,13 @@ impl TreemapApp {
         if self.surface.canvas_width <= 0.0 {
             return Ok(());
         }
-        self.send_message(wire::encode_viewport(
-            self.surface.canvas_width as f32,
-            self.surface.canvas_height as f32,
-        ))
+        self.send_message(
+            wire::ClientMessage::Viewport {
+                width: self.surface.canvas_width as f32,
+                height: self.surface.canvas_height as f32,
+            }
+            .encode(),
+        )
     }
 
     pub(super) fn start_scan_timer(&mut self) -> Result<(), JsValue> {
@@ -146,7 +149,7 @@ impl TreemapApp {
             return Ok(());
         };
         let bytes = Uint8Array::new(&buffer).to_vec();
-        match wire::decode_server_message(&bytes) {
+        match wire::ServerMessage::decode(&bytes) {
             Some(ServerMessage::PickerMode) => {
                 self.show_picker()?;
             }
