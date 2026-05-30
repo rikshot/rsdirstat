@@ -3,24 +3,50 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::Once;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Build the trunk frontend bundle once per test run. The server serves it at runtime from
+/// Ensure the trunk frontend bundle exists; the server serves it at runtime from
 /// `crates/wasm/dist`, so the e2e/visual tests need it present. This is test-only orchestration
 /// (it never runs during a normal `cargo build`), so it does not reintroduce a build script.
+///
+/// nextest runs every test in its own process, so a `std::sync::Once` cannot serialize this —
+/// dozens of test processes would launch `trunk build` concurrently and race on trunk's shared
+/// wasm-bindgen download. So: skip if the bundle is already built (CI builds it once up front), and
+/// otherwise take a cross-process lock (atomic `create_dir`) so only one process builds at a time.
 fn ensure_frontend_built() {
-    static BUILT: Once = Once::new();
-    BUILT.call_once(|| {
-        // Trunk.toml lives at the workspace root (two levels up from this crate).
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let status = Command::new("trunk")
-            .arg("build")
-            .current_dir(&root)
-            .status()
-            .expect("failed to run `trunk build` — is trunk installed? (cargo install trunk)");
-        assert!(status.success(), "trunk build failed with status {status}");
-    });
+    // Trunk.toml lives at the workspace root (two levels up from this crate).
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let bundle = root.join("crates/wasm/dist/rsdirstat-wasm.js");
+    if bundle.exists() {
+        return;
+    }
+    let lock = root.join("target/.trunk-build.lock");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        if bundle.exists() {
+            return;
+        }
+        match std::fs::create_dir(&lock) {
+            Ok(()) => {
+                let status = Command::new("trunk")
+                    .arg("build")
+                    .current_dir(&root)
+                    .status()
+                    .expect("failed to run `trunk build` — is trunk installed? (cargo install trunk)");
+                // Release the lock before asserting so a failed build doesn't strand other waiters.
+                let _ = std::fs::remove_dir(&lock);
+                assert!(status.success(), "trunk build failed with status {status}");
+                return;
+            }
+            Err(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for another process to run `trunk build`"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
 }
 
 pub struct TestServer {
