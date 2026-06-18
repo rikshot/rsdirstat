@@ -18,10 +18,10 @@ mimalloc = "0.1"
 open = "5"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "parking_lot"] }
-tower-http = { version = "0.6", features = ["fs", "compression-br", "compression-gzip", "compression-zstd"] }
+tower-http = { version = "0.7", features = ["fs", "compression-br", "compression-gzip", "compression-zstd"] }
 
 [dev-dependencies]
-playwright-rs = "0.9"
+playwright-rs = { version = "0.13", features = ["screenshot-diff"] }
 tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]

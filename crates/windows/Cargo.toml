@@ -8,5 +8,5 @@ license.workspace = true
 rsdirstat-core.workspace = true
 rsdirstat-protocol.workspace = true
 anyhow.workspace = true
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security"] }
 dashmap.workspace = true
