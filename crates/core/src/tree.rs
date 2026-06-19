@@ -207,31 +207,15 @@ impl DirTree {
         order
     }
 
-    pub fn recompute_sizes(&mut self) {
-        self.recursive_sizes.clear();
-        let order = self.bottom_up_order();
-        for &id in order.iter().rev() {
-            if let Some(node) = self.nodes.get(&id) {
-                let mut total = node.direct_size;
-                for &child in &node.children {
-                    total = total.saturating_add(self.recursive_sizes.get(&child).copied().unwrap_or(0));
-                }
-                self.recursive_sizes.insert(id, total);
-            }
-        }
-    }
-
-    pub fn compute_filtered_sizes(&self, filter: &FilterConfig) -> HashMap<u64, u64> {
+    /// Bottom-up fold: each node's size is `own_size(node)` plus the already-folded sizes of its
+    /// children. Shared by the recursive-size and filtered-size passes (they differ only in the
+    /// per-node "own" term).
+    fn fold_sizes(&self, own_size: impl Fn(&DirNode) -> u64) -> HashMap<u64, u64> {
         let order = self.bottom_up_order();
         let mut sizes = HashMap::with_capacity(order.len());
         for &id in order.iter().rev() {
             if let Some(node) = self.nodes.get(&id) {
-                let mut total: u64 = 0;
-                for file in &node.files {
-                    if filter.matches_file(&file.name, file.size) {
-                        total = total.saturating_add(file.size);
-                    }
-                }
+                let mut total = own_size(node);
                 for &child in &node.children {
                     total = total.saturating_add(sizes.get(&child).copied().unwrap_or(0));
                 }
@@ -239,6 +223,19 @@ impl DirTree {
             }
         }
         sizes
+    }
+
+    pub fn recompute_sizes(&mut self) {
+        self.recursive_sizes = self.fold_sizes(|node| node.direct_size);
+    }
+
+    pub fn compute_filtered_sizes(&self, filter: &FilterConfig) -> HashMap<u64, u64> {
+        self.fold_sizes(|node| {
+            node.files
+                .iter()
+                .filter(|file| filter.matches_file(&file.name, file.size))
+                .fold(0u64, |acc, file| acc.saturating_add(file.size))
+        })
     }
 
     pub fn breadcrumb(&self, view_root: u64) -> Vec<BreadcrumbEntry> {

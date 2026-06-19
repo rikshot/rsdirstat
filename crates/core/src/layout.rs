@@ -180,6 +180,8 @@ fn layout_node(
 
     let (min_time, max_time) = config.mtime_range;
 
+    // The zip below relies on squarify emitting exactly one rect per item, in input order.
+    debug_assert_eq!(rects.len(), layout_items.len(), "squarify must emit one rect per item");
     for (raw, item) in rects.iter().zip(layout_items.iter()) {
         match &item.kind {
             ItemKind::Dir { child_id } => {

@@ -118,8 +118,7 @@ pub fn scan_cancellable(
     let active_dirs: Arc<Vec<Mutex<String>>> = Arc::new((0..num_threads).map(|_| Mutex::new(String::new())).collect());
 
     let _handles: Vec<_> = (0..num_threads)
-        .enumerate()
-        .map(|(tid, _)| {
+        .map(|tid| {
             let work = Arc::clone(&work);
             let tx = tx.clone();
             let visited = Arc::clone(&visited);

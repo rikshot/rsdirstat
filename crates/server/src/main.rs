@@ -321,17 +321,20 @@ fn start_scan(state: &Arc<AppState>) {
 
     let relay_state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
+        // Reused across iterations so the per-batch drain doesn't reallocate each wakeup.
+        let mut events = Vec::new();
         while let Ok(event) = rx.recv() {
             if relay_state.scan.generation.load(Ordering::Relaxed) != generation {
                 break;
             }
-            let mut events = vec![event];
+            events.clear();
+            events.push(event);
             while let Ok(extra) = rx.try_recv() {
                 events.push(extra);
             }
 
             let mut tree = relay_state.scan.tree.write();
-            for event in events {
+            for event in events.drain(..) {
                 match event {
                     ScanEvent::ScanStart { path } => {
                         tree.clear();

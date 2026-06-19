@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use dashmap::DashSet;
 use rsdirstat_core::scan::{WorkQueue, node_id};
 use rsdirstat_protocol::ScanEvent;
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -144,8 +144,7 @@ pub fn scan_cancellable(
     let root_volume_serial = root_info.volume_serial;
 
     let _handles: Vec<_> = (0..num_threads)
-        .enumerate()
-        .map(|(tid, _)| {
+        .map(|tid| {
             let work = Arc::clone(&work);
             let tx = tx.clone();
             let visited = Arc::clone(&visited);
@@ -222,6 +221,12 @@ fn scan_directory(
         };
 
         if ok == 0 {
+            // ERROR_NO_MORE_FILES is the normal end-of-directory; anything else is a real failure
+            // we shouldn't silently treat as completion (parity with the macOS/Linux scanners).
+            let err = unsafe { GetLastError() };
+            if err != ERROR_NO_MORE_FILES {
+                eprintln!("GetFileInformationByHandleEx failed for {dir_name}: error {err}");
+            }
             break;
         }
 

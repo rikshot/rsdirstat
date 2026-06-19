@@ -178,8 +178,7 @@ pub fn scan_cancellable(
     let root_mnt_id = root_info.mnt_id;
 
     let _handles: Vec<_> = (0..num_threads)
-        .enumerate()
-        .map(|(tid, _)| {
+        .map(|tid| {
             let work = Arc::clone(&work);
             let tx = tx.clone();
             let visited = Arc::clone(&visited);
@@ -258,7 +257,11 @@ fn scan_directory(
             )
         };
 
-        if nread <= 0 {
+        if nread < 0 {
+            eprintln!("getdents64 failed for {dir_name}: {}", std::io::Error::last_os_error());
+            break;
+        }
+        if nread == 0 {
             break;
         }
 
