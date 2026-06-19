@@ -96,7 +96,11 @@ fn open_root(root: &Path) -> Result<RootInfo> {
         volume_serial,
         name,
         handle,
-        path: display_path.to_string(),
+        // Keep the extended-length (\\?\) prefix on the path used to open child directories:
+        // children are opened by reconstructed path (format!("{dir}\\{name}")), and without the
+        // prefix CreateFileW fails for paths over MAX_PATH (260), silently dropping deep subtrees.
+        // The prefix is stripped only for the stall diagnostic display.
+        path: path_str,
     })
 }
 
@@ -180,7 +184,7 @@ pub fn scan_cancellable(
         for dir in active_dirs.iter() {
             let name = dir.lock().unwrap();
             if !name.is_empty() {
-                eprintln!("  {name}");
+                eprintln!("  {}", strip_extended_prefix(&name));
             }
         }
     });
