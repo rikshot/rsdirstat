@@ -214,3 +214,22 @@ fn scanner_unicode_filenames() {
         "missing unicode file in {file_names:?}"
     );
 }
+
+// Hardlink dedup is implemented on Unix (cheap via statx/getattrlistbulk link counts); the Windows
+// scanner does not dedup (link count would require a per-file open), so this is Unix-only.
+#[cfg(unix)]
+#[test]
+fn scanner_dedups_hardlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("original.bin"), vec![0u8; 10_240]).unwrap();
+    fs::hard_link(root.join("original.bin"), root.join("hardlink.bin")).unwrap();
+
+    let (tree, _) = scan_to_tree(root);
+    let root_id = tree.root_id.unwrap();
+    let root_size = tree.recursive_sizes[&root_id];
+    assert_eq!(
+        root_size, 10_240,
+        "hardlinked file should be counted once, got root size {root_size}"
+    );
+}

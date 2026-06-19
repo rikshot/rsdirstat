@@ -3,12 +3,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result};
 use dashmap::DashSet;
-use rsdirstat_core::scan::{WorkQueue, raise_fd_limit};
+use rsdirstat_core::scan::{WorkQueue, node_id, raise_fd_limit};
 use rsdirstat_protocol::ScanEvent;
 
 const VREG: u32 = 1;
@@ -29,8 +30,9 @@ static SCAN_ATTRS: libc::attrlist = libc::attrlist {
     dirattr: 0,
     // DATALENGTH (logical data-fork length), not TOTALSIZE: the latter adds resource-fork bytes,
     // which Linux (stx_size) and Windows (EndOfFile) don't count, so the same tree would total
-    // differently per platform. DATALENGTH matches their apparent-size semantics.
-    fileattr: libc::ATTR_FILE_DATALENGTH,
+    // differently per platform. DATALENGTH matches their apparent-size semantics. LINKCOUNT lets us
+    // skip hardlinks already counted under another name.
+    fileattr: libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_DATALENGTH,
     forkattr: 0,
 };
 
@@ -76,6 +78,17 @@ fn open_root(root: &Path) -> Result<RootInfo> {
 }
 
 pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
+    scan_cancellable(root, cross_filesystems, tx, Arc::new(AtomicBool::new(false)))
+}
+
+/// Scan, aborting promptly if `cancel` is set. The server trips this when a scan is superseded by a
+/// rescan or a new `ScanPath` so the old worker threads stop walking the filesystem.
+pub fn scan_cancellable(
+    root: &Path,
+    cross_filesystems: bool,
+    tx: std::sync::mpsc::Sender<ScanEvent>,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
     let root_info = open_root(root)?;
 
     let _ = tx.send(ScanEvent::ScanStart {
@@ -84,16 +97,19 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
 
     let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
+    let root_id = node_id(root_info.dev, root_info.ino);
     let visited = {
         let set = DashSet::new();
-        set.insert(root_info.ino);
+        set.insert(root_id);
         Arc::new(set)
     };
+    // Hardlinked files (nlink > 1) are deduped across the whole scan by their (dev, ino) identity.
+    let visited_files: Arc<DashSet<u64>> = Arc::new(DashSet::new());
 
     let work = Arc::new(WorkQueue::new());
     work.push(vec![WorkItem {
         fd: root_info.fd,
-        file_id: root_info.ino,
+        file_id: root_id,
         parent_id: 0,
         name: root_info.name.clone(),
         path: root_info.path.display().to_string(),
@@ -107,12 +123,18 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
             let work = Arc::clone(&work);
             let tx = tx.clone();
             let visited = Arc::clone(&visited);
+            let visited_files = Arc::clone(&visited_files);
             let root_dev_i32 = root_info.dev as i32;
             let active = Arc::clone(&active_dirs);
+            let cancel = Arc::clone(&cancel);
             thread::spawn(move || {
                 let mut buffer = vec![0u8; BUF_SIZE];
 
                 while let Some(item) = work.take() {
+                    if cancel.load(Ordering::Relaxed) {
+                        work.cancel(); // unwind every worker: clears the queue and wakes blocked takers
+                        break;
+                    }
                     *active[tid].lock().unwrap() = item.path.clone();
                     scan_directory(
                         item.fd,
@@ -125,6 +147,7 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
                         &work,
                         &tx,
                         &visited,
+                        &visited_files,
                         &item.path,
                     );
                     work.finish_one();
@@ -159,6 +182,7 @@ fn scan_directory(
     work: &WorkQueue<WorkItem>,
     tx: &std::sync::mpsc::Sender<ScanEvent>,
     visited: &DashSet<u64>,
+    visited_files: &DashSet<u64>,
     dir_path: &str,
 ) {
     let mut new_work = Vec::new();
@@ -216,10 +240,11 @@ fn scan_directory(
                             };
                             if raw_fd >= 0 {
                                 let child_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-                                if visited.insert(parsed.file_id) {
+                                let child_id = node_id(parsed.dev_id as u32 as u64, parsed.file_id);
+                                if visited.insert(child_id) {
                                     new_work.push(WorkItem {
                                         fd: child_fd,
-                                        file_id: parsed.file_id,
+                                        file_id: child_id,
                                         parent_id: dir_file_id,
                                         name: parsed.name.to_string(),
                                         path: if dir_path.is_empty() {
@@ -233,15 +258,20 @@ fn scan_directory(
                         }
                     }
                     VREG => {
-                        dir_total += parsed.file_size;
-                        dir_mtime = dir_mtime.max(parsed.mtime);
-                        if parsed.file_size > 0 {
-                            let _ = tx.send(ScanEvent::File {
-                                parent: dir_file_id,
-                                name: parsed.name.to_string(),
-                                size: parsed.file_size,
-                                mtime: parsed.mtime,
-                            });
+                        // Skip hardlinks already counted under another name (matches `du`).
+                        let counted = parsed.nlink <= 1
+                            || visited_files.insert(node_id(parsed.dev_id as u32 as u64, parsed.file_id));
+                        if counted {
+                            dir_total += parsed.file_size;
+                            dir_mtime = dir_mtime.max(parsed.mtime);
+                            if parsed.file_size > 0 {
+                                let _ = tx.send(ScanEvent::File {
+                                    parent: dir_file_id,
+                                    name: parsed.name.to_string(),
+                                    size: parsed.file_size,
+                                    mtime: parsed.mtime,
+                                });
+                            }
                         }
                     }
                     _ => {}
@@ -271,6 +301,7 @@ struct ParsedEntry<'a> {
     obj_type: u32,
     file_id: u64,
     file_size: u64,
+    nlink: u32,
     mtime: i64,
 }
 
@@ -300,6 +331,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
     let mut file_id = 0u64;
     let mut mtime = 0i64;
     let mut file_size = 0u64;
+    let mut nlink = 0u32;
 
     // Read a fixed-width field only if its bit is set, advancing `pos` past the bytes it occupies.
     macro_rules! field {
@@ -336,7 +368,11 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
     field!(returned_common & libc::ATTR_CMN_FILEID != 0, 8, {
         file_id = u64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
     });
-    // File attributes only appear for files, so this bit is naturally clear for directories.
+    // File attributes only appear for files, so these bits are naturally clear for directories.
+    // LINKCOUNT (bit 0x400) precedes DATALENGTH (bit 0x2000) in ascending-bit order.
+    field!(returned_file & libc::ATTR_FILE_LINKCOUNT != 0, 4, {
+        nlink = u32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
+    });
     field!(returned_file & libc::ATTR_FILE_DATALENGTH != 0, 8, {
         file_size = u64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
     });
@@ -347,6 +383,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
         obj_type,
         file_id,
         file_size,
+        nlink,
         mtime,
     })
 }

@@ -2,6 +2,21 @@ use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
+/// Combine a `(device, inode)` pair into a stable node id. Inodes are only unique within a single
+/// filesystem, so a cross-filesystem scan (`--all`) can see the same inode number on two devices;
+/// mixing the device in keeps node identity distinct across mounts (and stops one directory from
+/// being wrongly skipped or overwriting another). The result is kept in the positive `i64` range —
+/// the layout encodes file rects with negative ids and the frontend keys directories by `id > 0`,
+/// so the sign bit must stay clear — and is never 0 (the parent-of-root sentinel).
+pub fn node_id(dev: u64, ino: u64) -> u64 {
+    // splitmix64 finalizer over the inode combined with a golden-ratio-scaled device.
+    let mut x = ino.wrapping_add(dev.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    (x & 0x7FFF_FFFF_FFFF_FFFF).max(1)
+}
+
 #[cfg(unix)]
 pub fn raise_fd_limit() {
     // The scanner keeps every pending directory fd open at once, so the default soft limit
@@ -311,5 +326,24 @@ mod tests {
             unique_threads >= 2,
             "only {unique_threads} thread(s) participated — work queue lost parallelism"
         );
+    }
+
+    #[test]
+    fn node_id_is_deterministic_positive_and_nonzero() {
+        assert_eq!(node_id(0, 12345), node_id(0, 12345));
+        for ino in [0u64, 1, 2, 999, u64::MAX] {
+            for dev in [0u64, 1, 16777220, u64::MAX] {
+                let id = node_id(dev, ino);
+                assert_ne!(id, 0, "node id must never be the root sentinel 0");
+                assert!((id as i64) > 0, "node id must stay in the positive i64 range");
+            }
+        }
+    }
+
+    #[test]
+    fn node_id_distinguishes_same_inode_across_devices() {
+        // The whole point: the same inode on two different devices must not collide.
+        assert_ne!(node_id(1, 2), node_id(2, 2));
+        assert_ne!(node_id(0x0100_0004, 2), node_id(0x0100_0005, 2));
     }
 }

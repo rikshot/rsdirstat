@@ -75,6 +75,9 @@ struct ScanState {
     /// Bumped each time a scan starts; lets a superseded scan's relay task detect it has been
     /// replaced and stop writing into the shared tree.
     generation: AtomicU64,
+    /// Cancel flag for the in-flight scan's worker threads, replaced on each new scan. The
+    /// generation only stops the relay; this stops the OS-level filesystem walk too.
+    cancel: Mutex<Arc<AtomicBool>>,
     root: Mutex<PathBuf>,
     cross_filesystems: bool,
 }
@@ -139,6 +142,7 @@ async fn run_server(
             done: AtomicBool::new(false),
             started: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             root: Mutex::new(scan_root),
             cross_filesystems,
         },
@@ -303,6 +307,16 @@ fn start_scan(state: &Arc<AppState>) {
     let generation = state.scan.generation.fetch_add(1, Ordering::Relaxed) + 1;
     state.scan.done.store(false, Ordering::Relaxed);
     state.scan.started.store(true, Ordering::Relaxed);
+
+    // Trip the previous scan's cancel flag so its worker threads stop walking the filesystem (the
+    // generation bump only stops the relay), then install a fresh flag for this scan.
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut slot = state.scan.cancel.lock();
+        slot.store(true, Ordering::Relaxed);
+        *slot = Arc::clone(&cancel);
+    }
+
     let (tx, rx) = std::sync::mpsc::channel::<ScanEvent>();
 
     let relay_state = Arc::clone(state);
@@ -360,7 +374,7 @@ fn start_scan(state: &Arc<AppState>) {
     let path = state.scan.root.lock().clone();
     let cross_filesystems = state.scan.cross_filesystems;
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = scanner::scan::scan(&path, cross_filesystems, tx) {
+        if let Err(e) = scanner::scan::scan_cancellable(&path, cross_filesystems, tx, cancel) {
             eprintln!("Scan error: {e}");
         }
     });

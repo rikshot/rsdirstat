@@ -2,12 +2,13 @@ use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result};
 use dashmap::DashSet;
-use rsdirstat_core::scan::{WorkQueue, raise_fd_limit};
+use rsdirstat_core::scan::{WorkQueue, node_id, raise_fd_limit};
 use rsdirstat_protocol::ScanEvent;
 
 const DT_DIR: u8 = 4;
@@ -17,10 +18,17 @@ const BUF_SIZE: usize = 1024 * 1024;
 
 const STATX_TYPE: u32 = 0x0001;
 const STATX_MODE: u32 = 0x0002;
+const STATX_NLINK: u32 = 0x0004;
 const STATX_SIZE: u32 = 0x0200;
 const STATX_MTIME: u32 = 0x0040;
 const STATX_MNT_ID: u32 = 0x1000;
 const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
+
+/// Combine the statx device major/minor into a single value for node identity. This need not match
+/// the kernel's `dev_t` encoding — only be consistent within a scan.
+fn makedev(major: u32, minor: u32) -> u64 {
+    ((major as u64) << 32) | minor as u64
+}
 
 #[repr(C)]
 struct StatxTimestamp {
@@ -98,6 +106,7 @@ struct WorkItem {
 struct RootInfo {
     path: std::path::PathBuf,
     ino: u64,
+    dev: u64,
     mnt_id: u64,
     name: String,
     fd: OwnedFd,
@@ -120,6 +129,7 @@ fn open_root(root: &Path) -> Result<RootInfo> {
     Ok(RootInfo {
         path,
         ino: sx.stx_ino,
+        dev: makedev(sx.stx_dev_major, sx.stx_dev_minor),
         mnt_id: sx.stx_mnt_id,
         name,
         fd,
@@ -127,6 +137,17 @@ fn open_root(root: &Path) -> Result<RootInfo> {
 }
 
 pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
+    scan_cancellable(root, cross_filesystems, tx, Arc::new(AtomicBool::new(false)))
+}
+
+/// Scan, aborting promptly if `cancel` is set. The server trips this when a scan is superseded by a
+/// rescan or a new `ScanPath` so the old worker threads stop walking the filesystem.
+pub fn scan_cancellable(
+    root: &Path,
+    cross_filesystems: bool,
+    tx: std::sync::mpsc::Sender<ScanEvent>,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
     let root_info = open_root(root)?;
 
     let _ = tx.send(ScanEvent::ScanStart {
@@ -135,16 +156,19 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
 
     let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
+    let root_id = node_id(root_info.dev, root_info.ino);
     let visited = {
         let set = DashSet::new();
-        set.insert(root_info.ino);
+        set.insert(root_id);
         Arc::new(set)
     };
+    // Hardlinked files (nlink > 1) are deduped across the whole scan by their (dev, ino) identity.
+    let visited_files: Arc<DashSet<u64>> = Arc::new(DashSet::new());
 
     let work = Arc::new(WorkQueue::new());
     work.push(vec![WorkItem {
         fd: root_info.fd,
-        file_id: root_info.ino,
+        file_id: root_id,
         parent_id: 0,
         name: root_info.name.clone(),
         path: root_info.path.display().to_string(),
@@ -159,11 +183,17 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
             let work = Arc::clone(&work);
             let tx = tx.clone();
             let visited = Arc::clone(&visited);
+            let visited_files = Arc::clone(&visited_files);
             let active = Arc::clone(&active_dirs);
+            let cancel = Arc::clone(&cancel);
             thread::spawn(move || {
                 let mut buffer = vec![0u8; BUF_SIZE];
 
                 while let Some(item) = work.take() {
+                    if cancel.load(Ordering::Relaxed) {
+                        work.cancel(); // unwind every worker: clears the queue and wakes blocked takers
+                        break;
+                    }
                     *active[tid].lock().unwrap() = item.path.clone();
                     scan_directory(
                         item.fd,
@@ -176,6 +206,7 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
                         &work,
                         &tx,
                         &visited,
+                        &visited_files,
                         &item.path,
                     );
                     work.finish_one();
@@ -210,6 +241,7 @@ fn scan_directory(
     work: &WorkQueue<WorkItem>,
     tx: &std::sync::mpsc::Sender<ScanEvent>,
     visited: &DashSet<u64>,
+    visited_files: &DashSet<u64>,
     dir_path: &str,
 ) {
     let mut new_work = Vec::new();
@@ -292,22 +324,26 @@ fn scan_directory(
                     if raw_fd >= 0 {
                         let child_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
+                        // statx the child for its device (node identity) and mount id (the
+                        // filesystem-boundary check). stx_dev is always populated; stx_mnt_id needs
+                        // the mask.
+                        let sx = statx_fd(child_fd.as_raw_fd(), STATX_MNT_ID);
                         if !cross_filesystems {
-                            if let Some(sx) = statx_fd(child_fd.as_raw_fd(), STATX_MNT_ID) {
-                                if sx.stx_mnt_id != root_mnt_id {
+                            match &sx {
+                                Some(s) if s.stx_mnt_id == root_mnt_id => {}
+                                _ => {
                                     offset += d_reclen;
                                     continue;
                                 }
-                            } else {
-                                offset += d_reclen;
-                                continue;
                             }
                         }
 
-                        if visited.insert(d_ino) {
+                        let child_dev = sx.as_ref().map_or(0, |s| makedev(s.stx_dev_major, s.stx_dev_minor));
+                        let child_id = node_id(child_dev, d_ino);
+                        if visited.insert(child_id) {
                             new_work.push(WorkItem {
                                 fd: child_fd,
-                                file_id: d_ino,
+                                file_id: child_id,
                                 parent_id: dir_file_id,
                                 name: name_str.to_string(),
                                 path: if dir_path.is_empty() {
@@ -320,18 +356,25 @@ fn scan_directory(
                     }
                 }
                 DT_REG => {
-                    if let Some(sx) = statx_path(fd.as_raw_fd(), name.as_ptr(), STATX_SIZE | STATX_MTIME) {
-                        let file_size = sx.stx_size;
-                        let mtime = sx.stx_mtime.tv_sec;
-                        dir_total += file_size;
-                        dir_mtime = dir_mtime.max(mtime);
-                        if file_size > 0 {
-                            let _ = tx.send(ScanEvent::File {
-                                parent: dir_file_id,
-                                name: name_str.to_string(),
-                                size: file_size,
-                                mtime,
-                            });
+                    if let Some(sx) = statx_path(fd.as_raw_fd(), name.as_ptr(), STATX_SIZE | STATX_MTIME | STATX_NLINK)
+                    {
+                        // Skip hardlinks already counted under another name (matches `du`). Use the
+                        // entry's inode (d_ino) with the file's device for identity.
+                        let dev = makedev(sx.stx_dev_major, sx.stx_dev_minor);
+                        let counted = sx.stx_nlink <= 1 || visited_files.insert(node_id(dev, d_ino));
+                        if counted {
+                            let file_size = sx.stx_size;
+                            let mtime = sx.stx_mtime.tv_sec;
+                            dir_total += file_size;
+                            dir_mtime = dir_mtime.max(mtime);
+                            if file_size > 0 {
+                                let _ = tx.send(ScanEvent::File {
+                                    parent: dir_file_id,
+                                    name: name_str.to_string(),
+                                    size: file_size,
+                                    mtime,
+                                });
+                            }
                         }
                     }
                 }

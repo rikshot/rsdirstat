@@ -2,12 +2,13 @@ use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result};
 use dashmap::DashSet;
-use rsdirstat_core::scan::WorkQueue;
+use rsdirstat_core::scan::{WorkQueue, node_id};
 use rsdirstat_protocol::ScanEvent;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -100,6 +101,17 @@ fn open_root(root: &Path) -> Result<RootInfo> {
 }
 
 pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
+    scan_cancellable(root, cross_filesystems, tx, Arc::new(AtomicBool::new(false)))
+}
+
+/// Scan, aborting promptly if `cancel` is set. The server trips this when a scan is superseded by a
+/// rescan or a new `ScanPath` so the old worker threads stop walking the filesystem.
+pub fn scan_cancellable(
+    root: &Path,
+    cross_filesystems: bool,
+    tx: std::sync::mpsc::Sender<ScanEvent>,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
     let root_info = open_root(root)?;
 
     let _ = tx.send(ScanEvent::ScanStart {
@@ -108,16 +120,17 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
 
     let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
+    let root_id = node_id(root_info.volume_serial as u64, root_info.file_id);
     let visited = {
         let set = DashSet::new();
-        set.insert(root_info.file_id);
+        set.insert(root_id);
         Arc::new(set)
     };
 
     let work = Arc::new(WorkQueue::new());
     work.push(vec![WorkItem {
         handle: root_info.handle,
-        file_id: root_info.file_id,
+        file_id: root_id,
         parent_id: 0,
         name: root_info.name.clone(),
         path: root_info.path,
@@ -133,10 +146,15 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
             let tx = tx.clone();
             let visited = Arc::clone(&visited);
             let active = Arc::clone(&active_dirs);
+            let cancel = Arc::clone(&cancel);
             thread::spawn(move || {
                 let mut buffer = vec![0u8; BUF_SIZE];
 
                 while let Some(item) = work.take() {
+                    if cancel.load(Ordering::Relaxed) {
+                        work.cancel(); // unwind every worker: clears the queue and wakes blocked takers
+                        break;
+                    }
                     *active[tid].lock().unwrap() = item.path.clone();
                     scan_directory(
                         item.handle,
@@ -234,35 +252,29 @@ fn scan_directory(
                 if is_dir && !is_reparse {
                     let child_path = format!("{}\\{}", dir_path, name);
                     if let Some(child_handle) = open_dir(&wide_str(&child_path)) {
-                        if !cross_filesystems {
-                            if let Some((vol, _)) = get_volume_and_id(&child_handle) {
-                                if vol != root_volume_serial {
-                                    if info.NextEntryOffset == 0 {
-                                        break;
-                                    }
-                                    offset += info.NextEntryOffset as usize;
-                                    continue;
-                                }
-                            } else {
-                                if info.NextEntryOffset == 0 {
-                                    break;
-                                }
-                                offset += info.NextEntryOffset as usize;
-                                continue;
+                        // Authoritative volume serial + file id for node identity; needed for every
+                        // dir (not just the cross-fs check) so the same file id on two volumes can't
+                        // collide. Falls through to the bottom-of-loop advance when skipped.
+                        let vid = get_volume_and_id(&child_handle);
+                        let same_volume = vid.is_some_and(|(vol, _)| vol == root_volume_serial);
+                        if cross_filesystems || same_volume {
+                            let (vol, fid) = vid.unwrap_or((root_volume_serial, file_id));
+                            let child_id = node_id(vol as u64, fid);
+                            if visited.insert(child_id) {
+                                new_work.push(WorkItem {
+                                    handle: child_handle,
+                                    file_id: child_id,
+                                    parent_id: dir_file_id,
+                                    name: name.clone(),
+                                    path: child_path,
+                                });
                             }
-                        }
-
-                        if visited.insert(file_id) {
-                            new_work.push(WorkItem {
-                                handle: child_handle,
-                                file_id,
-                                parent_id: dir_file_id,
-                                name: name.clone(),
-                                path: child_path,
-                            });
                         }
                     }
                 } else if !is_dir && !is_reparse {
+                    // Unlike Unix, hardlinks are not deduped here: the directory enumeration carries
+                    // no link count, and fetching one per file would require opening every file.
+                    // Hardlinks are rare on NTFS, so files are counted as enumerated.
                     let file_size = info.EndOfFile as u64;
                     let mtime = filetime_to_unix(info.LastWriteTime);
                     dir_total += file_size;
