@@ -98,7 +98,7 @@ jobs:
       - run: playwright-rs install --with-deps chromium firefox webkit
       - uses: actions/cache@v5
         with:
-          key: visual-baselines-v2-${{ matrix.os }}
+          key: visual-baselines-v3-${{ matrix.os }}
           path: crates/server/tests/snapshots/
       # Build the frontend once here: nextest runs each test in its own process, so leaving the
       # bundle to the test harness would launch many concurrent `trunk build`s that race.
