@@ -133,6 +133,8 @@ struct SessionState {
     filter_timer_id: Option<i32>,
     ws: Option<WebSocket>,
     ws_callbacks: Option<WebSocketCallbacks>,
+    /// Consecutive failed reconnect attempts; drives exponential backoff and an eventual give-up.
+    reconnect_attempts: u32,
 }
 
 struct TreemapApp {
@@ -279,6 +281,7 @@ impl TreemapApp {
                 filter_timer_id: None,
                 ws: None,
                 ws_callbacks: None,
+                reconnect_attempts: 0,
             },
         })
     }

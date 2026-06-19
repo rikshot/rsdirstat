@@ -16,7 +16,12 @@ impl TreemapApp {
             return Ok(());
         }
         self.clear_hover()?;
-        self.view.pending_old_rects = Some(self.view.rects.clone());
+        // Only arm the zoom animation once the scan is done. Mid-scan the server streams progress
+        // layouts on the same channel, and any of them would otherwise consume this one-shot
+        // snapshot and animate against the wrong (non-navigation) target.
+        if self.view.scan_done {
+            self.view.pending_old_rects = Some(self.view.rects.clone());
+        }
         self.send_message(message)
     }
 

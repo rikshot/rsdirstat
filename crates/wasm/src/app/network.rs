@@ -106,6 +106,7 @@ impl TreemapApp {
     }
 
     pub(super) fn handle_ws_open(&mut self) -> Result<(), JsValue> {
+        self.session.reconnect_attempts = 0;
         if self.session.wait_mode {
             self.chrome.status_element.set_text_content(Some(""));
             let button = self
@@ -185,18 +186,35 @@ impl TreemapApp {
         // Stop the scan timer first: otherwise its 100ms interval keeps overwriting the status with
         // "Scanning... Ns" right after we set the disconnected message, and the two fight forever.
         self.stop_scan_timer();
-        self.chrome
-            .status_element
-            .set_text_content(Some("Disconnected. Reconnecting in 3s..."));
         self.session.ws = None;
         self.session.ws_callbacks = None;
+
+        // Give up after a bounded number of attempts so a permanently-gone server (it self-exits a
+        // few seconds after the last client leaves) doesn't leave the tab reconnecting forever.
+        const MAX_ATTEMPTS: u32 = 10;
+        if self.session.reconnect_attempts >= MAX_ATTEMPTS {
+            self.chrome
+                .status_element
+                .set_text_content(Some("Disconnected — server unavailable. Reload to retry."));
+            return Ok(());
+        }
+        self.session.reconnect_attempts += 1;
+
+        // Exponential backoff capped at 30s (1, 2, 4, 8, 16, 30, 30, ...) instead of hammering a
+        // dead port every 3s.
+        let delay_ms = (1000u32 << (self.session.reconnect_attempts - 1).min(5)).min(30_000);
+        self.chrome
+            .status_element
+            .set_text_content(Some(&format!("Disconnected. Reconnecting in {}s...", delay_ms / 1000)));
         let callback = Closure::once_into_js(move || {
             with_app(|app| {
                 let _ = app.borrow_mut().connect();
             });
         });
-        self.window
-            .set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref::<Function>(), 3000)?;
+        self.window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            callback.unchecked_ref::<Function>(),
+            delay_ms as i32,
+        )?;
         Ok(())
     }
 
