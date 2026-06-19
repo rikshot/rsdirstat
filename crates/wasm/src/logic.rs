@@ -82,13 +82,11 @@ pub(crate) fn find_rect_index(rects: &[RenderRect], mouse_x: f64, mouse_y: f64) 
 }
 
 pub(crate) fn find_navigable_target_index(rects: &[RenderRect], mouse_x: f64, mouse_y: f64) -> Option<usize> {
-    let mut target = None;
-    for (index, rect) in rects.iter().enumerate() {
-        if hit_test(rect, mouse_x, mouse_y) && !rect.is_files && !rect.is_file && rect.id > 0 {
-            target = Some(index);
-        }
-    }
-    target
+    // Topmost (last-drawn) navigable directory under the cursor — same back-to-front scan as
+    // find_rect_index, with the extra "is a real directory" predicate.
+    rects.iter().enumerate().rev().find_map(|(index, rect)| {
+        (hit_test(rect, mouse_x, mouse_y) && !rect.is_files && !rect.is_file && rect.id > 0).then_some(index)
+    })
 }
 
 pub(crate) fn build_rect_index(rects: &[RenderRect]) -> HashMap<u64, usize> {

@@ -88,6 +88,22 @@ impl TreemapApp {
         });
         breadcrumb_click.forget();
 
+        // One delegated listener on the picker grid instead of a closure per volume card (which
+        // leaked one forgotten closure per card on every picker refresh).
+        let picker_click = Closure::wrap(Box::new(move |event: Event| {
+            with_app(|app| {
+                let _ = app.borrow_mut().handle_picker_event(event);
+            });
+        }) as Box<dyn FnMut(_)>);
+        with_app(|app| {
+            let _ = app
+                .borrow()
+                .chrome
+                .picker_grid
+                .add_event_listener_with_callback("click", picker_click.as_ref().unchecked_ref());
+        });
+        picker_click.forget();
+
         let depth_change = Closure::wrap(Box::new(move |_event: Event| {
             with_app(|app| {
                 let _ = app.borrow_mut().handle_depth_change();
@@ -430,16 +446,28 @@ impl TreemapApp {
             card.append_child(&fs_type)?;
         }
 
-        let mount_point = volume.mount_point.clone();
-        let click = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().scan_path(mount_point.clone());
-            });
-        }) as Box<dyn FnMut(_)>);
-        card.add_event_listener_with_callback("click", click.as_ref().unchecked_ref())?;
-        click.forget();
+        // The delegated picker-grid listener reads this to start the scan; no per-card closure.
+        card.set_attribute("data-mount", &volume.mount_point)?;
 
         Ok(card)
+    }
+
+    pub(super) fn handle_picker_event(&mut self, event: Event) -> Result<(), JsValue> {
+        let Some(target) = event.target() else {
+            return Ok(());
+        };
+        let Ok(mut element) = target.dyn_into::<Element>() else {
+            return Ok(());
+        };
+        loop {
+            if let Some(mount) = element.get_attribute("data-mount") {
+                return self.scan_path(mount);
+            }
+            let Some(parent) = element.parent_element() else {
+                return Ok(());
+            };
+            element = parent;
+        }
     }
 
     pub(super) fn scan_path(&mut self, path: String) -> Result<(), JsValue> {

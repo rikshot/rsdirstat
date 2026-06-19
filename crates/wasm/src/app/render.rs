@@ -143,17 +143,25 @@ fn inset_rect(rect: &RenderRect) -> (f64, f64, f64, f64) {
 }
 
 fn truncate_label(ctx: &CanvasRenderingContext2d, label: &str, max_width: f64) -> Result<(String, f64), JsValue> {
-    let mut label = label.to_string();
-    let mut text_width = ctx.measure_text(&label)?.width();
+    let text_width = ctx.measure_text(label)?.width();
     if text_width <= max_width {
-        return Ok((label, text_width));
+        return Ok((label.to_string(), text_width));
     }
-    let char_count = ((label.chars().count() as f64 * (max_width - 10.0)) / text_width)
+    // Linear estimate, then shrink until it actually fits. The estimate is approximate for
+    // proportional fonts, so without the shrink loop the result could still exceed max_width and the
+    // caller would draw nothing rather than an ellipsized label.
+    let chars: Vec<char> = label.chars().collect();
+    let mut count = (((chars.len() as f64) * (max_width - 10.0)) / text_width)
         .floor()
-        .max(1.0) as usize;
-    label = format!("{}…", label.chars().take(char_count).collect::<String>());
-    text_width = ctx.measure_text(&label)?.width();
-    Ok((label, text_width))
+        .clamp(1.0, chars.len() as f64) as usize;
+    loop {
+        let candidate: String = chars[..count].iter().collect::<String>() + "…";
+        let candidate_width = ctx.measure_text(&candidate)?.width();
+        if candidate_width <= max_width || count == 1 {
+            return Ok((candidate, candidate_width));
+        }
+        count -= 1;
+    }
 }
 
 /// Tracks the last `fillStyle`/`font` set on the context so we can skip redundant assignments.
