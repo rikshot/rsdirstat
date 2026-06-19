@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::IntoResponse;
 use axum::routing::get;
 use clap::Parser;
 use parking_lot::{Mutex, RwLock};
@@ -85,7 +87,6 @@ struct LayoutBroadcast {
 
 struct ConnectionTracker {
     count: AtomicU64,
-    had_any: AtomicBool,
 }
 
 struct AppState {
@@ -104,6 +105,13 @@ impl AppState {
         // `done` writes that happened before this call.
         self.scan.version.fetch_add(1, Ordering::Release);
         self.layout.notify.notify_one();
+    }
+
+    /// Mutate the view config under its lock, then trigger a relayout. Collapses the otherwise
+    /// repeated lock-mutate-invalidate dance shared by every view-changing client message.
+    fn update_view(&self, f: impl FnOnce(&mut ViewConfig)) {
+        f(&mut self.view.lock());
+        self.invalidate_layout();
     }
 }
 
@@ -148,7 +156,6 @@ async fn run_server(
         },
         connections: ConnectionTracker {
             count: AtomicU64::new(0),
-            had_any: AtomicBool::new(false),
         },
         start: Notify::new(),
         shutdown: watch::channel(false).0,
@@ -383,14 +390,48 @@ async fn start_handler(axum::extract::State(state): axum::extract::State<Arc<App
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::response::Response {
+    // Reject cross-origin upgrades. Binding to loopback stops remote hosts, but the server has no
+    // auth and exposes the filesystem, so a malicious page in the user's own browser could
+    // otherwise connect to ws://127.0.0.1 and drive the protocol (cross-origin WS / DNS rebinding).
+    if !origin_allowed(&headers) {
+        return (StatusCode::FORBIDDEN, "cross-origin WebSocket rejected").into_response();
+    }
     ws.on_upgrade(move |socket| handle_ws(socket, state))
+}
+
+/// Allow an upgrade with no `Origin` (non-browser clients never send one) or a loopback `Origin`.
+/// Browsers always send `Origin` on a WS handshake, so this rejects the cross-origin browser case
+/// without affecting local tooling.
+fn origin_allowed(headers: &HeaderMap) -> bool {
+    match headers.get(header::ORIGIN) {
+        None => true,
+        Some(origin) => origin.to_str().map(origin_is_loopback).unwrap_or(false),
+    }
+}
+
+fn origin_is_loopback(origin: &str) -> bool {
+    let rest = origin.split_once("://").map_or(origin, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(after) = authority.strip_prefix('[') {
+        after.split(']').next().unwrap_or("") // IPv6 literal: [host]:port
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
+/// True only if `name` is a single, non-traversing path component (no separators, not `.`/`..`,
+/// not absolute). Used to keep client-supplied reveal targets inside their resolved directory.
+fn is_safe_component(name: &str) -> bool {
+    let mut components = std::path::Path::new(name).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_))) && components.next().is_none()
 }
 
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     state.connections.count.fetch_add(1, Ordering::Relaxed);
-    state.connections.had_any.store(true, Ordering::Relaxed);
 
     // Subscribe before reading the snapshot: a layout produced between the snapshot read and the
     // subscribe would otherwise be lost to this client (absent from the snapshot, broadcast before
@@ -444,9 +485,8 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
         let server = Arc::clone(&state);
         tokio::spawn(async move {
             tokio::time::sleep(SHUTDOWN_GRACE).await;
-            if server.connections.count.load(Ordering::Relaxed) == 0
-                && server.connections.had_any.load(Ordering::Relaxed)
-            {
+            // This timer only spawns when the last connection drops, so a connection always existed.
+            if server.connections.count.load(Ordering::Relaxed) == 0 {
                 let _ = server.shutdown.send(true);
             }
         });
@@ -474,13 +514,9 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
     let Some(msg) = ClientMessage::decode(data) else { return };
     match msg {
         ClientMessage::Viewport { width, height } => {
-            state.view.lock().viewport = (width as f64, height as f64);
-            state.invalidate_layout();
+            state.update_view(|v| v.viewport = (width as f64, height as f64));
         }
-        ClientMessage::Navigate { id } => {
-            state.view.lock().view_root = Some(id);
-            state.invalidate_layout();
-        }
+        ClientMessage::Navigate { id } => state.update_view(|v| v.view_root = Some(id)),
         ClientMessage::RevealDir { id } => {
             let root = state.scan.root.lock().clone();
             let tree = state.scan.tree.read();
@@ -490,11 +526,15 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
             }
         }
         ClientMessage::RevealFile { dir_id, name } => {
-            let root = state.scan.root.lock().clone();
-            let tree = state.scan.tree.read();
-            if let Some(path) = tree.full_path(dir_id, &root).map(|p| p.join(name)) {
-                drop(tree);
-                reveal_in_file_manager(&path);
+            // `name` is attacker-controllable over the WS; only join a single, non-traversing
+            // component so it can't escape the resolved directory with `..` or an absolute path.
+            if is_safe_component(&name) {
+                let root = state.scan.root.lock().clone();
+                let tree = state.scan.tree.read();
+                if let Some(path) = tree.full_path(dir_id, &root).map(|p| p.join(&name)) {
+                    drop(tree);
+                    reveal_in_file_manager(&path);
+                }
             }
         }
         ClientMessage::Rescan => {
@@ -502,33 +542,15 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
                 start_scan(state);
             }
         }
-        ClientMessage::SetDepth { depth } => {
-            state.view.lock().max_depth = depth;
-            state.invalidate_layout();
-        }
-        ClientMessage::ColorMode { mode } => {
-            state.view.lock().color_mode = mode;
-            state.invalidate_layout();
-        }
-        ClientMessage::FilterExt { extensions } => {
-            state.view.lock().filter.extensions = extensions;
-            state.invalidate_layout();
-        }
-        ClientMessage::FilterSize { min, max } => {
-            let mut view = state.view.lock();
-            view.filter.min_size = min;
-            view.filter.max_size = max;
-            drop(view);
-            state.invalidate_layout();
-        }
-        ClientMessage::FilterName { pattern } => {
-            state.view.lock().filter.name_pattern = pattern;
-            state.invalidate_layout();
-        }
-        ClientMessage::ClearFilter => {
-            state.view.lock().filter = FilterConfig::default();
-            state.invalidate_layout();
-        }
+        ClientMessage::SetDepth { depth } => state.update_view(|v| v.max_depth = depth),
+        ClientMessage::ColorMode { mode } => state.update_view(|v| v.color_mode = mode),
+        ClientMessage::FilterExt { extensions } => state.update_view(|v| v.filter.extensions = extensions),
+        ClientMessage::FilterSize { min, max } => state.update_view(|v| {
+            v.filter.min_size = min;
+            v.filter.max_size = max;
+        }),
+        ClientMessage::FilterName { pattern } => state.update_view(|v| v.filter.name_pattern = pattern),
+        ClientMessage::ClearFilter => state.update_view(|v| v.filter = FilterConfig::default()),
         ClientMessage::ScanPath { path } => {
             let can_start = !state.scan.started.load(Ordering::Relaxed) || state.scan.done.load(Ordering::Relaxed);
             if can_start {

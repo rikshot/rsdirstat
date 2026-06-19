@@ -68,7 +68,7 @@ pub enum ServerMessage {
 
 impl ServerMessage {
     pub fn encode(&self) -> Vec<u8> {
-        pack(postcard::to_allocvec(self).unwrap_or_default())
+        pack(postcard::to_allocvec(self).expect("ServerMessage must serialize"))
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
@@ -95,7 +95,7 @@ pub enum ClientMessage {
 
 impl ClientMessage {
     pub fn encode(&self) -> Vec<u8> {
-        pack(postcard::to_allocvec(self).unwrap_or_default())
+        pack(postcard::to_allocvec(self).expect("ClientMessage must serialize"))
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {

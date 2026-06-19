@@ -214,15 +214,14 @@ fn scan_directory(
             // 8-aligned. Copy the (Copy) header out by value; the variable-length name is read
             // separately below from the still-in-buffer bytes.
             let info = unsafe { std::ptr::read_unaligned(buffer.as_ptr().add(offset) as *const FILE_ID_BOTH_DIR_INFO) };
-            let name_len = (info.FileNameLength as usize) / 2;
 
-            // Read variable-length filename
-            let name_ptr = unsafe {
-                buffer
-                    .as_ptr()
-                    .add(offset)
-                    .add(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName)) as *const u16
-            };
+            // Read the variable-length filename. Clamp the declared length to what actually remains
+            // in the buffer: the kernel only writes whole records, but a malformed/over-long
+            // FileNameLength must not make from_raw_parts read past the buffer end.
+            let name_field_offset = offset + std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+            let avail_u16 = buffer.len().saturating_sub(name_field_offset) / 2;
+            let name_len = ((info.FileNameLength as usize) / 2).min(avail_u16);
+            let name_ptr = unsafe { buffer.as_ptr().add(name_field_offset) as *const u16 };
             let name_slice = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
             let name = String::from_utf16_lossy(name_slice);
 

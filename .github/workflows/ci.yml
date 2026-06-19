@@ -31,7 +31,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
-      - run: cargo clippy --all-targets --no-deps -- -D warnings
+      - run: cargo clippy --locked --all-targets --no-deps -- -D warnings
 
   test:
     needs: lint
@@ -45,7 +45,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - run: cargo nextest run --profile ci -E 'not test(/^visual/) and not test(/^e2e/)'
+      - run: cargo nextest run --locked --profile ci -E 'not test(/^visual/) and not test(/^e2e/)'
 
   build:
     needs: lint
@@ -62,7 +62,7 @@ jobs:
         with:
           tool: trunk
       - run: trunk build --release
-      - run: cargo build --release
+      - run: cargo build --locked --release
 
   browser:
     needs: lint
@@ -103,7 +103,7 @@ jobs:
       # Build the frontend once here: nextest runs each test in its own process, so leaving the
       # bundle to the test harness would launch many concurrent `trunk build`s that race.
       - run: trunk build
-      - run: cargo nextest run --profile ci -E 'test(/^visual/) or test(/^e2e/)'
+      - run: cargo nextest run --locked --profile ci -E 'test(/^visual/) or test(/^e2e/)'
       - uses: actions/upload-artifact@v7
         if: always()
         with:

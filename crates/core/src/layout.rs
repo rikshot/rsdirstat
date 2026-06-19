@@ -172,7 +172,7 @@ fn layout_node(
     if layout_items.is_empty() {
         return;
     }
-    layout_items.sort_unstable_by(|a, b| b.size.partial_cmp(&a.size).unwrap());
+    layout_items.sort_unstable_by(|a, b| b.size.total_cmp(&a.size));
 
     let squarify_items: Vec<(i64, f64)> = layout_items.iter().map(|item| (item.id, item.size)).collect();
     let mut rects = Vec::new();
@@ -386,8 +386,9 @@ fn squarify_slice(
         let row_w = w * row_frac;
         let mut cy = y;
         for (i, item) in row_items.iter().enumerate() {
+            // Last item fills the remainder; clamp so float drift can't yield a negative extent.
             let ih = if i == row_items.len() - 1 {
-                y + h - cy
+                (y + h - cy).max(0.0)
             } else {
                 (item.1 / row_area) * h
             };
@@ -405,8 +406,9 @@ fn squarify_slice(
         let row_h = h * row_frac;
         let mut cx = x;
         for (i, item) in row_items.iter().enumerate() {
+            // Last item fills the remainder; clamp so float drift can't yield a negative extent.
             let iw = if i == row_items.len() - 1 {
-                x + w - cx
+                (x + w - cx).max(0.0)
             } else {
                 (item.1 / row_area) * w
             };

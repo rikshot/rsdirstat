@@ -4,11 +4,44 @@ use std::time::Duration;
 
 #[cfg(unix)]
 pub fn raise_fd_limit() {
+    // The scanner keeps every pending directory fd open at once, so the default soft limit
+    // (256 on macOS) is easily exhausted on large trees. Raise it to the hard limit.
     unsafe {
         let mut rlim: libc::rlimit = std::mem::zeroed();
-        libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim);
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
+            eprintln!("getrlimit(RLIMIT_NOFILE) failed: {}", std::io::Error::last_os_error());
+            return;
+        }
+        if rlim.rlim_cur >= rlim.rlim_max && rlim.rlim_max != libc::RLIM_INFINITY {
+            return;
+        }
         rlim.rlim_cur = rlim.rlim_max;
-        libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
+            return;
+        }
+        // macOS rejects rlim_cur == RLIM_INFINITY and caps it at the per-process ceiling, so the
+        // raise above silently fails there and leaves the 256 default in place. Retry with the
+        // kernel's actual limit (kern.maxfilesperproc) instead of giving up.
+        #[cfg(target_os = "macos")]
+        {
+            let mut open_max: libc::c_int = 0;
+            let mut size = std::mem::size_of::<libc::c_int>();
+            if libc::sysctlbyname(
+                c"kern.maxfilesperproc".as_ptr(),
+                &mut open_max as *mut _ as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            ) == 0
+                && open_max > 0
+            {
+                rlim.rlim_cur = open_max as libc::rlim_t;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
+                    return;
+                }
+            }
+        }
+        eprintln!("setrlimit(RLIMIT_NOFILE) failed: {}", std::io::Error::last_os_error());
     }
 }
 

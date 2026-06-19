@@ -182,6 +182,9 @@ impl TreemapApp {
     }
 
     pub(super) fn handle_ws_close(&mut self) -> Result<(), JsValue> {
+        // Stop the scan timer first: otherwise its 100ms interval keeps overwriting the status with
+        // "Scanning... Ns" right after we set the disconnected message, and the two fight forever.
+        self.stop_scan_timer();
         self.chrome
             .status_element
             .set_text_content(Some("Disconnected. Reconnecting in 3s..."));

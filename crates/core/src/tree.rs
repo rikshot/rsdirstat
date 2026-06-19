@@ -180,7 +180,8 @@ impl DirTree {
     fn propagate_size(&mut self, node_id: u64, delta: u64) {
         let mut current = node_id;
         loop {
-            *self.recursive_sizes.entry(current).or_insert(0) += delta;
+            let entry = self.recursive_sizes.entry(current).or_insert(0);
+            *entry = entry.saturating_add(delta);
             match self.nodes.get(&current) {
                 Some(node) if node.parent != 0 => current = node.parent,
                 _ => break,
@@ -213,7 +214,7 @@ impl DirTree {
             if let Some(node) = self.nodes.get(&id) {
                 let mut total = node.direct_size;
                 for &child in &node.children {
-                    total += self.recursive_sizes.get(&child).copied().unwrap_or(0);
+                    total = total.saturating_add(self.recursive_sizes.get(&child).copied().unwrap_or(0));
                 }
                 self.recursive_sizes.insert(id, total);
             }
@@ -228,11 +229,11 @@ impl DirTree {
                 let mut total: u64 = 0;
                 for file in &node.files {
                     if filter.matches_file(&file.name, file.size) {
-                        total += file.size;
+                        total = total.saturating_add(file.size);
                     }
                 }
                 for &child in &node.children {
-                    total += sizes.get(&child).copied().unwrap_or(0);
+                    total = total.saturating_add(sizes.get(&child).copied().unwrap_or(0));
                 }
                 sizes.insert(id, total);
             }
@@ -244,7 +245,10 @@ impl DirTree {
         let root_id = self.root_id.unwrap_or(0);
         let mut path = Vec::new();
         let mut current = view_root;
-        while let Some(node) = self.nodes.get(&current) {
+        // Bound the walk by the node count: a corrupt parent cycle (e.g. inode collision under
+        // --all) must not hang a request, since the server calls this on every layout.
+        for _ in 0..=self.nodes.len() {
+            let Some(node) = self.nodes.get(&current) else { break };
             let name = if node.name.is_empty() {
                 self.scan_path.clone()
             } else {
@@ -264,7 +268,8 @@ impl DirTree {
         let root_id = self.root_id?;
         let mut parts: Vec<&str> = Vec::new();
         let mut current = node_id;
-        loop {
+        // Bounded by node count so a corrupt parent cycle can't hang this client-triggered walk.
+        for _ in 0..=self.nodes.len() {
             if current == root_id {
                 break;
             }
