@@ -1,9 +1,12 @@
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use futures_util::FutureExt;
 
 /// Ensure the trunk frontend bundle exists; the server serves it at runtime from
 /// `crates/wasm/dist`, so the e2e/visual tests need it present. This is test-only orchestration
@@ -134,6 +137,14 @@ pub fn create_test_dir() -> tempfile::TempDir {
 pub async fn launch_browser(
     browser_name: &str,
 ) -> (playwright_rs::Playwright, playwright_rs::Browser, playwright_rs::Page) {
+    launch_browser_sized(browser_name, 1280, 720).await
+}
+
+pub async fn launch_browser_sized(
+    browser_name: &str,
+    width: u32,
+    height: u32,
+) -> (playwright_rs::Playwright, playwright_rs::Browser, playwright_rs::Page) {
     let pw = playwright_rs::Playwright::launch().await.unwrap();
     let browser = match browser_name {
         "chromium" => pw.chromium().launch().await.unwrap(),
@@ -142,12 +153,9 @@ pub async fn launch_browser(
         _ => panic!("unknown browser: {browser_name}"),
     };
     let page = browser.new_page().await.unwrap();
-    page.set_viewport_size(playwright_rs::Viewport {
-        width: 1280,
-        height: 720,
-    })
-    .await
-    .unwrap();
+    page.set_viewport_size(playwright_rs::Viewport { width, height })
+        .await
+        .unwrap();
     (pw, browser, page)
 }
 
@@ -163,4 +171,91 @@ pub async fn wait_for_scan_done(page: &playwright_rs::Page) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("scan did not complete within 10 seconds");
+}
+
+/// Directory where Playwright failure traces are written. Only tests that fail
+/// populate it; CI uploads it as an artifact so a red cross-OS browser run is
+/// debuggable postmortem (DOM snapshots + screenshots + console/network timeline).
+pub fn trace_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/traces")
+}
+
+/// Build a filesystem-safe, unique trace label from the browser and the test
+/// body's name. `name` is typically `std::any::type_name::<F>()` (e.g.
+/// `"e2e::page_title"`); we keep the final path segment.
+pub fn trace_label(browser: &str, name: &str) -> String {
+    let short = name.rsplit("::").next().unwrap_or(name);
+    let safe: String = short
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("{browser}-{safe}")
+}
+
+/// Run `body` with Playwright tracing active on `page`'s context, saving the
+/// trace to `tests/traces/<label>.zip` only if the body fails — either by
+/// panicking (an assertion) or by returning `Err`. On success the trace is
+/// discarded. Panics are re-raised afterwards so the test still fails as usual.
+/// This mirrors Playwright's own `retain-on-failure` trace policy.
+///
+/// Tracing is best-effort: if it can't be started (e.g. an unexpected driver
+/// state) the body still runs untraced, so tracing never turns a green test red.
+pub async fn with_trace<F, T, E>(page: &playwright_rs::Page, label: &str, body: F) -> Result<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let tracing = trace_start(page, label).await;
+    let outcome = AssertUnwindSafe(body).catch_unwind().await;
+    let failed = !matches!(outcome, Ok(Ok(_)));
+    trace_stop(tracing, label, failed).await;
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// [`with_trace`] for bodies that signal failure only by panicking (the e2e
+/// tests, which assert rather than return `Result`). Keeps the `Infallible`
+/// plumbing in one place instead of at every call site.
+pub async fn with_trace_unit<F>(page: &playwright_rs::Page, label: &str, body: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let _ = with_trace(page, label, async move {
+        body.await;
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .await;
+}
+
+async fn trace_start(page: &playwright_rs::Page, label: &str) -> Option<playwright_rs::Tracing> {
+    let tracing = page.context().ok()?.tracing().await.ok()?;
+    tracing
+        .start(Some(
+            playwright_rs::TracingStartOptions::default()
+                .name(label)
+                .screenshots(true)
+                .snapshots(true),
+        ))
+        .await
+        .ok()?;
+    Some(tracing)
+}
+
+async fn trace_stop(tracing: Option<playwright_rs::Tracing>, label: &str, failed: bool) {
+    let Some(tracing) = tracing else { return };
+    let path = trace_dir().join(format!("{label}.zip"));
+    if !failed {
+        let _ = tracing.stop(None).await; // discard in-memory trace
+        // Under `nextest` retries a flaky test can fail then pass; drop any zip an
+        // earlier failed attempt left behind so a passed test never ships a trace.
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let _ = std::fs::create_dir_all(trace_dir());
+    let opts = playwright_rs::TracingStopOptions::default().path(path.to_string_lossy().into_owned());
+    if tracing.stop(Some(opts)).await.is_ok() {
+        // Surface the path so it's greppable in CI logs alongside the failure.
+        eprintln!("playwright trace saved: {}", path.display());
+    }
 }

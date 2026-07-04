@@ -1,4 +1,5 @@
 /target
 /docs
 crates/server/tests/snapshots/*.png
+crates/server/tests/traces/
 crates/wasm/dist/

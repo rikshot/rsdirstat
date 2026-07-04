@@ -16,14 +16,20 @@ async fn setup_with(
     let dir = create_test_dir();
     let server = TestServer::start(dir.path());
     let (pw, browser, page) = launch_browser(browser_name).await;
-    page.goto(&server.url, None).await.unwrap();
-    wait_for_scan_done(&page).await;
     (dir, server, pw, browser, page)
 }
 
-async fn run(browser_name: &str, f: impl AsyncFn(&playwright_rs::Page)) {
-    let (_dir, _server, _pw, browser, page) = setup_with(browser_name).await;
-    f(&page).await;
+async fn run<F: AsyncFn(&playwright_rs::Page)>(browser_name: &str, f: F) {
+    let (_dir, server, _pw, browser, page) = setup_with(browser_name).await;
+    let label = common::trace_label(browser_name, std::any::type_name::<F>());
+    // Trace from navigation onward so a `wait_for_scan_done` timeout — the most
+    // likely cross-OS flake — is captured, not just failures inside `f`.
+    common::with_trace_unit(&page, &label, async {
+        page.goto(&server.url, None).await.unwrap();
+        wait_for_scan_done(&page).await;
+        f(&page).await;
+    })
+    .await;
     let _ = browser.close().await;
 }
 
@@ -35,19 +41,23 @@ async fn setup_picker() -> (
 ) {
     let server = TestServer::start_picker();
     let (pw, browser, page) = launch_browser("chromium").await;
-    page.goto(&format!("{}/?picker", server.url), None).await.unwrap();
-    for _ in 0..50 {
-        if page.locator("#picker").await.is_visible().await.unwrap_or(false) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
     (server, pw, browser, page)
 }
 
-async fn run_picker(f: impl AsyncFn(&playwright_rs::Page)) {
-    let (_server, _pw, browser, page) = setup_picker().await;
-    f(&page).await;
+async fn run_picker<F: AsyncFn(&playwright_rs::Page)>(f: F) {
+    let (server, _pw, browser, page) = setup_picker().await;
+    let label = common::trace_label("chromium", std::any::type_name::<F>());
+    common::with_trace_unit(&page, &label, async {
+        page.goto(&format!("{}/?picker", server.url), None).await.unwrap();
+        for _ in 0..50 {
+            if page.locator("#picker").await.is_visible().await.unwrap_or(false) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        f(&page).await;
+    })
+    .await;
     let _ = browser.close().await;
 }
 
@@ -313,23 +323,27 @@ async fn click_leaf_directory_navigates(browser_name: &str) {
 
     let server = TestServer::start(root);
     let (_pw, browser, page) = launch_browser(browser_name).await;
-    page.goto(&server.url, None).await.unwrap();
-    wait_for_scan_done(&page).await;
+    let label = common::trace_label(browser_name, "click_leaf_directory_navigates");
+    common::with_trace_unit(&page, &label, async {
+        page.goto(&server.url, None).await.unwrap();
+        wait_for_scan_done(&page).await;
 
-    let crumbs = page.locator("#crumbs").await;
-    let initial_text = crumbs.text_content().await.unwrap().unwrap();
-    let initial_parts: Vec<&str> = initial_text.split('/').collect();
+        let crumbs = page.locator("#crumbs").await;
+        let initial_text = crumbs.text_content().await.unwrap().unwrap();
+        let initial_parts: Vec<&str> = initial_text.split('/').collect();
 
-    page.locator("#treemap").await.click(None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+        page.locator("#treemap").await.click(None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    let after_text = crumbs.text_content().await.unwrap().unwrap();
-    let after_parts: Vec<&str> = after_text.split('/').collect();
+        let after_text = crumbs.text_content().await.unwrap().unwrap();
+        let after_parts: Vec<&str> = after_text.split('/').collect();
 
-    assert!(
-        after_parts.len() > initial_parts.len(),
-        "clicking a leaf dir should navigate into it: before={initial_text}, after={after_text}"
-    );
+        assert!(
+            after_parts.len() > initial_parts.len(),
+            "clicking a leaf dir should navigate into it: before={initial_text}, after={after_text}"
+        );
+    })
+    .await;
     let _ = browser.close().await;
 }
 

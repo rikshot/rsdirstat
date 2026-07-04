@@ -94,7 +94,7 @@ jobs:
       # the build's target/, it survives compile caching — so we no longer need the old
       # `cargo clean -p playwright-rs` dance (which forced build.rs to re-download into target/), nor
       # Node/npx. Pin the CLI to the same version as the dev-dependency so the bundled driver matches.
-      - run: cargo install --locked playwright-rs@0.13.0 --features cli
+      - run: cargo install --locked playwright-rs@0.14.0 --features cli
       - run: playwright-rs install --with-deps chromium firefox webkit
       - uses: actions/cache@v5
         with:
@@ -109,3 +109,11 @@ jobs:
         with:
           name: visual-snapshots-${{ matrix.os }}
           path: crates/server/tests/snapshots/
+      # Playwright traces are written only for failing browser tests (retain-on-failure);
+      # upload them so a red cross-OS run is debuggable without reproducing locally.
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: playwright-traces-${{ matrix.os }}
+          path: crates/server/tests/traces/
+          if-no-files-found: ignore
