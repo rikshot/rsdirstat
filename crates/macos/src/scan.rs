@@ -15,6 +15,12 @@ use rsdirstat_protocol::ScanEvent;
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
 
+// st_flags bit (from <sys/stat.h>, not exposed by libc) marking a "dataless" object: a cloud
+// placeholder (Dropbox/Drive/iCloud) whose data isn't materialized locally. Its logical length is
+// the full "online" size while 0 bytes are allocated on disk, so we count it as 0. Read-only flag,
+// surfaced via ATTR_CMN_FLAGS; reading attributes never triggers a download.
+const SF_DATALESS: u32 = 0x4000_0000;
+
 const BUF_SIZE: usize = 1024 * 1024;
 
 static SCAN_ATTRS: libc::attrlist = libc::attrlist {
@@ -25,6 +31,7 @@ static SCAN_ATTRS: libc::attrlist = libc::attrlist {
         | libc::ATTR_CMN_DEVID
         | libc::ATTR_CMN_OBJTYPE
         | libc::ATTR_CMN_MODTIME
+        | libc::ATTR_CMN_FLAGS
         | libc::ATTR_CMN_FILEID,
     volattr: 0,
     dirattr: 0,
@@ -261,13 +268,16 @@ fn scan_directory(
                         let counted = parsed.nlink <= 1
                             || visited_files.insert(node_id(parsed.dev_id as u32 as u64, parsed.file_id));
                         if counted {
-                            dir_total += parsed.file_size;
+                            // Unmaterialized cloud placeholders occupy 0 bytes on disk; count them
+                            // as such rather than their "online" logical length.
+                            let file_size = if parsed.dataless { 0 } else { parsed.file_size };
+                            dir_total += file_size;
                             dir_mtime = dir_mtime.max(parsed.mtime);
-                            if parsed.file_size > 0 {
+                            if file_size > 0 {
                                 let _ = tx.send(ScanEvent::File {
                                     parent: dir_file_id,
                                     name: parsed.name.to_string(),
-                                    size: parsed.file_size,
+                                    size: file_size,
                                     mtime: parsed.mtime,
                                 });
                             }
@@ -302,6 +312,7 @@ struct ParsedEntry<'a> {
     file_size: u64,
     nlink: u32,
     mtime: i64,
+    dataless: bool,
 }
 
 /// Parse one `getattrlistbulk` entry. The layout is dynamic: a leading `attribute_set_t`
@@ -331,6 +342,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
     let mut mtime = 0i64;
     let mut file_size = 0u64;
     let mut nlink = 0u32;
+    let mut flags = 0u32;
 
     // Read a fixed-width field only if its bit is set, advancing `pos` past the bytes it occupies.
     macro_rules! field {
@@ -364,6 +376,11 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
     field!(returned_common & libc::ATTR_CMN_MODTIME != 0, 16, {
         mtime = i64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
     });
+    // ATTR_CMN_FLAGS (bit 0x40000) precedes FILEID (bit 0x2000000) in ascending-bit order. Returns
+    // st_flags as a u32; we only inspect SF_DATALESS to spot unmaterialized cloud placeholders.
+    field!(returned_common & libc::ATTR_CMN_FLAGS != 0, 4, {
+        flags = u32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
+    });
     field!(returned_common & libc::ATTR_CMN_FILEID != 0, 8, {
         file_id = u64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
     });
@@ -384,5 +401,73 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
         file_size,
         nlink,
         mtime,
+        dataless: flags & SF_DATALESS != 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build one synthetic `getattrlistbulk` entry mirroring `parse_entry`'s expected layout: a
+    /// leading u32 length, the 5-word returned-attrs bitmap, then each requested attribute in
+    /// ascending-bit order, with the name bytes appended after the fixed fields.
+    fn build_file_entry(name: &str, flags: u32, file_size: u64) -> Vec<u8> {
+        let mut e = Vec::new();
+        e.extend_from_slice(&0u32.to_ne_bytes()); // entry length, backfilled below
+
+        let returned_common: u32 = libc::ATTR_CMN_NAME
+            | libc::ATTR_CMN_DEVID
+            | libc::ATTR_CMN_OBJTYPE
+            | libc::ATTR_CMN_MODTIME
+            | libc::ATTR_CMN_FLAGS
+            | libc::ATTR_CMN_FILEID;
+        let returned_file: u32 = libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_DATALENGTH;
+        e.extend_from_slice(&returned_common.to_ne_bytes());
+        e.extend_from_slice(&0u32.to_ne_bytes()); // vol
+        e.extend_from_slice(&0u32.to_ne_bytes()); // dir
+        e.extend_from_slice(&returned_file.to_ne_bytes());
+        e.extend_from_slice(&0u32.to_ne_bytes()); // fork
+
+        // ATTR_CMN_NAME attrreference_t: i32 offset (relative to its own start) + u32 length.
+        let name_ref_pos = e.len();
+        e.extend_from_slice(&0i32.to_ne_bytes()); // offset, backfilled
+        e.extend_from_slice(&((name.len() + 1) as u32).to_ne_bytes());
+        e.extend_from_slice(&7i32.to_ne_bytes()); // DEVID
+        e.extend_from_slice(&VREG.to_ne_bytes()); // OBJTYPE
+        e.extend_from_slice(&111i64.to_ne_bytes()); // MODTIME tv_sec
+        e.extend_from_slice(&0i64.to_ne_bytes()); // MODTIME tv_nsec
+        e.extend_from_slice(&flags.to_ne_bytes()); // FLAGS
+        e.extend_from_slice(&42u64.to_ne_bytes()); // FILEID
+        e.extend_from_slice(&1u32.to_ne_bytes()); // LINKCOUNT
+        e.extend_from_slice(&file_size.to_ne_bytes()); // DATALENGTH
+
+        let name_pos = e.len();
+        e.extend_from_slice(name.as_bytes());
+        e.push(0);
+
+        let offset = (name_pos - name_ref_pos) as i32;
+        e[name_ref_pos..name_ref_pos + 4].copy_from_slice(&offset.to_ne_bytes());
+        let len = e.len() as u32;
+        e[0..4].copy_from_slice(&len.to_ne_bytes());
+        e
+    }
+
+    #[test]
+    fn dataless_cloud_placeholder_is_flagged() {
+        // A Dropbox/Drive/iCloud file that isn't materialized: full logical size, 0 bytes on disk.
+        let entry = build_file_entry("Demo.gdoc", SF_DATALESS, 173);
+        let parsed = parse_entry(&entry).expect("entry should parse");
+        assert_eq!(parsed.name, "Demo.gdoc");
+        assert_eq!(parsed.file_size, 173, "logical size still parsed");
+        assert!(parsed.dataless, "SF_DATALESS must mark the entry dataless");
+    }
+
+    #[test]
+    fn materialized_file_is_not_dataless() {
+        let entry = build_file_entry("main.rs", 0, 12);
+        let parsed = parse_entry(&entry).expect("entry should parse");
+        assert_eq!(parsed.file_size, 12);
+        assert!(!parsed.dataless);
+    }
 }
