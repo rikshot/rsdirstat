@@ -1,5 +1,10 @@
 # rsdirstat
 
+[![CI](https://github.com/rikshot/rsdirstat/actions/workflows/ci.yml/badge.svg)](https://github.com/rikshot/rsdirstat/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/rikshot/rsdirstat/branch/main/graph/badge.svg)](https://codecov.io/gh/rikshot/rsdirstat)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-informational)
+
 Fast, cross-platform disk usage analyzer with an interactive treemap GUI.
 
 ## Features
@@ -19,9 +24,19 @@ Fast, cross-platform disk usage analyzer with an interactive treemap GUI.
 
 Requires [Rust](https://rustup.rs/) (edition 2024).
 
+The CLI is self-contained:
+
 ```sh
 cargo install --path crates/cli
-cargo install --path crates/server
+```
+
+The GUI server additionally needs the WASM frontend bundle (see [Building](#building)).
+It loads the bundle from `crates/wasm/dist` when run from a checkout, or from a `dist/`
+directory next to the binary when deployed:
+
+```sh
+trunk build --release              # produces crates/wasm/dist
+cargo install --path crates/server # then run alongside a dist/ directory
 ```
 
 ## Usage
@@ -29,8 +44,11 @@ cargo install --path crates/server
 ### GUI
 
 ```sh
-rsdirstat-server [path]          # opens browser with treemap
+rsdirstat-server                 # no path: pick a volume in the browser, then scan
+rsdirstat-server [path]          # scan a path, opens the treemap in your browser
 rsdirstat-server --all [path]    # cross filesystem boundaries
+rsdirstat-server --port 8080 [path]   # fixed port (default: random)
+rsdirstat-server --no-open [path]     # don't auto-open the browser
 ```
 
 ### CLI
