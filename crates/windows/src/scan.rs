@@ -19,6 +19,14 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 const BUF_SIZE: usize = 1024 * 1024;
 
+// Reparse tags for cloud placeholders created by the Cloud Files API (OneDrive, and other providers
+// built on it). They share the base 0x9000001A; a provider index occupies the CLOUD_MASK (0xF000)
+// nibble, spanning 0x9000001A..=0x9000F01A. Values mirror windows-sys' IO_REPARSE_TAG_CLOUD /
+// IO_REPARSE_TAG_CLOUD_MASK (in Win32_System_SystemServices), defined here so we needn't pull that
+// whole bindings module in for two integers.
+const IO_REPARSE_TAG_CLOUD: u32 = 0x9000_001A;
+const IO_REPARSE_TAG_CLOUD_MASK: u32 = 0x0000_F000;
+
 // Convert Windows FILETIME (100ns since 1601-01-01) to Unix epoch seconds
 fn filetime_to_unix(ft: i64) -> i64 {
     const EPOCH_DIFF: i64 = 11_644_473_600;
@@ -192,6 +200,61 @@ pub fn scan_cancellable(
     Ok(())
 }
 
+/// What to do with one enumerated directory entry.
+#[derive(Debug, PartialEq, Eq)]
+enum EntryKind {
+    /// A directory to descend into (a plain directory, or a cloud-placeholder directory).
+    Directory,
+    /// A file contributing `size` bytes — 0 for an online-only (dehydrated) cloud placeholder.
+    File { size: u64 },
+    /// A symlink / junction / mount point (any non-cloud reparse point): neither counted nor
+    /// traversed, to avoid double-counting and traversal loops.
+    Skip,
+}
+
+/// A cloud-placeholder reparse tag shares the base `IO_REPARSE_TAG_CLOUD` with a provider index in
+/// the `IO_REPARSE_TAG_CLOUD_MASK` nibble; mask it out and compare to the base.
+fn is_cloud_reparse_tag(tag: u32) -> bool {
+    tag & !IO_REPARSE_TAG_CLOUD_MASK == IO_REPARSE_TAG_CLOUD
+}
+
+/// Decide how to treat a directory entry from its attributes, reparse tag, and sizes.
+///
+/// Cloud files (OneDrive et al.) are placeholders — reparse points — for both files *and* folders,
+/// so we can't just skip every reparse point or we'd hide all locally-present cloud content and
+/// whole cloud subtrees. Instead, inspect the tag: cloud placeholders back real data and are treated
+/// like ordinary files/dirs, while genuine redirections (symlink/junction/mount point) are skipped.
+///
+/// `reparse_tag` is only meaningful when `FILE_ATTRIBUTE_REPARSE_POINT` is set — the directory
+/// enumeration overlays it onto the entry's `EaSize` field (per [MS-FSCC]).
+fn classify(attrs: u32, reparse_tag: u32, end_of_file: i64, allocation_size: i64) -> EntryKind {
+    let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let is_reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+
+    // Non-cloud reparse points (symlinks, junctions, mount points) redirect elsewhere — skip them to
+    // avoid double-counting and traversal loops. Cloud placeholders are also reparse points but back
+    // real content, so they fall through to normal directory/file handling below.
+    if is_reparse && !is_cloud_reparse_tag(reparse_tag) {
+        return EntryKind::Skip;
+    }
+
+    if is_dir {
+        return EntryKind::Directory;
+    }
+
+    // Reaching here with `is_reparse` set means a cloud placeholder file. An online-only
+    // (unmaterialized) placeholder occupies 0 bytes on disk — AllocationSize 0 — even though
+    // EndOfFile still reports its full "online" length; count it as 0. On-disk allocation is a
+    // provider- and hydration-policy-agnostic signal, unlike the assorted FILE_ATTRIBUTE_RECALL_ON_*
+    // flags different providers set. A materialized placeholder — and any ordinary file, including a
+    // sparse one — counts at its logical size, matching the rest of the tree and the macOS
+    // dataless-placeholder handling.
+    let unmaterialized_cloud = is_reparse && allocation_size == 0;
+    EntryKind::File {
+        size: if unmaterialized_cloud { 0 } else { end_of_file as u64 },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_directory(
     handle: OwnedHandle,
@@ -254,48 +317,49 @@ fn scan_directory(
 
             if name != "." && name != ".." {
                 let file_id = info.FileId as u64;
-                let attrs = info.FileAttributes;
-                let is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                let is_reparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-
-                if is_dir && !is_reparse {
-                    let child_path = format!("{}\\{}", dir_path, name);
-                    if let Some(child_handle) = open_dir(&wide_str(&child_path)) {
-                        // Authoritative volume serial + file id for node identity; needed for every
-                        // dir (not just the cross-fs check) so the same file id on two volumes can't
-                        // collide. Falls through to the bottom-of-loop advance when skipped.
-                        let vid = get_volume_and_id(&child_handle);
-                        let same_volume = vid.is_some_and(|(vol, _)| vol == root_volume_serial);
-                        if cross_filesystems || same_volume {
-                            let (vol, fid) = vid.unwrap_or((root_volume_serial, file_id));
-                            let child_id = node_id(vol as u64, fid);
-                            if visited.insert(child_id) {
-                                new_work.push(WorkItem {
-                                    handle: child_handle,
-                                    file_id: child_id,
-                                    parent_id: dir_file_id,
-                                    name: name.clone(),
-                                    path: child_path,
-                                });
+                // When the reparse bit is set, the enumeration overlays the reparse tag onto EaSize.
+                match classify(info.FileAttributes, info.EaSize, info.EndOfFile, info.AllocationSize) {
+                    EntryKind::Directory => {
+                        let child_path = format!("{}\\{}", dir_path, name);
+                        if let Some(child_handle) = open_dir(&wide_str(&child_path)) {
+                            // Authoritative volume serial + file id for node identity; needed for
+                            // every dir (not just the cross-fs check) so the same file id on two
+                            // volumes can't collide. Falls through to the bottom-of-loop advance when
+                            // skipped.
+                            let vid = get_volume_and_id(&child_handle);
+                            let same_volume = vid.is_some_and(|(vol, _)| vol == root_volume_serial);
+                            if cross_filesystems || same_volume {
+                                let (vol, fid) = vid.unwrap_or((root_volume_serial, file_id));
+                                let child_id = node_id(vol as u64, fid);
+                                if visited.insert(child_id) {
+                                    new_work.push(WorkItem {
+                                        handle: child_handle,
+                                        file_id: child_id,
+                                        parent_id: dir_file_id,
+                                        name: name.clone(),
+                                        path: child_path,
+                                    });
+                                }
                             }
                         }
                     }
-                } else if !is_dir && !is_reparse {
-                    // Unlike Unix, hardlinks are not deduped here: the directory enumeration carries
-                    // no link count, and fetching one per file would require opening every file.
-                    // Hardlinks are rare on NTFS, so files are counted as enumerated.
-                    let file_size = info.EndOfFile as u64;
-                    let mtime = filetime_to_unix(info.LastWriteTime);
-                    dir_total += file_size;
-                    dir_mtime = dir_mtime.max(mtime);
-                    if file_size > 0 {
-                        let _ = tx.send(ScanEvent::File {
-                            parent: dir_file_id,
-                            name,
-                            size: file_size,
-                            mtime,
-                        });
+                    EntryKind::File { size } => {
+                        // Unlike Unix, hardlinks are not deduped here: the directory enumeration
+                        // carries no link count, and fetching one per file would require opening
+                        // every file. Hardlinks are rare on NTFS, so files are counted as enumerated.
+                        let mtime = filetime_to_unix(info.LastWriteTime);
+                        dir_total += size;
+                        dir_mtime = dir_mtime.max(mtime);
+                        if size > 0 {
+                            let _ = tx.send(ScanEvent::File {
+                                parent: dir_file_id,
+                                name,
+                                size,
+                                mtime,
+                            });
+                        }
                     }
+                    EntryKind::Skip => {}
                 }
             }
 
@@ -317,4 +381,69 @@ fn scan_directory(
     });
 
     work.push(new_work);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DIR: u32 = FILE_ATTRIBUTE_DIRECTORY;
+    const REPARSE: u32 = FILE_ATTRIBUTE_REPARSE_POINT;
+    // A cloud tag with a non-zero provider index in the CLOUD_MASK nibble, to prove masking works.
+    const CLOUD_TAG_3: u32 = 0x9000_301A;
+    const SYMLINK_TAG: u32 = 0xA000_000C; // IO_REPARSE_TAG_SYMLINK
+    const MOUNT_POINT_TAG: u32 = 0xA000_0003; // IO_REPARSE_TAG_MOUNT_POINT (junction)
+
+    #[test]
+    fn regular_file_counts_logical_size() {
+        // attrs 0, some data on disk (allocation 4096).
+        assert_eq!(classify(0, 0, 4096, 4096), EntryKind::File { size: 4096 });
+    }
+
+    #[test]
+    fn regular_directory_recurses() {
+        assert_eq!(classify(DIR, 0, 0, 0), EntryKind::Directory);
+    }
+
+    #[test]
+    fn sparse_regular_file_is_not_zeroed() {
+        // A non-cloud sparse file has 0 bytes allocated but a large logical length; under the tool's
+        // apparent-size semantics it must still count at EndOfFile, not be mistaken for a placeholder.
+        assert_eq!(classify(0, 0, 1_000_000, 0), EntryKind::File { size: 1_000_000 });
+    }
+
+    #[test]
+    fn online_only_cloud_file_counts_zero() {
+        // Dehydrated placeholder: cloud reparse tag, full online length in EndOfFile, 0 on disk.
+        let entry = classify(REPARSE, IO_REPARSE_TAG_CLOUD, 10_000_000, 0);
+        assert_eq!(entry, EntryKind::File { size: 0 });
+    }
+
+    #[test]
+    fn hydrated_cloud_file_counts_logical_size() {
+        // Locally-available placeholder: cloud reparse tag, data on disk (allocation > 0).
+        assert_eq!(classify(REPARSE, CLOUD_TAG_3, 173, 4096), EntryKind::File { size: 173 });
+    }
+
+    #[test]
+    fn cloud_directory_recurses() {
+        // Folders are placeholders too; we must descend rather than skip the whole subtree.
+        assert_eq!(classify(DIR | REPARSE, CLOUD_TAG_3, 0, 0), EntryKind::Directory);
+    }
+
+    #[test]
+    fn symlink_and_junction_are_skipped() {
+        assert_eq!(classify(REPARSE, SYMLINK_TAG, 0, 0), EntryKind::Skip);
+        assert_eq!(classify(DIR | REPARSE, MOUNT_POINT_TAG, 0, 0), EntryKind::Skip);
+    }
+
+    #[test]
+    fn cloud_tag_detection_masks_provider_nibble() {
+        assert!(is_cloud_reparse_tag(IO_REPARSE_TAG_CLOUD));
+        assert!(is_cloud_reparse_tag(0x9000_301A));
+        assert!(is_cloud_reparse_tag(0x9000_F01A));
+        assert!(!is_cloud_reparse_tag(SYMLINK_TAG));
+        assert!(!is_cloud_reparse_tag(MOUNT_POINT_TAG));
+        assert!(!is_cloud_reparse_tag(0));
+    }
 }
