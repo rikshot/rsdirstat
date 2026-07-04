@@ -1,0 +1,13 @@
+# Injected by dist into every build-local-artifacts leg (see `github-build-setup`
+# in dist-workspace.toml), right after checkout and before `dist build`. The
+# `rsdirstat` binary embeds the compiled frontend from `dist/` via rust-embed, so
+# the bundle must exist before cargo builds the release binary. The bundle is
+# target-independent, so building it once per leg on the native runner is fine.
+- name: Add wasm target
+  run: rustup target add wasm32-unknown-unknown
+- name: Install trunk
+  uses: taiki-e/install-action@v2
+  with:
+    tool: trunk
+- name: Build embedded frontend bundle
+  run: trunk build --release

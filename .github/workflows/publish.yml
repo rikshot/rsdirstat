@@ -1,0 +1,45 @@
+name: Publish
+
+# Publish the workspace to crates.io when a version tag is pushed. Prebuilt binaries
+# and the GitHub Release are handled separately by release.yml (cargo-dist), which
+# triggers on the same tags.
+on:
+  push:
+    tags: ["v*"]
+
+# Trusted Publishing: the job proves its identity to crates.io with a GitHub OIDC
+# token and exchanges it for a short-lived registry token — no stored API secret.
+# `id-token: write` is required to mint the OIDC token; `contents: read` to check out.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  crates-io:
+    runs-on: ubuntu-latest
+    # Optional gate: configure required reviewers on this environment (and name it in
+    # the crate's Trusted Publishing settings) to require a human approval per release.
+    environment: release
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+      # `rsdirstat` embeds the frontend from `dist/` (rust-embed) and `include`s it in
+      # the package tarball, so the release bundle must exist before packaging.
+      - run: trunk build --release
+      # Exchange the OIDC token for a 30-minute crates.io token.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      # `--workspace` publishes every non-`publish=false` member in dependency order
+      # (protocol → core → {linux,macos,windows} → rsdirstat), skipping the wasm crate.
+      # `--no-verify`: the macOS/Windows scanner crates can't compile on this Linux
+      # runner (native platform APIs), so skip the per-crate verify build — CI already
+      # built and tested every crate on its native OS at this commit.
+      # `--allow-dirty`: `dist/` is git-ignored (a build artifact) but must ship.
+      - run: cargo publish --workspace --no-verify --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
