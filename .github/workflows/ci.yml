@@ -85,9 +85,10 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: wasm32-unknown-unknown
+          components: llvm-tools
       - uses: taiki-e/install-action@v2
         with:
-          tool: nextest,trunk
+          tool: nextest,trunk,cargo-llvm-cov
       - uses: actions/cache@v5
         with:
           key: playwright-1.60.0-${{ runner.os }}
@@ -113,7 +114,17 @@ jobs:
       # Build the frontend once here: nextest runs each test in its own process, so leaving the
       # bundle to the test harness would launch many concurrent `trunk build`s that race.
       - run: trunk build
-      - run: cargo nextest run --locked --profile ci -E 'test(/^visual/) or test(/^e2e/)'
+      # Run under instrumentation: the e2e/visual tests drive the server binary as a
+      # subprocess, so this captures server/main.rs coverage that the unit `test` job can't.
+      # The server flushes coverage on SIGTERM (graceful shutdown); Windows hard-kills it,
+      # so only the unix runners contribute server coverage — merged in by Codecov.
+      - run: cargo llvm-cov nextest --locked --profile ci -E 'test(/^visual/) or test(/^e2e/)' --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          flags: browser-${{ matrix.os }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
       - uses: actions/upload-artifact@v7
         if: always()
         with:
