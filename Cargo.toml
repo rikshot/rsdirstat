@@ -33,7 +33,9 @@ codegen-units = 1
 inherits = "release"
 debug = true
 
-# The profile that 'dist' will build with
+# The profile 'dist' builds the shipped binaries with. `dist init` defaults this to
+# `lto = "thin"` for faster release CI, but the prebuilt binaries should be at least as
+# optimized as a `cargo install` (which uses [profile.release]'s fat LTO), so inherit
+# release wholesale rather than downgrading the LTO.
 [profile.dist]
 inherits = "release"
-lto = "thin"
