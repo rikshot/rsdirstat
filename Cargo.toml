@@ -1,17 +1,24 @@
 [workspace]
 members = ["crates/*"]
-default-members = ["crates/cli", "crates/core", "crates/protocol", "crates/server", "crates/wasm"]
+default-members = ["crates/core", "crates/protocol", "crates/rsdirstat", "crates/wasm"]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 description = "Fast, cross-platform disk usage analyzer with a treemap GUI"
 repository = "https://github.com/rikshot/rsdirstat"
+readme = "README.md"
+keywords = ["disk-usage", "treemap", "filesystem", "du", "ncdu"]
+categories = ["filesystem", "command-line-utilities", "visualization"]
 
 [workspace.dependencies]
-rsdirstat-core = { path = "crates/core" }
-rsdirstat-protocol = { path = "crates/protocol" }
+rsdirstat-core = { path = "crates/core", version = "0.1.0" }
+rsdirstat-protocol = { path = "crates/protocol", version = "0.1.0" }
+rsdirstat-macos = { path = "crates/macos", version = "0.1.0" }
+rsdirstat-linux = { path = "crates/linux", version = "0.1.0" }
+rsdirstat-windows = { path = "crates/windows", version = "0.1.0" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dashmap = { version = "6", features = ["inline"] }

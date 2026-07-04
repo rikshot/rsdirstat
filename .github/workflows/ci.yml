@@ -109,8 +109,8 @@ jobs:
       - run: playwright-rs install --with-deps chromium firefox webkit
       - uses: actions/cache@v5
         with:
-          key: visual-baselines-v3-${{ matrix.os }}
-          path: crates/server/tests/snapshots/
+          key: visual-baselines-v4-${{ matrix.os }}
+          path: crates/rsdirstat/tests/snapshots/
       # Build the frontend once here: nextest runs each test in its own process, so leaving the
       # bundle to the test harness would launch many concurrent `trunk build`s that race.
       - run: trunk build
@@ -129,12 +129,12 @@ jobs:
         if: always()
         with:
           name: visual-snapshots-${{ matrix.os }}
-          path: crates/server/tests/snapshots/
+          path: crates/rsdirstat/tests/snapshots/
       # Playwright traces are written only for failing browser tests (retain-on-failure);
       # upload them so a red cross-OS run is debuggable without reproducing locally.
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: playwright-traces-${{ matrix.os }}
-          path: crates/server/tests/traces/
+          path: crates/rsdirstat/tests/traces/
           if-no-files-found: ignore

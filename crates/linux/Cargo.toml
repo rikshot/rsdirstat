@@ -2,7 +2,11 @@
 name = "rsdirstat-linux"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Linux filesystem scanner for rsdirstat (getdents64 + statx)"
+categories = ["filesystem", "os::linux-apis"]
 
 [dependencies]
 rsdirstat-core.workspace = true

@@ -2,7 +2,11 @@
 name = "rsdirstat-protocol"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Wire protocol shared between the rsdirstat server and its WASM frontend"
+categories = ["encoding"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 
-/// Ensure the trunk frontend bundle exists; the server serves it at runtime from
-/// `crates/wasm/dist`, so the e2e/visual tests need it present. This is test-only orchestration
-/// (it never runs during a normal `cargo build`), so it does not reintroduce a build script.
+/// Ensure the trunk frontend bundle exists; debug builds of the server read it from
+/// `crates/rsdirstat/dist` on disk (rust-embed only embeds in release), so the e2e/visual tests
+/// need it present. This is test-only orchestration (it never runs during a normal `cargo build`),
+/// so it does not reintroduce a build script.
 ///
 /// nextest runs every test in its own process, so a `std::sync::Once` cannot serialize this —
 /// dozens of test processes would launch `trunk build` concurrently and race on trunk's shared
@@ -19,7 +20,7 @@ use futures_util::FutureExt;
 fn ensure_frontend_built() {
     // Trunk.toml lives at the workspace root (two levels up from this crate).
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let bundle = root.join("crates/wasm/dist/rsdirstat-wasm.js");
+    let bundle = root.join("crates/rsdirstat/dist/rsdirstat-wasm.js");
     if bundle.exists() {
         return;
     }
@@ -68,13 +69,13 @@ impl TestServer {
 
     fn spawn(args: &[&str]) -> Self {
         ensure_frontend_built();
-        let bin = env!("CARGO_BIN_EXE_rsdirstat-server");
+        let bin = env!("CARGO_BIN_EXE_rsdirstat");
         let mut child = Command::new(bin)
             .args(args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
-            .expect("failed to start rsdirstat-server");
+            .expect("failed to start rsdirstat");
 
         let stderr = child.stderr.take().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();

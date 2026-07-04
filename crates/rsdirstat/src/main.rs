@@ -9,15 +9,15 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use clap::Parser;
 use parking_lot::{Mutex, RwLock};
+use rust_embed::RustEmbed;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, broadcast, watch};
 use tower_http::compression::CompressionLayer;
-use tower_http::services::ServeDir;
 
 use rsdirstat_core::layout::{self, LayoutConfig};
 use rsdirstat_core::tree::FilterConfig;
@@ -31,7 +31,7 @@ use rsdirstat_macos as scanner;
 use rsdirstat_windows as scanner;
 
 #[derive(Parser)]
-#[command(name = "rsdirstat-server", about = "Interactive treemap disk usage server")]
+#[command(name = "rsdirstat", about = "Interactive treemap disk usage server")]
 struct Args {
     /// Path to scan (omit to show volume picker)
     path: Option<PathBuf>,
@@ -241,14 +241,16 @@ async fn run_server(
         state.start.notify_one();
     }
 
-    let static_dir = find_static_dir();
+    if Assets::get("index.html").is_none() {
+        eprintln!("Warning: frontend bundle not embedded — run `trunk build` before building; the GUI will not load.");
+    }
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/start", get(start_handler))
         .route("/volumes", get(volumes_handler))
         .with_state(Arc::clone(&state))
-        .fallback_service(ServeDir::new(&static_dir))
+        .fallback(static_handler)
         .layer(CompressionLayer::new());
 
     // Bind loopback only: the UI is always pointed at localhost, and the server exposes full
@@ -383,21 +385,32 @@ fn start_scan(state: &Arc<AppState>) {
     });
 }
 
-/// Locate the trunk-built frontend bundle. In a dev checkout it lives in the wasm crate's
-/// `dist/` (produced by `trunk build`); a deployed binary expects a `dist/` next to it.
-fn find_static_dir() -> PathBuf {
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../wasm/dist");
-    if dev.is_dir() {
-        return dev;
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        let dir = exe.parent().unwrap_or(std::path::Path::new(".")).join("dist");
-        if dir.is_dir() {
-            return dir;
+/// The trunk-built frontend bundle (`index.html`, wasm, js, css), baked into the binary at
+/// compile time. In release builds the files are embedded; in debug builds `rust-embed` reads
+/// them from `dist/` on disk, so `trunk watch` hot-reloads during development.
+#[derive(RustEmbed)]
+#[folder = "dist"]
+// `allow_missing` lets the crate compile when `dist/` hasn't been built yet — a fresh clone,
+// `cargo clippy`/`cargo test`, or rust-analyzer, none of which run `trunk build`. The bundle is
+// only needed for a working GUI, which the build/publish steps produce (trunk build first);
+// `run_server` warns at startup if it wasn't embedded.
+#[allow_missing = true]
+struct Assets;
+
+/// Serve the embedded frontend. Unknown paths 404, matching the previous `ServeDir` behavior.
+async fn static_handler(uri: Uri) -> Response {
+    let path = match uri.path().trim_start_matches('/') {
+        "" => "index.html",
+        p => p,
+    };
+    match Assets::get(path) {
+        Some(content) => {
+            // Content-type is baked in at compile time by rust-embed's `mime-guess` feature.
+            let mime = content.metadata.mimetype().to_owned();
+            ([(header::CONTENT_TYPE, mime)], content.data).into_response()
         }
+        None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
-    eprintln!("Warning: frontend 'dist/' not found; run `trunk build` in crates/wasm");
-    PathBuf::from(".")
 }
 
 async fn start_handler(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> &'static str {

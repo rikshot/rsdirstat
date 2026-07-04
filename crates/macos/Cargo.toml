@@ -2,7 +2,16 @@
 name = "rsdirstat-macos"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "macOS filesystem scanner for rsdirstat (getattrlistbulk)"
+categories = ["filesystem", "os::macos-apis"]
+
+# docs.rs builds on Linux by default; this crate only compiles for macOS, so point
+# its docs build at a macOS target (rustdoc type-checks without linking).
+[package.metadata.docs.rs]
+default-target = "x86_64-apple-darwin"
 
 [dependencies]
 rsdirstat-core.workspace = true

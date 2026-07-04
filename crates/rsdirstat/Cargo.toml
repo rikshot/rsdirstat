@@ -1,0 +1,50 @@
+[package]
+name = "rsdirstat"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+default-run = "rsdirstat"
+# The frontend bundle in `dist/` is a build artifact (git-ignored, produced by `trunk`);
+# `include` forces it into the published tarball so the embedded assets ship. `tests/` are
+# left out of the package.
+include = ["src/**/*", "dist/**/*"]
+
+# Two binaries, auto-discovered: `src/main.rs` -> `rsdirstat` (the GUI server, default),
+# `src/bin/rsdirstat-cli.rs` -> `rsdirstat-cli` (the top-N reporter).
+
+[dependencies]
+rsdirstat-core.workspace = true
+rsdirstat-protocol.workspace = true
+anyhow.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+clap.workspace = true
+humansize = "2"
+mimalloc = "0.1"
+open = "5"
+parking_lot = "0.12"
+rust-embed = { version = "8", features = ["mime-guess"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "parking_lot"] }
+tower-http = { version = "0.7", features = ["compression-br", "compression-gzip", "compression-zstd"] }
+
+[dev-dependencies]
+playwright-rs = { version = "0.14", features = ["screenshot-diff"] }
+futures-util = "0.3"
+tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rsdirstat-macos.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rsdirstat-linux.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+rsdirstat-windows.workspace = true

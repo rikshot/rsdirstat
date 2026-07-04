@@ -22,33 +22,26 @@ Fast, cross-platform disk usage analyzer with an interactive treemap GUI.
 
 ## Installation
 
-Requires [Rust](https://rustup.rs/) (edition 2024).
-
-The CLI is self-contained:
-
 ```sh
-cargo install --path crates/cli
+cargo install rsdirstat
 ```
 
-The GUI server additionally needs the WASM frontend bundle (see [Building](#building)).
-It loads the bundle from `crates/wasm/dist` when run from a checkout, or from a `dist/`
-directory next to the binary when deployed:
-
-```sh
-trunk build --release              # produces crates/wasm/dist
-cargo install --path crates/server # then run alongside a dist/ directory
-```
+This installs two binaries: **`rsdirstat`** (the GUI server, with the web frontend
+embedded — a single self-contained binary, no extra files needed) and
+**`rsdirstat-cli`** (the terminal top-N reporter). Building from source requires
+[Rust](https://rustup.rs/) 1.88+ (edition 2024); see [Building](#building) to build
+the frontend bundle from a checkout.
 
 ## Usage
 
 ### GUI
 
 ```sh
-rsdirstat-server                 # no path: pick a volume in the browser, then scan
-rsdirstat-server [path]          # scan a path, opens the treemap in your browser
-rsdirstat-server --all [path]    # cross filesystem boundaries
-rsdirstat-server --port 8080 [path]   # fixed port (default: random)
-rsdirstat-server --no-open [path]     # don't auto-open the browser
+rsdirstat                 # no path: pick a volume in the browser, then scan
+rsdirstat [path]          # scan a path, opens the treemap in your browser
+rsdirstat --all [path]    # cross filesystem boundaries
+rsdirstat --port 8080 [path]   # fixed port (default: random)
+rsdirstat --no-open [path]     # don't auto-open the browser
 ```
 
 ### CLI
@@ -63,23 +56,23 @@ rsdirstat-cli --all [path]    # cross filesystem boundaries
 ## Building
 
 The browser frontend is a Rust/WASM app built with [trunk](https://trunkrs.dev), which
-drives `wasm-bindgen` and `wasm-opt` for you:
+drives `wasm-bindgen` and `wasm-opt` for you. A release build **embeds** the bundle into the
+`rsdirstat` binary (via `rust-embed`), so the result is a single self-contained executable —
+no separate files to deploy.
 
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install trunk
 
-# All trunk commands run from the project root (Trunk.toml lives there).
-# Build the frontend bundle (into crates/wasm/dist, git-ignored), then the server:
+# trunk runs from the project root (Trunk.toml lives there) and writes the bundle to
+# crates/rsdirstat/dist (git-ignored). Build it first, then the release binary embeds it:
 trunk build --release
 cargo build --release
 ```
 
-The server serves the bundle from `crates/wasm/dist` in a dev checkout, or from a `dist/`
-directory next to the binary when deployed.
-
-For frontend development, run `trunk watch` (rebuilds `dist/` on change) alongside
-`cargo run -p rsdirstat-server`, and refresh the browser.
+For frontend development, debug builds read the bundle from `crates/rsdirstat/dist` on disk
+instead of embedding it, so run `trunk watch` (rebuilds on change) alongside
+`cargo run -p rsdirstat` and just refresh the browser.
 
 Only the native platform scanner is compiled. Cross-compilation:
 
@@ -97,9 +90,8 @@ cargo xwin build --release --target x86_64-pc-windows-msvc
 crates/
   core/       Shared library: treemap layout, work queue
   protocol/   Shared wire protocol for server and wasm frontend
-  cli/        Command-line interface
-  server/     Web-based treemap server (axum + WebSocket)
-  wasm/       Browser frontend compiled to WebAssembly
+  rsdirstat/  App crate — `rsdirstat` (axum + WebSocket GUI) and `rsdirstat-cli` binaries
+  wasm/       Browser frontend compiled to WebAssembly (embedded into rsdirstat)
   macos/      macOS scanner
   linux/      Linux scanner
   windows/    Windows scanner

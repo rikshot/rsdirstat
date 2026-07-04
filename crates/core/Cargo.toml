@@ -2,7 +2,11 @@
 name = "rsdirstat-core"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Core library for rsdirstat: treemap layout, directory tree, and work queue"
+categories = ["filesystem", "visualization"]
 
 [dependencies]
 rsdirstat-protocol.workspace = true

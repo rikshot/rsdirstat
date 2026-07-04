@@ -1,7 +1,7 @@
 [build]
 # Run trunk from the project root; the frontend lives in the wasm crate.
 target = "crates/wasm/index.html"
-dist = "crates/wasm/dist"
+dist = "crates/rsdirstat/dist"
 # Stable asset names (no content hash): the e2e harness imports the bundle at a
 # fixed path, the axum server serves predictable files, and cache-busting is
 # pointless for a freshly-built, locally-served dev tool.
