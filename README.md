@@ -22,15 +22,37 @@ Fast, cross-platform disk usage analyzer with an interactive treemap GUI.
 
 ## Installation
 
+### Prebuilt binaries
+
+No Rust toolchain required — the installer scripts drop a self-contained binary for your
+platform onto your `PATH`:
+
+**macOS / Linux**
+
 ```sh
-cargo install rsdirstat
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rikshot/rsdirstat/releases/latest/download/rsdirstat-installer.sh | sh
 ```
 
-This installs two binaries: **`rsdirstat`** (the GUI server, with the web frontend
-embedded — a single self-contained binary, no extra files needed) and
-**`rsdirstat-cli`** (the terminal top-N reporter). Building from source requires
-[Rust](https://rustup.rs/) 1.88+ (edition 2024); see [Building](#building) to build
-the frontend bundle from a checkout.
+**Windows (PowerShell)**
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/rikshot/rsdirstat/releases/latest/download/rsdirstat-installer.ps1 | iex"
+```
+
+Or download an archive for your platform directly from the
+[latest release](https://github.com/rikshot/rsdirstat/releases/latest).
+
+### With Cargo
+
+```sh
+cargo binstall rsdirstat   # fetches the prebuilt binaries from the GitHub release
+cargo install rsdirstat    # compiles from source (requires Rust 1.88+, edition 2024)
+```
+
+Every method installs two binaries: **`rsdirstat`** (the GUI server, with the web frontend
+embedded — a single self-contained binary, no extra files needed) and **`rsdirstat-cli`**
+(the terminal top-N reporter). To build the frontend bundle from a checkout, see
+[Building](#building).
 
 ## Usage
 
