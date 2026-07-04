@@ -6,6 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: CI only needs to read the repo. Codecov uploads with its own token
+# and upload-artifact uses the Actions runtime token, so neither needs write scope.
+permissions:
+  contents: read
+
+# Cancel superseded runs for the same ref — but only on pull requests, so every push to
+# main keeps its own CI record.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -14,7 +25,7 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt
@@ -27,7 +38,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
@@ -40,7 +51,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: llvm-tools
@@ -50,9 +61,10 @@ jobs:
       # Run the (non-browser) tests under instrumentation and emit lcov. Each OS runner
       # covers its own native scanner; Codecov merges the three uploads (keyed by flag).
       - run: cargo llvm-cov nextest --locked --profile ci -E 'not test(/^visual/) and not test(/^e2e/)' --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@v5
+      - uses: codecov/codecov-action@v7
         with:
           files: lcov.info
+          disable_search: true
           flags: ${{ matrix.os }}
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
@@ -64,7 +76,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: wasm32-unknown-unknown
@@ -81,7 +93,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: wasm32-unknown-unknown
@@ -89,7 +101,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest,trunk,cargo-llvm-cov
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           key: playwright-1.60.0-${{ runner.os }}
           path: |
@@ -107,7 +119,7 @@ jobs:
       # Node/npx. Pin the CLI to the same version as the dev-dependency so the bundled driver matches.
       - run: cargo install --locked playwright-rs@0.14.0 --features cli
       - run: playwright-rs install --with-deps chromium firefox webkit
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           key: visual-baselines-v4-${{ matrix.os }}
           path: crates/rsdirstat/tests/snapshots/
@@ -119,9 +131,10 @@ jobs:
       # The server flushes coverage on SIGTERM (graceful shutdown); Windows hard-kills it,
       # so only the unix runners contribute server coverage — merged in by Codecov.
       - run: cargo llvm-cov nextest --locked --profile ci -E 'test(/^visual/) or test(/^e2e/)' --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@v5
+      - uses: codecov/codecov-action@v7
         with:
           files: lcov.info
+          disable_search: true
           flags: browser-${{ matrix.os }}
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
@@ -130,6 +143,7 @@ jobs:
         with:
           name: visual-snapshots-${{ matrix.os }}
           path: crates/rsdirstat/tests/snapshots/
+          retention-days: 14
       # Playwright traces are written only for failing browser tests (retain-on-failure);
       # upload them so a red cross-OS run is debuggable without reproducing locally.
       - uses: actions/upload-artifact@v7
@@ -138,3 +152,4 @@ jobs:
           name: playwright-traces-${{ matrix.os }}
           path: crates/rsdirstat/tests/traces/
           if-no-files-found: ignore
+          retention-days: 14
