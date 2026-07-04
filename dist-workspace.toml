@@ -11,6 +11,13 @@ ci = "github"
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Build only the `rsdirstat` package (`cargo build --package`), not the whole
+# workspace. The default unified `cargo build --workspace` tries to compile every
+# member on every runner, but the platform scanner crates (rsdirstat-{linux,macos,
+# windows}) only compile on their native OS — a workspace build fails cross-OS.
+# Building just the app respects its target-gated deps, so each runner pulls in only
+# its own scanner.
+precise-builds = true
 # Run `trunk build --release` before each binary build so rust-embed can embed the
 # compiled frontend bundle into the `rsdirstat` binary (see .github/build-setup.yml).
 github-build-setup = "../build-setup.yml"
