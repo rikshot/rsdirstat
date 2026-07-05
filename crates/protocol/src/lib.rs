@@ -116,7 +116,12 @@ impl ClientMessage {
     }
 }
 
-const COMPRESSION_LEVEL: u8 = 6;
+/// DEFLATE level for `pack`. Kept low on purpose: layout messages are broadcast up to ~20×/sec
+/// during a scan, so compression must stay cheap. Level 1's fast/greedy matching skips the expensive
+/// LZ77 search that dominates higher levels (it was ~37% of server CPU at level 6 on a large scan),
+/// while still shrinking the repetitive rect stream well. `unpack` inflates identically regardless
+/// of the level the sender used.
+const COMPRESSION_LEVEL: u8 = 1;
 /// Sanity backstop against a malicious/corrupt frame inflating to an unreasonable size.
 const MAX_DECOMPRESSED: usize = 256 * 1024 * 1024;
 

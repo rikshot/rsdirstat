@@ -183,6 +183,15 @@ fn layout_node(
     // The zip below relies on squarify emitting exactly one rect per item, in input order.
     debug_assert_eq!(rects.len(), layout_items.len(), "squarify must emit one rect per item");
     for (raw, item) in rects.iter().zip(layout_items.iter()) {
+        // Skip any rect the client won't draw (it filters `w >= 1 && h >= 1`) before it is
+        // serialized + deflated into the payload broadcast ~20×/sec during a scan. This pays off
+        // because directories — unlike files, which aggregate below `min_file_size` — get a rect per
+        // non-empty child with no size floor, so a high-fan-out dir (Windows WinSxS, the driver/
+        // component store) otherwise emits thousands of sub-pixel rects. A sub-pixel rect never
+        // satisfies `can_nest` (which needs >= MIN_NEST_PX), so culling here drops nothing nested.
+        if raw.w < 1.0 || raw.h < 1.0 {
+            continue;
+        }
         match &item.kind {
             ItemKind::Dir { child_id } => {
                 let child_node = tree.nodes.get(child_id);

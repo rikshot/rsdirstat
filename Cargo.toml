@@ -31,6 +31,7 @@ codegen-units = 1
 
 [profile.profiling]
 inherits = "release"
+lto = "thin"
 debug = true
 
 # The profile 'dist' builds the shipped binaries with. `dist init` defaults this to
