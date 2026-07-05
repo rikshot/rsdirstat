@@ -14,11 +14,11 @@ keywords = ["disk-usage", "treemap", "filesystem", "du", "ncdu"]
 categories = ["filesystem", "command-line-utilities", "visualization"]
 
 [workspace.dependencies]
-rsdirstat-core = { path = "crates/core", version = "0.1.1" }
-rsdirstat-protocol = { path = "crates/protocol", version = "0.1.1" }
-rsdirstat-macos = { path = "crates/macos", version = "0.1.1" }
-rsdirstat-linux = { path = "crates/linux", version = "0.1.1" }
-rsdirstat-windows = { path = "crates/windows", version = "0.1.1" }
+rsdirstat-core = { path = "crates/core", version = "0.1.2" }
+rsdirstat-protocol = { path = "crates/protocol", version = "0.1.2" }
+rsdirstat-macos = { path = "crates/macos", version = "0.1.2" }
+rsdirstat-linux = { path = "crates/linux", version = "0.1.2" }
+rsdirstat-windows = { path = "crates/windows", version = "0.1.2" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dashmap = { version = "6", features = ["inline"] }
