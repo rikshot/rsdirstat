@@ -125,7 +125,7 @@ jobs:
           tool: nextest,trunk,cargo-llvm-cov
       - uses: actions/cache@v6
         with:
-          key: playwright-1.60.0-${{ runner.os }}
+          key: playwright-1.62.1-${{ runner.os }}
           path: |
             ~/.cache/ms-playwright
             ~/Library/Caches/ms-playwright
@@ -139,11 +139,13 @@ jobs:
       # the build's target/, it survives compile caching — so we no longer need the old
       # `cargo clean -p playwright-rs` dance (which forced build.rs to re-download into target/), nor
       # Node/npx. Pin the CLI to the same version as the dev-dependency so the bundled driver matches.
-      - run: cargo install --locked playwright-rs@0.14.0 --features cli
+      - run: cargo install --locked playwright-rs@0.17.0 --features cli
       - run: playwright-rs install --with-deps chromium firefox webkit
       - uses: actions/cache@v6
         with:
-          key: visual-baselines-v4-${{ matrix.os }}
+          # Bump on every browser-engine change: the driver's bundled Chromium/Firefox/WebKit
+          # render text and antialiasing differently across majors, so stale baselines fail.
+          key: visual-baselines-v6-${{ matrix.os }}
           path: crates/rsdirstat/tests/snapshots/
       # Build the frontend once here: nextest runs each test in its own process, so leaving the
       # bundle to the test harness would launch many concurrent `trunk build`s that race.

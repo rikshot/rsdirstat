@@ -33,7 +33,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tower-http = { version = "0.7", features = ["compression-br", "compression-gzip", "compression-zstd"] }
 
 [dev-dependencies]
-playwright-rs = { version = "0.14", features = ["screenshot-diff"] }
+playwright-rs = { version = "0.17", features = ["screenshot-diff"] }
 futures-util = "0.3"
 tempfile = "3"
 

@@ -161,7 +161,7 @@ pub async fn launch_browser_sized(
 }
 
 pub async fn wait_for_scan_done(page: &playwright_rs::Page) {
-    let status = page.locator("#status").await;
+    let status = page.locator("#status");
     for _ in 0..100 {
         if let Ok(Some(text)) = status.text_content().await
             && text.contains(" dirs")
