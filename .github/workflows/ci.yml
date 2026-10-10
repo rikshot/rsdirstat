@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           components: rustfmt
       - run: cargo fmt --check
@@ -39,7 +39,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           components: clippy
       - run: cargo clippy --locked --all-targets --no-deps -- -D warnings
@@ -52,7 +52,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           components: llvm-tools
       - uses: taiki-e/install-action@v2
@@ -75,8 +75,8 @@ jobs:
   # higher MSRV and users never build the tests. No `--workspace`: that would drag in
   # the wrong-OS scanner crates (they only compile on their native platform); the
   # default-members set already checks each host's scanner via `rsdirstat`'s deps.
-  # `rustflags: ""` clears the action's default `-D warnings` so a warning emitted by a
-  # dependency under an older rustc can't fail the check.
+  # `build-warnings: ""` drops the action's default `CARGO_BUILD_WARNINGS=deny` so a warning
+  # under an older rustc can't fail the check (cargo 1.88 predates `build.warnings` anyway).
   msrv:
     needs: lint
     strategy:
@@ -85,10 +85,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: "1.88"
-          rustflags: ""
+          build-warnings: ""
       - run: cargo check --locked
 
   build:
@@ -99,7 +99,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           target: wasm32-unknown-unknown
       - uses: taiki-e/install-action@v2
@@ -116,7 +116,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           target: wasm32-unknown-unknown
           components: llvm-tools
