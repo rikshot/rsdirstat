@@ -22,7 +22,7 @@ rsdirstat-windows = { path = "crates/windows", version = "0.1.2" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dashmap = { version = "6", features = ["inline"] }
-libc = "0.2"
+libc = "0.2.190"
 
 [profile.release]
 opt-level = 3

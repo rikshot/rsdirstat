@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
+use playwright_rs::protocol::WaitForFunctionOptions;
 
 /// Ensure the trunk frontend bundle exists; debug builds of the server read it from
 /// `crates/rsdirstat/dist` on disk (rust-embed only embeds in release), so the e2e/visual tests
@@ -160,18 +161,26 @@ pub async fn launch_browser_sized(
     (pw, browser, page)
 }
 
+/// Wait for the scan to finish, then let the treemap settle so callers can
+/// screenshot a stable frame.
+///
+/// `" dirs"` is the completion marker: while scanning, the frontend's interval
+/// timer writes `"Scanning... {n}s"`, and only the layout handler swaps in
+/// `"{dirs} dirs — {size}"`. Polling that predicate inside the page costs one
+/// driver round-trip instead of one per attempt, and the driver enforces the
+/// timeout itself, so a hang reports `Timeout 10000ms exceeded` rather than a
+/// bare panic.
+///
+/// The trailing sleep stays hand-rolled: the treemap paints to a canvas, so
+/// there is no DOM predicate for "render settled" to wait on instead.
 pub async fn wait_for_scan_done(page: &playwright_rs::Page) {
-    let status = page.locator("#status");
-    for _ in 0..100 {
-        if let Ok(Some(text)) = status.text_content().await
-            && text.contains(" dirs")
-        {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("scan did not complete within 10 seconds");
+    page.wait_for_function(
+        "() => document.querySelector('#status')?.textContent?.includes(' dirs')",
+        WaitForFunctionOptions::default().timeout(10_000.0),
+    )
+    .await
+    .expect("scan did not complete within 10 seconds");
+    tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
 /// Directory where Playwright failure traces are written. Only tests that fail

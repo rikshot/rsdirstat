@@ -31,7 +31,7 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
             continue;
         };
 
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let mut stat = libc::statvfs::default();
         if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
             continue;
         }

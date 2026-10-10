@@ -22,7 +22,7 @@ pub fn raise_fd_limit() {
     // The scanner keeps every pending directory fd open at once, so the default soft limit
     // (256 on macOS) is easily exhausted on large trees. Raise it to the hard limit.
     unsafe {
-        let mut rlim: libc::rlimit = std::mem::zeroed();
+        let mut rlim = libc::rlimit::default();
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
             eprintln!("getrlimit(RLIMIT_NOFILE) failed: {}", std::io::Error::last_os_error());
             return;

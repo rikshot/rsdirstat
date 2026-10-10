@@ -17,7 +17,7 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
         };
         let Ok(c_path) = CString::new(mount_str) else { continue };
 
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let mut stat = libc::statvfs::default();
         if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
             continue;
         }
@@ -49,7 +49,7 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
 }
 
 fn fs_type_for(c_path: &CString) -> String {
-    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    let mut buf = libc::statfs::default();
     if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
         return String::new();
     }

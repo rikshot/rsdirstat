@@ -31,6 +31,7 @@ fn makedev(major: u32, minor: u32) -> u64 {
 }
 
 #[repr(C)]
+#[derive(Default)]
 struct StatxTimestamp {
     tv_sec: i64,
     tv_nsec: u32,
@@ -38,6 +39,7 @@ struct StatxTimestamp {
 }
 
 #[repr(C)]
+#[derive(Default)]
 struct Statx {
     stx_mask: u32,
     stx_blksize: u32,
@@ -66,7 +68,7 @@ struct Statx {
 }
 
 fn statx_path(dirfd: i32, name: *const libc::c_char, mask: u32) -> Option<Statx> {
-    let mut buf: Statx = unsafe { std::mem::zeroed() };
+    let mut buf = Statx::default();
     let ret = unsafe {
         libc::syscall(
             libc::SYS_statx,
@@ -81,7 +83,7 @@ fn statx_path(dirfd: i32, name: *const libc::c_char, mask: u32) -> Option<Statx>
 }
 
 fn statx_fd(fd: i32, mask: u32) -> Option<Statx> {
-    let mut buf: Statx = unsafe { std::mem::zeroed() };
+    let mut buf = Statx::default();
     let ret = unsafe {
         libc::syscall(
             libc::SYS_statx,
