@@ -8,7 +8,11 @@ cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell", "powershell"]
+installers = ["shell", "powershell", "homebrew"]
+# The Homebrew tap the formula is pushed to (`brew install rikshot/tap/rsdirstat`)
+tap = "rikshot/homebrew-tap"
+# Publish the formula on release, using the HOMEBREW_TAP_TOKEN secret
+publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Build only the `rsdirstat` package (`cargo build --package`), not the whole

@@ -9,6 +9,7 @@ rust-version = "1.88"
 license = "MIT"
 description = "Fast, cross-platform disk usage analyzer with a treemap GUI"
 repository = "https://github.com/rikshot/rsdirstat"
+homepage = "https://github.com/rikshot/rsdirstat"
 readme = "README.md"
 keywords = ["disk-usage", "treemap", "filesystem", "du", "ncdu"]
 categories = ["filesystem", "command-line-utilities", "visualization"]
