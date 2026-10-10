@@ -18,7 +18,7 @@ use rsdirstat_macos as scanner;
 use rsdirstat_windows as scanner;
 
 #[derive(Parser)]
-#[command(name = "rsdirstat-cli", about = "Blazing fast disk usage scanner")]
+#[command(name = "rsdirstat-cli", version, about = "Blazing fast disk usage scanner")]
 struct Args {
     /// Path to scan
     #[arg(default_value = ".")]

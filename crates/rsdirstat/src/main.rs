@@ -32,7 +32,7 @@ use rsdirstat_macos as scanner;
 use rsdirstat_windows as scanner;
 
 #[derive(Parser)]
-#[command(name = "rsdirstat", about = "Interactive treemap disk usage server")]
+#[command(name = "rsdirstat", version, about = "Interactive treemap disk usage server")]
 struct Args {
     /// Path to scan (omit to show volume picker)
     path: Option<PathBuf>,

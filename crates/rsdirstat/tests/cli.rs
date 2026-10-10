@@ -79,3 +79,19 @@ fn cli_nonexistent_path_fails() {
     let output = rsdirstat_bin().arg("/nonexistent/path/xyz").output().unwrap();
     assert!(!output.status.success());
 }
+
+/// Both binaries answer `-V` / `--version` with their name and the crate version.
+#[test]
+fn version_flags_print_name_and_version() {
+    for (bin, name) in [
+        (env!("CARGO_BIN_EXE_rsdirstat"), "rsdirstat"),
+        (env!("CARGO_BIN_EXE_rsdirstat-cli"), "rsdirstat-cli"),
+    ] {
+        for flag in ["-V", "--version"] {
+            let output = Command::new(bin).arg(flag).output().unwrap();
+            assert!(output.status.success(), "{name} {flag} failed");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.trim(), format!("{name} {}", env!("CARGO_PKG_VERSION")));
+        }
+    }
+}
