@@ -13,8 +13,9 @@ readme.workspace = true
 default-run = "rsdirstat"
 # The frontend bundle in `dist/` is a build artifact (git-ignored, produced by `trunk`);
 # `include` forces it into the published tarball so the embedded assets ship. `tests/` are
-# left out of the package.
-include = ["src/**/*", "dist/**/*"]
+# left out of the package. `LICENSE` is a copy of the workspace one, as in every published
+# crate: cargo can't package a file from outside the crate directory.
+include = ["src/**/*", "dist/**/*", "LICENSE"]
 
 # Two binaries, auto-discovered: `src/main.rs` -> `rsdirstat` (the GUI server, default),
 # `src/bin/rsdirstat-cli.rs` -> `rsdirstat-cli` (the top-N reporter).
