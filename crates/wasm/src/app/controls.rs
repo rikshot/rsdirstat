@@ -228,7 +228,7 @@ impl TreemapApp {
     }
 
     pub(super) fn handle_depth_change(&mut self) -> Result<(), JsValue> {
-        let depth = self.chrome.depth_select.value().parse::<u8>().unwrap_or(5);
+        let depth = self.chrome.depth_select.value().parse::<u8>().unwrap_or(6);
         self.send_message(wire::ClientMessage::SetDepth { depth }.encode())
     }
 

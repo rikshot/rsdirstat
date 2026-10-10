@@ -204,10 +204,14 @@ fn layout_node(
                     hue = age_hue(mtime, min_time, max_time);
                 }
 
-                let can_nest = depth < config.max_depth
+                // `max_depth` is the number of levels shown: this rect sits on level `depth + 1`,
+                // so opening it puts its contents on `depth + 2`. Any folder with room opens up,
+                // including one holding only files — gating on "has sub-folders" left files-only
+                // folders as solid blocks at every depth (issue #5).
+                let can_nest = depth + 1 < config.max_depth
                     && raw.w >= MIN_NEST_PX
                     && raw.h >= MIN_NEST_PX
-                    && child_node.is_some_and(|n| !n.children.is_empty());
+                    && child_node.is_some();
 
                 let (is_container, header_height_value) = if can_nest {
                     (true, header_height(raw.w, raw.h))
@@ -698,39 +702,61 @@ mod tests {
         );
     }
 
+    /// `max_depth` is the number of levels drawn: 1 is a flat map of the view root's children, and
+    /// each step adds one level of nesting (issue #5).
     #[test]
-    fn max_depth_limits_nesting() {
+    fn max_depth_is_levels_shown() {
         let mut tree = DirTree::new();
         tree.insert_dir(1, 0, "root", 0, 100);
         tree.insert_dir(2, 1, "level1", 0, 100);
         tree.insert_dir(3, 2, "level2", 0, 100);
-        tree.insert_dir(4, 3, "level3", 500, 100);
+        tree.insert_dir(4, 3, "level3", 0, 100);
+        tree.insert_dir(5, 4, "level4", 500, 100);
 
-        let config_shallow = LayoutConfig {
+        let levels_drawn = |max_depth: u8| {
+            let config = LayoutConfig {
+                max_depth,
+                ..default_config()
+            };
+            let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+            rects.iter().map(|r| r.depth + 1).max().unwrap_or(0)
+        };
+        for max_depth in 1..=4 {
+            assert_eq!(levels_drawn(max_depth), max_depth, "max_depth={max_depth}");
+        }
+        assert_eq!(levels_drawn(10), 4, "the tree is only 4 levels deep");
+
+        let config = LayoutConfig {
             max_depth: 1,
-            color_mode: 0,
-            filter: FilterConfig::default(),
-            mtime_range: (0, 0),
+            ..default_config()
         };
-        let rects_shallow = compute_layout(&tree, 1, 800.0, 600.0, &config_shallow);
-        let max_depth = rects_shallow.iter().map(|r| r.depth).max().unwrap_or(0);
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
         assert!(
-            max_depth <= 1,
-            "With max_depth=1, deepest rect depth should be <= 1, got {max_depth}"
+            rects.iter().all(|r| !r.is_container),
+            "max_depth=1 should not open any folder"
         );
+    }
 
-        let config_deep = LayoutConfig {
-            max_depth: 10,
-            color_mode: 0,
-            filter: FilterConfig::default(),
-            mtime_range: (0, 0),
-        };
-        let rects_deep = compute_layout(&tree, 1, 800.0, 600.0, &config_deep);
-        let max_depth_deep = rects_deep.iter().map(|r| r.depth).max().unwrap_or(0);
-        assert!(
-            max_depth_deep > 1,
-            "With max_depth=10, should nest deeper than 1, got {max_depth_deep}"
-        );
+    /// A folder holding only files opens up like any other, instead of staying a solid block at
+    /// every depth (issue #5).
+    #[test]
+    fn files_only_folder_shows_its_files() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_dir(2, 1, "scans", 3000, 100);
+        tree.insert_file(2, "a.pdf", 2000, 100);
+        tree.insert_file(2, "b.pdf", 1000, 100);
+
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &default_config());
+        let folder = rects.iter().find(|r| r.name == "scans").unwrap();
+        assert!(folder.is_container, "a files-only folder should open up");
+        let mut files: Vec<&str> = rects
+            .iter()
+            .filter(|r| r.is_file && r.parent_id == 2)
+            .map(|r| r.name.as_str())
+            .collect();
+        files.sort_unstable();
+        assert_eq!(files, ["a.pdf", "b.pdf"]);
     }
 
     #[test]

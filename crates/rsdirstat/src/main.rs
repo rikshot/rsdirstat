@@ -149,7 +149,7 @@ async fn run_server(
         view: Mutex::new(ViewConfig {
             viewport: (0.0, 0.0),
             view_root: None,
-            max_depth: 5,
+            max_depth: 6,
             color_mode: 0,
             filter: FilterConfig::default(),
         }),

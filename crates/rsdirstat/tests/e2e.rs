@@ -86,7 +86,7 @@ async fn toolbar_elements_visible(page: &playwright_rs::Page) {
 
 async fn depth_selector_changes_value(page: &playwright_rs::Page) {
     let depth = page.locator("#depth");
-    assert_eq!(depth.input_value(None).await.unwrap(), "5");
+    assert_eq!(depth.input_value(None).await.unwrap(), "6");
 
     depth.select_option("1", None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
