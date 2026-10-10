@@ -444,7 +444,12 @@ fn origin_is_loopback(origin: &str) -> bool {
     } else {
         authority.rsplit_once(':').map_or(authority, |(h, _)| h)
     };
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    // Compare the host exactly: a prefix test on "127." would also accept a hostname such as
+    // `127.0.0.1.attacker.example`, which an attacker controls and can point at their own page.
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 /// True only if `name` is a single, non-traversing path component (no separators, not `.`/`..`,
@@ -592,4 +597,39 @@ async fn volumes_handler() -> Json<Vec<wire::VolumeInfo>> {
             .await
             .unwrap_or_default(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_origins_are_allowed() {
+        for origin in [
+            "http://localhost:8080",
+            "http://LOCALHOST",
+            "http://127.0.0.1:3000",
+            "http://127.1.2.3",
+            "http://[::1]:8080",
+            "http://[::ffff:127.0.0.1]",
+        ] {
+            assert!(origin_is_loopback(origin), "{origin} should be allowed");
+        }
+    }
+
+    #[test]
+    fn non_loopback_origins_are_rejected() {
+        for origin in [
+            "http://127.0.0.1.attacker.example",
+            "http://127.0.0.1.attacker.example:8080",
+            "https://localhost.attacker.example",
+            "http://example.com",
+            "http://192.168.1.10:8080",
+            "http://[::2]",
+            "null",
+            "",
+        ] {
+            assert!(!origin_is_loopback(origin), "{origin} should be rejected");
+        }
+    }
 }
