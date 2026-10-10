@@ -16,7 +16,6 @@ wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "BinaryType",
     "CanvasRenderingContext2d",
-    "CloseEvent",
     "CssStyleDeclaration",
     "Document",
     "DomTokenList",
@@ -26,7 +25,6 @@ web-sys = { version = "0.3", features = [
     "EventTarget",
     "HtmlButtonElement",
     "HtmlCanvasElement",
-    "HtmlDivElement",
     "HtmlElement",
     "HtmlInputElement",
     "HtmlSelectElement",

@@ -1,240 +1,70 @@
-use super::dom::{add_class, remove_class, with_app};
+use super::dom::{delegated_attribute, listen, set_hidden, with_app};
 use super::network::fetch_volumes;
 use super::*;
+use crate::logic::crumb_label;
 
 impl TreemapApp {
-    pub(super) fn install_event_listeners() -> Result<(), JsValue> {
-        let mousemove = Closure::wrap(Box::new(move |event: MouseEvent| {
-            with_app(|app| {
-                let _ = app.borrow_mut().handle_mousemove(event);
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .surface
-                .canvas
-                .add_event_listener_with_callback("mousemove", mousemove.as_ref().unchecked_ref());
-        });
-        mousemove.forget();
-
-        let mouseleave = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().handle_mouseleave();
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .surface
-                .canvas
-                .add_event_listener_with_callback("mouseleave", mouseleave.as_ref().unchecked_ref());
-        });
-        mouseleave.forget();
-
-        let click = Closure::wrap(Box::new(move |event: MouseEvent| {
-            with_app(|app| {
-                let _ = app.borrow_mut().handle_canvas_click(event);
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .surface
-                .canvas
-                .add_event_listener_with_callback("click", click.as_ref().unchecked_ref());
-        });
-        click.forget();
-
-        let contextmenu = Closure::wrap(Box::new(move |event: MouseEvent| {
+    pub(super) fn install_event_listeners(&self) -> Result<(), JsValue> {
+        let canvas = &self.surface.canvas;
+        listen(canvas, "mousemove", |app, event: MouseEvent| {
+            app.handle_mousemove(event)
+        })?;
+        listen(canvas, "mouseleave", |app, _: Event| app.handle_mouseleave())?;
+        listen(canvas, "click", |app, event: MouseEvent| app.handle_canvas_click(event))?;
+        listen(canvas, "contextmenu", |app, event: MouseEvent| {
             event.prevent_default();
-            with_app(|app| {
-                let _ = app.borrow_mut().handle_context_menu(event);
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .surface
-                .canvas
-                .add_event_listener_with_callback("contextmenu", contextmenu.as_ref().unchecked_ref());
-        });
-        contextmenu.forget();
+            app.handle_context_menu(event)
+        })?;
+        listen(&self.window, "resize", |app, _: Event| app.handle_resize())?;
 
-        let resize = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().handle_resize();
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .window
-                .add_event_listener_with_callback("resize", resize.as_ref().unchecked_ref());
-        });
-        resize.forget();
-
-        let breadcrumb_click = Closure::wrap(Box::new(move |event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().handle_breadcrumb_event(event);
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .chrome
-                .breadcrumb_bar
-                .add_event_listener_with_callback("click", breadcrumb_click.as_ref().unchecked_ref());
-        });
-        breadcrumb_click.forget();
-
+        let chrome = &self.chrome;
+        listen(&chrome.breadcrumb_bar, "click", |app, event: Event| {
+            app.handle_breadcrumb_event(event)
+        })?;
         // One delegated listener on the picker grid instead of a closure per volume card (which
         // leaked one forgotten closure per card on every picker refresh).
-        let picker_click = Closure::wrap(Box::new(move |event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().handle_picker_event(event);
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .chrome
-                .picker_grid
-                .add_event_listener_with_callback("click", picker_click.as_ref().unchecked_ref());
-        });
-        picker_click.forget();
-
-        let depth_change = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().handle_depth_change();
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .chrome
-                .depth_select
-                .add_event_listener_with_callback("change", depth_change.as_ref().unchecked_ref());
-        });
-        depth_change.forget();
-
-        let color_change = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().handle_color_mode_change();
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .chrome
-                .color_mode_select
-                .add_event_listener_with_callback("change", color_change.as_ref().unchecked_ref());
-        });
-        color_change.forget();
-
-        let filter_input = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().schedule_filter_send();
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let app = app.borrow();
-            let _ = app
-                .chrome
-                .filter_ext_input
-                .add_event_listener_with_callback("input", filter_input.as_ref().unchecked_ref());
-            let _ = app
-                .chrome
-                .filter_name_input
-                .add_event_listener_with_callback("input", filter_input.as_ref().unchecked_ref());
-            let _ = app
-                .chrome
-                .filter_min_input
-                .add_event_listener_with_callback("input", filter_input.as_ref().unchecked_ref());
-        });
-        filter_input.forget();
-
-        let filter_min_unit = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().schedule_filter_send();
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .chrome
-                .filter_min_unit_select
-                .add_event_listener_with_callback("change", filter_min_unit.as_ref().unchecked_ref());
-        });
-        filter_min_unit.forget();
-
-        let filter_clear = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().clear_filter();
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .chrome
-                .filter_clear_button
-                .add_event_listener_with_callback("click", filter_clear.as_ref().unchecked_ref());
-        });
-        filter_clear.forget();
-
-        let rescan = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow().send_message(wire::ClientMessage::Rescan.encode());
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .chrome
-                .rescan_button
-                .add_event_listener_with_callback("click", rescan.as_ref().unchecked_ref());
-        });
-        rescan.forget();
-
-        let refresh = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().load_volumes();
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .chrome
-                .picker_refresh_button
-                .add_event_listener_with_callback("click", refresh.as_ref().unchecked_ref());
-        });
-        refresh.forget();
-
-        let change = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().show_picker();
-            });
-        }) as Box<dyn FnMut(_)>);
-        with_app(|app| {
-            let _ = app
-                .borrow()
-                .chrome
-                .change_button
-                .add_event_listener_with_callback("click", change.as_ref().unchecked_ref());
-        });
-        change.forget();
-
-        Ok(())
+        listen(&chrome.picker_grid, "click", |app, event: Event| {
+            app.handle_picker_event(event)
+        })?;
+        listen(&chrome.depth_select, "change", |app, _: Event| {
+            app.handle_depth_change()
+        })?;
+        listen(&chrome.color_mode_select, "change", |app, _: Event| {
+            app.handle_color_mode_change()
+        })?;
+        for input in [
+            &chrome.filter_ext_input,
+            &chrome.filter_name_input,
+            &chrome.filter_min_input,
+        ] {
+            listen(input, "input", |app, _: Event| app.schedule_filter_send())?;
+        }
+        listen(&chrome.filter_min_unit_select, "change", |app, _: Event| {
+            app.schedule_filter_send()
+        })?;
+        listen(&chrome.filter_clear_button, "click", |app, _: Event| app.clear_filter())?;
+        listen(&chrome.rescan_button, "click", |app, _: Event| {
+            app.send_message(ClientMessage::Rescan)
+        })?;
+        listen(&chrome.picker_refresh_button, "click", |app, _: Event| {
+            app.load_volumes()
+        })?;
+        listen(&chrome.change_button, "click", |app, _: Event| app.show_picker())
     }
 
     pub(super) fn handle_depth_change(&mut self) -> Result<(), JsValue> {
-        let depth = self.chrome.depth_select.value().parse::<u8>().unwrap_or(6);
-        self.send_message(wire::ClientMessage::SetDepth { depth }.encode())
+        let depth = self.chrome.depth_select.value().parse().unwrap_or(wire::DEFAULT_DEPTH);
+        self.send_message(ClientMessage::SetDepth { depth })
     }
 
     pub(super) fn handle_color_mode_change(&mut self) -> Result<(), JsValue> {
-        let mode = self.chrome.color_mode_select.value().parse::<u8>().unwrap_or(0);
-        self.send_message(wire::ClientMessage::ColorMode { mode }.encode())
+        let mode = self
+            .chrome
+            .color_mode_select
+            .value()
+            .parse()
+            .unwrap_or(wire::COLOR_MODE_TYPE);
+        self.send_message(ClientMessage::ColorMode { mode })
     }
 
     pub(super) fn schedule_filter_send(&mut self) -> Result<(), JsValue> {
@@ -262,35 +92,30 @@ impl TreemapApp {
         self.chrome.filter_ext_input.set_value("");
         self.chrome.filter_name_input.set_value("");
         self.chrome.filter_min_input.set_value("");
-        self.send_message(wire::ClientMessage::ClearFilter.encode())
+        self.send_message(ClientMessage::ClearFilter)
     }
 
     pub(super) fn send_filter_now(&mut self) -> Result<(), JsValue> {
         self.session.filter_timer_id = None;
-        let ext_value = self.chrome.filter_ext_input.value().trim().to_string();
-        let extensions: Vec<Box<str>> = if ext_value.is_empty() {
-            Vec::new()
-        } else {
-            ext_value
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(Box::from)
-                .collect()
-        };
-        self.send_message(wire::ClientMessage::FilterExt { extensions }.encode())?;
+        let extensions = self
+            .chrome
+            .filter_ext_input
+            .value()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(Box::from)
+            .collect();
+        self.send_message(ClientMessage::FilterExt { extensions })?;
 
         let min_value = self.chrome.filter_min_input.value().parse::<f64>().unwrap_or(0.0);
         let min_unit = self.chrome.filter_min_unit_select.value().parse::<u64>().unwrap_or(1);
-        self.send_message(
-            wire::ClientMessage::FilterSize {
-                min: (min_value * min_unit as f64).floor() as u64,
-                max: 0,
-            }
-            .encode(),
-        )?;
+        self.send_message(ClientMessage::FilterSize {
+            min: (min_value * min_unit as f64).floor() as u64,
+            max: 0,
+        })?;
         let pattern = self.chrome.filter_name_input.value().trim().to_string();
-        self.send_message(wire::ClientMessage::FilterName { pattern }.encode())
+        self.send_message(ClientMessage::FilterName { pattern })
     }
 
     pub(super) fn build_breadcrumb(&mut self) -> Result<(), JsValue> {
@@ -306,7 +131,7 @@ impl TreemapApp {
                 self.chrome.breadcrumb_bar.append_child(&separator)?;
             }
             let span = self.document.create_element("span")?;
-            span.set_text_content(Some(if entry.name.is_empty() { "/" } else { &entry.name }));
+            span.set_text_content(Some(crumb_label(entry)));
             if index + 1 == self.view.breadcrumb.len() {
                 span.set_class_name("current");
             } else {
@@ -319,23 +144,9 @@ impl TreemapApp {
     }
 
     pub(super) fn handle_breadcrumb_event(&mut self, event: Event) -> Result<(), JsValue> {
-        let Some(target) = event.target() else {
-            return Ok(());
-        };
-        let Ok(mut element) = target.dyn_into::<Element>() else {
-            return Ok(());
-        };
-        loop {
-            if let Some(index) = element
-                .get_attribute("data-breadcrumb-index")
-                .and_then(|value| value.parse::<usize>().ok())
-            {
-                return self.handle_breadcrumb_click(index);
-            }
-            let Some(parent) = element.parent_element() else {
-                return Ok(());
-            };
-            element = parent;
+        match delegated_attribute(&event, "data-breadcrumb-index").and_then(|index| index.parse().ok()) {
+            Some(index) => self.handle_breadcrumb_click(index),
+            None => Ok(()),
         }
     }
 
@@ -343,23 +154,20 @@ impl TreemapApp {
         if index + 1 >= self.view.breadcrumb.len() {
             return Ok(());
         }
-        self.begin_navigation(
-            wire::ClientMessage::Navigate {
-                id: self.view.breadcrumb[index].id,
-            }
-            .encode(),
-        )
+        self.begin_navigation(ClientMessage::Navigate {
+            id: self.view.breadcrumb[index].id,
+        })
     }
 
     pub(super) fn show_picker(&mut self) -> Result<(), JsValue> {
-        add_class(&self.chrome.treemap_view, "hidden")?;
-        remove_class(&self.chrome.picker_element, "hidden")?;
+        set_hidden(&self.chrome.treemap_view, true)?;
+        set_hidden(&self.chrome.picker_element, false)?;
         self.load_volumes()
     }
 
     pub(super) fn hide_picker(&mut self) -> Result<(), JsValue> {
-        add_class(&self.chrome.picker_element, "hidden")?;
-        remove_class(&self.chrome.treemap_view, "hidden")?;
+        set_hidden(&self.chrome.picker_element, true)?;
+        set_hidden(&self.chrome.treemap_view, false)?;
         self.resize()
     }
 
@@ -376,7 +184,7 @@ impl TreemapApp {
         Ok(())
     }
 
-    pub(super) fn apply_volume_result(&mut self, result: Result<Vec<VolumeEntry>, JsValue>) -> Result<(), JsValue> {
+    pub(super) fn apply_volume_result(&mut self, result: Result<Vec<VolumeInfo>, JsValue>) -> Result<(), JsValue> {
         self.chrome.picker_grid.set_inner_html("");
         match result {
             Ok(volumes) if volumes.is_empty() => {
@@ -400,7 +208,7 @@ impl TreemapApp {
         Ok(())
     }
 
-    pub(super) fn create_volume_card(&self, volume: VolumeEntry) -> Result<Element, JsValue> {
+    pub(super) fn create_volume_card(&self, volume: VolumeInfo) -> Result<Element, JsValue> {
         let card = self.document.create_element("div")?;
         card.set_class_name("volume-card");
 
@@ -434,8 +242,8 @@ impl TreemapApp {
         sizes.set_class_name("volume-sizes");
         sizes.set_text_content(Some(&format!(
             "{} used of {}",
-            format_size_impl(volume.used_bytes as f64),
-            format_size_impl(volume.total_bytes as f64)
+            format_size(volume.used_bytes),
+            format_size(volume.total_bytes)
         )));
         card.append_child(&sizes)?;
 
@@ -453,25 +261,14 @@ impl TreemapApp {
     }
 
     pub(super) fn handle_picker_event(&mut self, event: Event) -> Result<(), JsValue> {
-        let Some(target) = event.target() else {
-            return Ok(());
-        };
-        let Ok(mut element) = target.dyn_into::<Element>() else {
-            return Ok(());
-        };
-        loop {
-            if let Some(mount) = element.get_attribute("data-mount") {
-                return self.scan_path(mount);
-            }
-            let Some(parent) = element.parent_element() else {
-                return Ok(());
-            };
-            element = parent;
+        match delegated_attribute(&event, "data-mount") {
+            Some(path) => self.scan_path(path),
+            None => Ok(()),
         }
     }
 
     pub(super) fn scan_path(&mut self, path: String) -> Result<(), JsValue> {
         self.hide_picker()?;
-        self.send_message(wire::ClientMessage::ScanPath { path }.encode())
+        self.send_message(ClientMessage::ScanPath { path })
     }
 }

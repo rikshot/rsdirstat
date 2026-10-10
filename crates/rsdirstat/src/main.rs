@@ -7,11 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use axum::Router;
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Json, Router};
 use clap::Parser;
 use parking_lot::{Mutex, RwLock};
 use rust_embed::RustEmbed;
@@ -53,7 +54,7 @@ struct Args {
     wait: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct ViewConfig {
     viewport: (f64, f64),
     view_root: Option<u64>,
@@ -82,21 +83,20 @@ struct ScanState {
     cross_filesystems: bool,
 }
 
+/// Encoded messages are `Bytes` so the snapshot and every receiver share one buffer.
 struct LayoutBroadcast {
-    tx: broadcast::Sender<Vec<u8>>,
-    last: Mutex<Option<Vec<u8>>>,
+    tx: broadcast::Sender<Bytes>,
+    last: Mutex<Option<Bytes>>,
     notify: Notify,
-}
-
-struct ConnectionTracker {
-    count: AtomicU64,
 }
 
 struct AppState {
     scan: ScanState,
     view: Mutex<ViewConfig>,
     layout: LayoutBroadcast,
-    connections: ConnectionTracker,
+    /// Open WebSocket connections; the layout loop idles at zero and the server exits after a
+    /// grace period once the last one closes.
+    connections: AtomicU64,
     start: Notify,
     shutdown: watch::Sender<bool>,
     picker_mode: bool,
@@ -110,28 +110,36 @@ impl AppState {
         self.layout.notify.notify_one();
     }
 
-    /// Mutate the view config under its lock, then trigger a relayout. Collapses the otherwise
-    /// repeated lock-mutate-invalidate dance shared by every view-changing client message.
+    /// Mutate the view config under its lock, then trigger a relayout if anything changed.
+    /// Collapses the otherwise repeated lock-mutate-invalidate dance shared by every view-changing
+    /// client message (the client sends all three filter fields on any filter edit, for example).
     fn update_view(&self, f: impl FnOnce(&mut ViewConfig)) {
-        f(&mut self.view.lock());
-        self.invalidate_layout();
+        let mut view = self.view.lock();
+        let before = view.clone();
+        f(&mut view);
+        let changed = *view != before;
+        drop(view);
+        if changed {
+            self.invalidate_layout();
+        }
     }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_server(args.path, args.all, args.port, args.no_open, args.wait))
+    rt.block_on(run_server(args))
 }
 
-async fn run_server(
-    path: Option<PathBuf>,
-    cross_filesystems: bool,
-    port: u16,
-    no_open: bool,
-    wait: bool,
-) -> Result<()> {
-    let (layout_tx, _) = broadcast::channel::<Vec<u8>>(64);
+async fn run_server(args: Args) -> Result<()> {
+    let Args {
+        path,
+        all: cross_filesystems,
+        port,
+        no_open,
+        wait,
+    } = args;
+    let (layout_tx, _) = broadcast::channel::<Bytes>(64);
     let picker_mode = path.is_none();
     let scan_root = path.map(|p| std::fs::canonicalize(&p).unwrap_or(p)).unwrap_or_default();
 
@@ -149,8 +157,8 @@ async fn run_server(
         view: Mutex::new(ViewConfig {
             viewport: (0.0, 0.0),
             view_root: None,
-            max_depth: 6,
-            color_mode: 0,
+            max_depth: wire::DEFAULT_DEPTH,
+            color_mode: wire::COLOR_MODE_TYPE,
             filter: FilterConfig::default(),
         }),
         layout: LayoutBroadcast {
@@ -158,9 +166,7 @@ async fn run_server(
             last: Mutex::new(None),
             notify: Notify::new(),
         },
-        connections: ConnectionTracker {
-            count: AtomicU64::new(0),
-        },
+        connections: AtomicU64::new(0),
         start: Notify::new(),
         shutdown: watch::channel(false).0,
         picker_mode,
@@ -172,70 +178,7 @@ async fn run_server(
         start_scan(&scan_state);
     });
 
-    let layout_state = Arc::clone(&state);
-    tokio::task::spawn(async move {
-        let mut last_version = 0u64;
-        let mut last_compute = Instant::now();
-
-        loop {
-            tokio::select! {
-                _ = layout_state.layout.notify.notified() => {},
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {},
-            }
-
-            let current_version = layout_state.scan.version.load(Ordering::Acquire);
-            let scan_done = layout_state.scan.done.load(Ordering::Acquire);
-
-            if current_version == last_version || layout_state.connections.count.load(Ordering::Relaxed) == 0 {
-                continue;
-            }
-            if !scan_done && last_compute.elapsed() < Duration::from_millis(45) {
-                continue;
-            }
-
-            let view = layout_state.view.lock().clone();
-            let (vw, vh) = view.viewport;
-            if vw <= 0.0 || vh <= 0.0 {
-                continue;
-            }
-
-            let tree = layout_state.scan.tree.read();
-            let root_id = match tree.root_id {
-                Some(id) => id,
-                None => continue,
-            };
-            let mut view_root = view.view_root.unwrap_or(root_id);
-            if !tree.nodes.contains_key(&view_root) {
-                view_root = root_id;
-            }
-
-            let config = LayoutConfig {
-                max_depth: view.max_depth,
-                color_mode: view.color_mode,
-                filter: view.filter,
-                mtime_range: tree.mtime_range,
-            };
-            let rects = layout::compute_layout(&tree, view_root, vw, vh, &config);
-            let breadcrumb = tree.breadcrumb(view_root);
-            let root_size = tree.recursive_sizes.get(&view_root).copied().unwrap_or(0);
-            let dir_count = tree.nodes.len() as u32;
-            drop(tree);
-
-            let message = wire::ServerMessage::Layout(wire::LayoutPayload {
-                root_size,
-                dir_count,
-                scan_done,
-                breadcrumb,
-                rects,
-            })
-            .encode();
-            *layout_state.layout.last.lock() = Some(message.clone());
-            let _ = layout_state.layout.tx.send(message);
-
-            last_version = current_version;
-            last_compute = Instant::now();
-        }
-    });
+    tokio::task::spawn(layout_loop(Arc::clone(&state)));
 
     if !picker_mode && !wait {
         state.start.notify_one();
@@ -280,24 +223,88 @@ async fn run_server(
     Ok(())
 }
 
+/// Recompute and broadcast the layout whenever the tree or view changes: at most every ~45ms while
+/// a scan streams in, immediately otherwise, and not at all with no clients connected.
+async fn layout_loop(state: Arc<AppState>) {
+    let mut last_version = 0u64;
+    let mut last_compute = Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = state.layout.notify.notified() => {},
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+        }
+
+        let current_version = state.scan.version.load(Ordering::Acquire);
+        let scan_done = state.scan.done.load(Ordering::Acquire);
+
+        if current_version == last_version || state.connections.load(Ordering::Relaxed) == 0 {
+            continue;
+        }
+        if !scan_done && last_compute.elapsed() < Duration::from_millis(45) {
+            continue;
+        }
+
+        let view = state.view.lock().clone();
+        let (vw, vh) = view.viewport;
+        if vw <= 0.0 || vh <= 0.0 {
+            continue;
+        }
+
+        let tree = state.scan.tree.read();
+        let Some(root_id) = tree.root_id else {
+            continue;
+        };
+        let view_root = view
+            .view_root
+            .filter(|id| tree.nodes.contains_key(id))
+            .unwrap_or(root_id);
+
+        let config = LayoutConfig {
+            max_depth: view.max_depth,
+            color_mode: view.color_mode,
+            filter: view.filter,
+            mtime_range: tree.mtime_range,
+        };
+        let rects = layout::compute_layout(&tree, view_root, vw, vh, &config);
+        let breadcrumb = tree.breadcrumb(view_root);
+        let root_size = tree.recursive_sizes.get(&view_root).copied().unwrap_or(0);
+        let dir_count = tree.nodes.len() as u32;
+        drop(tree);
+
+        let message = Bytes::from(
+            wire::ServerMessage::Layout(wire::LayoutPayload {
+                root_size,
+                dir_count,
+                scan_done,
+                breadcrumb,
+                rects,
+            })
+            .encode(),
+        );
+        *state.layout.last.lock() = Some(message.clone());
+        let _ = state.layout.tx.send(message);
+
+        last_version = current_version;
+        last_compute = Instant::now();
+    }
+}
+
 async fn shutdown_signal(state: Arc<AppState>) {
     let mut rx = state.shutdown.subscribe();
     #[cfg(unix)]
-    {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
-        tokio::select! {
-            _ = sigterm.recv() => {},
-            _ = tokio::signal::ctrl_c() => {},
-            _ = rx.changed() => {},
-        }
-    }
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
     #[cfg(not(unix))]
-    {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = rx.changed() => {},
-        }
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = terminate => {},
+        _ = tokio::signal::ctrl_c() => {},
+        _ = rx.changed() => {},
     }
     // Signal all WS handlers to close
     let _ = state.shutdown.send(true);
@@ -340,38 +347,22 @@ fn start_scan(state: &Arc<AppState>) {
 
             let mut tree = relay_state.scan.tree.write();
             for event in events.drain(..) {
-                match event {
-                    ScanEvent::ScanStart { path } => {
-                        tree.clear();
-                        tree.scan_path = path.clone();
-                        relay_state.view.lock().view_root = None;
-                        relay_state.scan.done.store(false, Ordering::Relaxed);
-                        let _ = relay_state
-                            .layout
-                            .tx
-                            .send(wire::ServerMessage::ScanStart { path }.encode());
-                    }
-                    ScanEvent::Dir {
-                        id,
-                        parent,
-                        name,
-                        size,
-                        mtime,
-                    } => {
-                        tree.insert_dir(id, parent, &name, size, mtime);
-                    }
-                    ScanEvent::File {
-                        parent,
-                        name,
-                        size,
-                        mtime,
-                    } => {
-                        tree.insert_file(parent, &name, size, mtime);
-                    }
-                    ScanEvent::ScanDone => {
-                        tree.recompute_sizes();
-                        relay_state.scan.done.store(true, Ordering::Relaxed);
-                    }
+                let start_path = match &event {
+                    ScanEvent::ScanStart { path } => Some(path.clone()),
+                    _ => None,
+                };
+                let done = matches!(event, ScanEvent::ScanDone);
+                tree.apply(event);
+                if let Some(path) = start_path {
+                    relay_state.view.lock().view_root = None;
+                    relay_state.scan.done.store(false, Ordering::Relaxed);
+                    let _ = relay_state
+                        .layout
+                        .tx
+                        .send(wire::ServerMessage::ScanStart { path }.encode().into());
+                }
+                if done {
+                    relay_state.scan.done.store(true, Ordering::Relaxed);
                 }
             }
             drop(tree);
@@ -464,7 +455,7 @@ fn is_safe_component(name: &str) -> bool {
 }
 
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
-    state.connections.count.fetch_add(1, Ordering::Relaxed);
+    state.connections.fetch_add(1, Ordering::Relaxed);
 
     // Subscribe before reading the snapshot: a layout produced between the snapshot read and the
     // subscribe would otherwise be lost to this client (absent from the snapshot, broadcast before
@@ -475,7 +466,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
 
     let last = state.layout.last.lock().clone();
     if let Some(message) = last {
-        if socket.send(Message::Binary(message.into())).await.is_err() {
+        if socket.send(Message::Binary(message)).await.is_err() {
             return;
         }
     } else if state.picker_mode
@@ -502,7 +493,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
             result = layout_rx.recv() => {
                 match result {
                     Ok(message) => {
-                        if socket.send(Message::Binary(message.into())).await.is_err() {
+                        if socket.send(Message::Binary(message)).await.is_err() {
                             break;
                         }
                     }
@@ -514,15 +505,27 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    if state.connections.count.fetch_sub(1, Ordering::Relaxed) == 1 {
+    if state.connections.fetch_sub(1, Ordering::Relaxed) == 1 {
         let server = Arc::clone(&state);
         tokio::spawn(async move {
             tokio::time::sleep(SHUTDOWN_GRACE).await;
             // This timer only spawns when the last connection drops, so a connection always existed.
-            if server.connections.count.load(Ordering::Relaxed) == 0 {
+            if server.connections.load(Ordering::Relaxed) == 0 {
                 let _ = server.shutdown.send(true);
             }
         });
+    }
+}
+
+/// Reveal directory `dir_id`, or the file `name` inside it, in the platform file manager.
+fn reveal(state: &AppState, dir_id: u64, name: Option<&str>) {
+    let root = state.scan.root.lock().clone();
+    let dir = state.scan.tree.read().full_path(dir_id, &root);
+    if let Some(mut path) = dir {
+        if let Some(name) = name {
+            path.push(name);
+        }
+        reveal_in_file_manager(&path);
     }
 }
 
@@ -550,24 +553,12 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
             state.update_view(|v| v.viewport = (width as f64, height as f64));
         }
         ClientMessage::Navigate { id } => state.update_view(|v| v.view_root = Some(id)),
-        ClientMessage::RevealDir { id } => {
-            let root = state.scan.root.lock().clone();
-            let tree = state.scan.tree.read();
-            if let Some(path) = tree.full_path(id, &root) {
-                drop(tree);
-                reveal_in_file_manager(&path);
-            }
-        }
+        ClientMessage::RevealDir { id } => reveal(state, id, None),
         ClientMessage::RevealFile { dir_id, name } => {
             // `name` is attacker-controllable over the WS; only join a single, non-traversing
             // component so it can't escape the resolved directory with `..` or an absolute path.
             if is_safe_component(&name) {
-                let root = state.scan.root.lock().clone();
-                let tree = state.scan.tree.read();
-                if let Some(path) = tree.full_path(dir_id, &root).map(|p| p.join(&name)) {
-                    drop(tree);
-                    reveal_in_file_manager(&path);
-                }
+                reveal(state, dir_id, Some(&name));
             }
         }
         ClientMessage::Rescan => {
@@ -595,46 +586,10 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
     }
 }
 
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c < '\u{20}' => {
-                use std::fmt::Write;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-async fn volumes_handler(
-    axum::extract::State(_state): axum::extract::State<Arc<AppState>>,
-) -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
-    let volumes = tokio::task::spawn_blocking(scanner::volumes::list_volumes)
-        .await
-        .unwrap_or_default();
-    let entries: Vec<String> = volumes
-        .iter()
-        .map(|v| {
-            format!(
-                r#"{{"name":"{}","mountPoint":"{}","totalBytes":{},"usedBytes":{},"fsType":"{}"}}"#,
-                json_escape(&v.name),
-                json_escape(&v.mount_point),
-                v.total_bytes,
-                v.used_bytes,
-                json_escape(&v.fs_type),
-            )
-        })
-        .collect();
-    (
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        format!("[{}]", entries.join(",")),
+async fn volumes_handler() -> Json<Vec<wire::VolumeInfo>> {
+    Json(
+        tokio::task::spawn_blocking(scanner::volumes::list_volumes)
+            .await
+            .unwrap_or_default(),
     )
 }

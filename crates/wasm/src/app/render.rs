@@ -1,3 +1,4 @@
+use super::dom::window_inner_size;
 use super::*;
 
 impl TreemapApp {
@@ -34,14 +35,13 @@ impl TreemapApp {
             self.surface
                 .ctx
                 .fill_rect(0.0, 0.0, self.surface.canvas_width, self.surface.canvas_height);
-            let progress = ((self.now() - zoom_anim.start_time) / zoom_anim.duration).min(1.0);
-            let interpolated = zoom_anim.interpolate(ease_out(progress));
-            draw_rects(&self.surface.ctx, &interpolated, 1.0, false)?;
+            let progress = ((self.now() - zoom_anim.start_time) / ZOOM_DURATION).min(1.0);
+            let interpolated = zoom_anim.plan.interpolate(ease_out(progress));
+            draw_rects(&self.surface.ctx, &interpolated, false)?;
+            // `tick` keeps scheduling frames while the animation is live.
             if progress >= 1.0 {
                 self.view.zoom_anim = None;
                 self.view.buffer_dirty = true;
-            } else {
-                self.view.dirty = true;
             }
         } else {
             if self.view.buffer_dirty {
@@ -49,7 +49,7 @@ impl TreemapApp {
                 self.surface
                     .buffer_context
                     .fill_rect(0.0, 0.0, self.surface.canvas_width, self.surface.canvas_height);
-                draw_rects(&self.surface.buffer_context, &self.view.rects, 1.0, true)?;
+                draw_rects(&self.surface.buffer_context, &self.view.rects, true)?;
                 self.view.buffer_dirty = false;
             }
             self.surface.ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)?;
@@ -70,19 +70,8 @@ impl TreemapApp {
     }
 
     pub(super) fn resize(&mut self) -> Result<(), JsValue> {
-        let width = self
-            .window
-            .inner_width()?
-            .as_f64()
-            .ok_or_else(|| JsValue::from_str("missing innerWidth"))?;
-        let height = self
-            .window
-            .inner_height()?
-            .as_f64()
-            .ok_or_else(|| JsValue::from_str("missing innerHeight"))?
-            - BREADCRUMB_HEIGHT
-            - TOOLBAR_HEIGHT
-            - PATH_BAR_HEIGHT;
+        let (width, inner_height) = window_inner_size(&self.window)?;
+        let height = inner_height - BREADCRUMB_HEIGHT - TOOLBAR_HEIGHT - PATH_BAR_HEIGHT;
         self.surface
             .canvas
             .style()
@@ -169,15 +158,15 @@ fn truncate_label(ctx: &CanvasRenderingContext2d, label: &str, max_width: f64) -
 /// across colour-batched draws is a real saving.
 #[derive(Default)]
 struct DrawState {
-    fill: Option<Box<str>>,
+    fill: Option<&'static str>,
     font: Option<Box<str>>,
 }
 
 impl DrawState {
-    fn fill(&mut self, ctx: &CanvasRenderingContext2d, color: &str) {
-        if self.fill.as_deref() != Some(color) {
+    fn fill(&mut self, ctx: &CanvasRenderingContext2d, color: &'static str) {
+        if self.fill != Some(color) {
             ctx.set_fill_style_str(color);
-            self.fill = Some(color.into());
+            self.fill = Some(color);
         }
     }
 
@@ -187,18 +176,6 @@ impl DrawState {
             self.font = Some(font.into());
         }
     }
-}
-
-fn body_color(rect: &RenderRect) -> &str {
-    if rect.is_container {
-        rect.color_background.as_deref().unwrap_or(&rect.color_dark)
-    } else {
-        &rect.color_dark
-    }
-}
-
-fn header_color(rect: &RenderRect) -> &str {
-    rect.color_header.as_deref().unwrap_or(&rect.color_dark)
 }
 
 /// Fill an axis-aligned box. Above `ROUND_MIN` in both dimensions we use a rounded `fill()` path
@@ -239,7 +216,7 @@ fn draw_container_label(
     let (label, text_width) = truncate_label(ctx, &rect.name, available_width)?;
     if text_width <= available_width {
         ctx.fill_text(&label, x + 4.0, y + visible_header_height / 2.0)?;
-        let size_label = format_size_impl(rect.size as f64);
+        let size_label = format_size(rect.size);
         if text_width + ctx.measure_text(&format!("  {size_label}"))?.width() <= available_width {
             state.fill(ctx, "rgba(255,255,255,0.45)");
             ctx.fill_text(
@@ -284,7 +261,7 @@ fn draw_leaf_label(
         let small_font_size = (font_size - 2).max(8);
         state.font(ctx, &format!("{small_font_size}px {FONT}"));
         state.fill(ctx, "rgba(255,255,255,0.55)");
-        let size_label = format_size_impl(rect.size as f64);
+        let size_label = format_size(rect.size);
         if ctx.measure_text(&size_label)?.width() <= available_width {
             ctx.fill_text(&size_label, x + 4.0, y + 3.0 + font_size as f64 + 2.0)?;
         }
@@ -298,15 +275,7 @@ fn draw_leaf_label(
 /// are gone — the `GAP` between rects already separates them (a hovered rect is still outlined by
 /// the overlay). During the zoom animation `draw_labels` is false: text is the costliest per-rect
 /// work and is illegible mid-transition, so it is skipped until the view settles.
-fn draw_rects(
-    ctx: &CanvasRenderingContext2d,
-    rects: &[RenderRect],
-    alpha: f64,
-    draw_labels: bool,
-) -> Result<(), JsValue> {
-    if alpha != 1.0 {
-        ctx.set_global_alpha(alpha);
-    }
+fn draw_rects(ctx: &CanvasRenderingContext2d, rects: &[RenderRect], draw_labels: bool) -> Result<(), JsValue> {
     let mut state = DrawState::default();
 
     let mut order: Vec<usize> = (0..rects.len())
@@ -316,7 +285,7 @@ fn draw_rects(
         rects[a]
             .depth
             .cmp(&rects[b].depth)
-            .then_with(|| body_color(&rects[a]).cmp(body_color(&rects[b])))
+            .then_with(|| rects[a].fill.cmp(rects[b].fill))
     });
 
     // Pass 1 — bodies.
@@ -325,7 +294,7 @@ fn draw_rects(
         if w < 0.5 || h < 0.5 {
             continue;
         }
-        state.fill(ctx, body_color(&rects[i]));
+        state.fill(ctx, rects[i].fill);
         fill_shape(ctx, x, y, w, h)?;
     }
 
@@ -336,7 +305,7 @@ fn draw_rects(
         .copied()
         .filter(|&i| rects[i].is_container && rects[i].header_height > 0.0)
         .collect();
-    headers.sort_by(|&a, &b| header_color(&rects[a]).cmp(header_color(&rects[b])));
+    headers.sort_by_key(|&i| rects[i].header_fill);
     for &i in &headers {
         let (x, y, w, h) = inset_rect(&rects[i]);
         if w < 4.0 || h < 4.0 {
@@ -346,7 +315,7 @@ fn draw_rects(
         if header_height <= 0.0 {
             continue;
         }
-        state.fill(ctx, header_color(&rects[i]));
+        state.fill(ctx, rects[i].header_fill);
         fill_shape(ctx, x, y, w, header_height)?;
     }
 
@@ -365,9 +334,6 @@ fn draw_rects(
         }
     }
 
-    if alpha != 1.0 {
-        ctx.set_global_alpha(1.0);
-    }
     Ok(())
 }
 

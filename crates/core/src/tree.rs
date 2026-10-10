@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use rsdirstat_protocol::ScanEvent;
+
 use crate::color::{hash_name, hue_for_extension};
 
 pub struct FileEntry {
@@ -21,7 +23,7 @@ pub struct DirNode {
     pub mtime: i64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct FilterConfig {
     pub extensions: Vec<Box<str>>,
     pub min_size: u64,
@@ -103,58 +105,67 @@ impl DirTree {
         self.hue_cache.clear();
     }
 
-    pub fn insert_dir(&mut self, id: u64, parent: u64, name: &str, size: u64, mtime: i64) {
-        let hue = hash_name(name);
+    /// Fold one scanner event into the tree; `ScanDone` finalizes the recursive sizes.
+    pub fn apply(&mut self, event: ScanEvent) {
+        match event {
+            ScanEvent::ScanStart { path } => {
+                self.clear();
+                self.scan_path = path;
+            }
+            ScanEvent::Dir {
+                id,
+                parent,
+                name,
+                size,
+                mtime,
+            } => self.insert_dir(id, parent, name, size, mtime),
+            ScanEvent::File {
+                parent,
+                name,
+                size,
+                mtime,
+            } => self.insert_file(parent, name, size, mtime),
+            ScanEvent::ScanDone => self.recompute_sizes(),
+        }
+    }
+
+    /// `name` is taken by value so a scanner's `String` moves in without a second allocation.
+    pub fn insert_dir(&mut self, id: u64, parent: u64, name: impl Into<Box<str>>, size: u64, mtime: i64) {
+        let name = name.into();
+        let hue = hash_name(&name);
 
         if parent == 0 {
             if self.root_id.is_none() {
                 self.root_id = Some(id);
             }
         } else {
-            let parent_node = self.nodes.entry(parent).or_default();
-            parent_node.children.push(id);
+            self.nodes.entry(parent).or_default().children.push(id);
         }
 
         self.update_mtime_range(mtime);
 
-        match self.nodes.get_mut(&id) {
-            Some(existing) => {
-                existing.parent = parent;
-                existing.name = name.into();
-                existing.direct_size = size;
-                existing.hue = hue;
-                existing.mtime = mtime;
-            }
-            None => {
-                self.nodes.insert(
-                    id,
-                    DirNode {
-                        parent,
-                        name: name.into(),
-                        direct_size: size,
-                        children: Vec::new(),
-                        files: Vec::new(),
-                        hue,
-                        mtime,
-                    },
-                );
-            }
-        }
+        // A child's events can precede its own `Dir` event, so the node may already exist (holding
+        // those children/files); either way only the directory's own fields are (re)set here.
+        let node = self.nodes.entry(id).or_default();
+        node.parent = parent;
+        node.name = name;
+        node.direct_size = size;
+        node.hue = hue;
+        node.mtime = mtime;
 
         self.propagate_size(id, size);
     }
 
-    pub fn insert_file(&mut self, parent: u64, name: &str, size: u64, mtime: i64) {
-        let hue = self.cached_extension_hue(name);
+    pub fn insert_file(&mut self, parent: u64, name: impl Into<Box<str>>, size: u64, mtime: i64) {
+        let name = name.into();
+        let hue = self.cached_extension_hue(&name);
         self.update_mtime_range(mtime);
 
-        let node = self.nodes.entry(parent).or_default();
-        node.files.push(FileEntry {
-            name: name.into(),
-            size,
-            hue,
-            mtime,
-        });
+        self.nodes
+            .entry(parent)
+            .or_default()
+            .files
+            .push(FileEntry { name, size, hue, mtime });
     }
 
     fn update_mtime_range(&mut self, mtime: i64) {
@@ -189,29 +200,28 @@ impl DirTree {
         }
     }
 
+    /// The whole tree in pre-order (every parent before its children), starting at the root.
     pub fn bottom_up_order(&self) -> Vec<u64> {
-        let root_id = match self.root_id {
-            Some(id) => id,
-            None => return Vec::new(),
-        };
-        let mut stack = vec![root_id];
-        let mut order = Vec::with_capacity(self.nodes.len());
+        self.root_id.map_or_else(Vec::new, |root| self.subtree_order(root))
+    }
+
+    fn subtree_order(&self, root: u64) -> Vec<u64> {
+        let mut stack = vec![root];
+        let mut order = Vec::new();
         while let Some(id) = stack.pop() {
             order.push(id);
             if let Some(node) = self.nodes.get(&id) {
-                for &child in &node.children {
-                    stack.push(child);
-                }
+                stack.extend(&node.children);
             }
         }
         order
     }
 
-    /// Bottom-up fold: each node's size is `own_size(node)` plus the already-folded sizes of its
-    /// children. Shared by the recursive-size and filtered-size passes (they differ only in the
-    /// per-node "own" term).
-    fn fold_sizes(&self, own_size: impl Fn(&DirNode) -> u64) -> HashMap<u64, u64> {
-        let order = self.bottom_up_order();
+    /// Bottom-up fold over the subtree under `root`: each node's size is `own_size(node)` plus the
+    /// already-folded sizes of its children. Shared by the recursive-size and filtered-size passes
+    /// (they differ only in the per-node "own" term).
+    fn fold_sizes(&self, root: u64, own_size: impl Fn(&DirNode) -> u64) -> HashMap<u64, u64> {
+        let order = self.subtree_order(root);
         let mut sizes = HashMap::with_capacity(order.len());
         for &id in order.iter().rev() {
             if let Some(node) = self.nodes.get(&id) {
@@ -226,11 +236,16 @@ impl DirTree {
     }
 
     pub fn recompute_sizes(&mut self) {
-        self.recursive_sizes = self.fold_sizes(|node| node.direct_size);
+        self.recursive_sizes = match self.root_id {
+            Some(root) => self.fold_sizes(root, |node| node.direct_size),
+            None => HashMap::new(),
+        };
     }
 
-    pub fn compute_filtered_sizes(&self, filter: &FilterConfig) -> HashMap<u64, u64> {
-        self.fold_sizes(|node| {
+    /// Sizes counting only the files `filter` matches, for the subtree under `root` (the layout
+    /// never looks outside the directory being viewed).
+    pub fn compute_filtered_sizes(&self, filter: &FilterConfig, root: u64) -> HashMap<u64, u64> {
+        self.fold_sizes(root, |node| {
             node.files
                 .iter()
                 .filter(|file| filter.matches_file(&file.name, file.size))
@@ -242,8 +257,8 @@ impl DirTree {
         let root_id = self.root_id.unwrap_or(0);
         let mut path = Vec::new();
         let mut current = view_root;
-        // Bound the walk by the node count: a corrupt parent cycle (e.g. inode collision under
-        // --all) must not hang a request, since the server calls this on every layout.
+        // Bound the walk by the node count: a corrupt parent cycle must not hang a request, since
+        // the server calls this on every layout.
         for _ in 0..=self.nodes.len() {
             let Some(node) = self.nodes.get(&current) else { break };
             let name = if node.name.is_empty() {
@@ -277,11 +292,8 @@ impl DirTree {
             }
             current = node.parent;
         }
-        parts.reverse();
         let mut path = root_path.to_path_buf();
-        for part in parts {
-            path.push(part);
-        }
+        path.extend(parts.iter().rev());
         Some(path)
     }
 }
@@ -678,11 +690,16 @@ mod tests {
             extensions: vec!["rs".into()],
             ..Default::default()
         };
-        let sizes = tree.compute_filtered_sizes(&filter);
+        let sizes = tree.compute_filtered_sizes(&filter, 1);
         // src dir: main.rs(500) + lib.rs(300) = 800
         assert_eq!(sizes[&2], 800);
         // root: sum of children = 800
         assert_eq!(sizes[&1], 800);
+
+        // Folding from a subtree covers just that subtree.
+        let sizes = tree.compute_filtered_sizes(&filter, 2);
+        assert_eq!(sizes.get(&2), Some(&800));
+        assert_eq!(sizes.get(&1), None);
     }
 
     #[test]
@@ -693,7 +710,7 @@ mod tests {
         tree.insert_file(1, "b.rs", 200, 100);
 
         let filter = FilterConfig::default();
-        let sizes = tree.compute_filtered_sizes(&filter);
+        let sizes = tree.compute_filtered_sizes(&filter, 1);
         assert_eq!(sizes[&1], 300);
     }
 }

@@ -9,19 +9,20 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use js_sys::{Array, ArrayBuffer, Date, Function, Reflect, Uint8Array};
-use rsdirstat_protocol::{self as wire, BreadcrumbEntry, LayoutPayload, ServerMessage};
+use rsdirstat_protocol::{self as wire, BreadcrumbEntry, ClientMessage, LayoutPayload, ServerMessage, VolumeInfo};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
+use wasm_bindgen::convert::FromWasmAbi;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    BinaryType, CanvasRenderingContext2d, Document, Element, Event, HtmlButtonElement, HtmlCanvasElement, HtmlElement,
-    HtmlInputElement, HtmlSelectElement, MessageEvent, MouseEvent, Response, UrlSearchParams, WebSocket, Window,
+    BinaryType, CanvasRenderingContext2d, Document, Element, Event, EventTarget, HtmlButtonElement, HtmlCanvasElement,
+    HtmlElement, HtmlInputElement, HtmlSelectElement, MessageEvent, MouseEvent, Response, UrlSearchParams, WebSocket,
+    Window,
 };
 
 use self::dom::{by_id, canvas_context, query, with_app};
-use crate::format_size_impl;
-use crate::logic::RenderRect;
+use crate::logic::{InterpolationPlan, RenderRect, format_size};
 
 const BACKGROUND: &str = "#1a1a2e";
 const BREADCRUMB_HEIGHT: f64 = 32.0;
@@ -40,24 +41,10 @@ thread_local! {
     static APP: RefCell<Option<Rc<RefCell<TreemapApp>>>> = const { RefCell::new(None) };
 }
 
+/// A navigation zoom in progress: `ZOOM_DURATION` ms of interpolation from `start_time`.
 struct ZoomAnim {
-    plan: crate::logic::InterpolationPlan,
+    plan: InterpolationPlan,
     start_time: f64,
-    duration: f64,
-}
-
-impl ZoomAnim {
-    fn new(from: Vec<RenderRect>, to: &[RenderRect], start_time: f64) -> Self {
-        Self {
-            plan: crate::logic::InterpolationPlan::new(&from, to),
-            start_time,
-            duration: ZOOM_DURATION,
-        }
-    }
-
-    fn interpolate(&self, progress: f64) -> Vec<RenderRect> {
-        self.plan.interpolate(progress)
-    }
 }
 
 // Closures are held only to keep them alive for the WebSocket's lifetime (RAII); they are
@@ -112,7 +99,6 @@ struct ViewState {
     rects: Vec<RenderRect>,
     rect_index_by_id: HashMap<u64, usize>,
     breadcrumb: Vec<BreadcrumbEntry>,
-    breadcrumb_parts: Vec<String>,
     rendered_breadcrumb: Vec<BreadcrumbEntry>,
     view_root_size: u64,
     zoom_anim: Option<ZoomAnim>,
@@ -121,8 +107,8 @@ struct ViewState {
     buffer_dirty: bool,
     hovered_index: Option<usize>,
     hovered_ancestor_indices: Vec<usize>,
-    last_mouse_x: f64,
-    last_mouse_y: f64,
+    /// Last pointer position over the canvas, if the pointer is on it.
+    last_mouse: Option<(f64, f64)>,
     scan_done: bool,
 }
 
@@ -146,15 +132,6 @@ struct TreemapApp {
     session: SessionState,
 }
 
-#[derive(Clone)]
-struct VolumeEntry {
-    name: String,
-    mount_point: String,
-    total_bytes: u64,
-    used_bytes: u64,
-    fs_type: String,
-}
-
 /// `devicePixelRatio` can report 0 in some headless/embedded contexts; fall back to 1 so the
 /// canvas backing store is never sized to zero.
 fn effective_pixel_ratio(window: &Window) -> f64 {
@@ -165,14 +142,11 @@ fn effective_pixel_ratio(window: &Window) -> f64 {
 pub fn start_browser_app() -> Result<(), JsValue> {
     let app = Rc::new(RefCell::new(TreemapApp::new()?));
     APP.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&app)));
-    TreemapApp::install_event_listeners()?;
-    {
-        let mut app = app.borrow_mut();
-        app.resize()?;
-        app.connect()?;
-        app.schedule_tick()?;
-    }
-    Ok(())
+    let mut app = app.borrow_mut();
+    app.install_event_listeners()?;
+    app.resize()?;
+    app.connect()?;
+    app.schedule_tick()
 }
 
 impl TreemapApp {
@@ -182,28 +156,32 @@ impl TreemapApp {
 
         let canvas: HtmlCanvasElement = by_id(&document, "treemap")?;
         let ctx = canvas_context(&canvas)?;
-        let breadcrumb_bar: HtmlElement = by_id(&document, "crumbs")?;
         let tooltip_element: HtmlElement = by_id(&document, "tooltip")?;
-        let status_element: HtmlElement = by_id(&document, "status")?;
-        let path_text_element: HtmlElement = by_id(&document, "path-text")?;
-        let path_size_element: HtmlElement = by_id(&document, "path-size")?;
-        let tooltip_name: HtmlElement = query(&tooltip_element, ".tip-name")?;
-        let tooltip_size: HtmlElement = query(&tooltip_element, ".tip-size")?;
-        let tooltip_percent: HtmlElement = query(&tooltip_element, ".tip-percent")?;
-        let tooltip_mtime: HtmlElement = query(&tooltip_element, ".tip-mtime")?;
-        let treemap_view: HtmlElement = by_id(&document, "treemap-view")?;
         let picker_element: HtmlElement = by_id(&document, "picker")?;
-        let change_button: HtmlButtonElement = by_id(&document, "change")?;
-        let rescan_button: HtmlButtonElement = by_id(&document, "rescan")?;
-        let depth_select: HtmlSelectElement = by_id(&document, "depth")?;
-        let color_mode_select: HtmlSelectElement = by_id(&document, "color-mode")?;
-        let filter_ext_input: HtmlInputElement = by_id(&document, "filter-ext")?;
-        let filter_name_input: HtmlInputElement = by_id(&document, "filter-name")?;
-        let filter_min_input: HtmlInputElement = by_id(&document, "filter-min")?;
-        let filter_min_unit_select: HtmlSelectElement = by_id(&document, "filter-min-unit")?;
-        let filter_clear_button: HtmlButtonElement = by_id(&document, "filter-clear")?;
-        let picker_grid: HtmlElement = query(&picker_element, ".picker-grid")?;
-        let picker_refresh_button: HtmlButtonElement = query(&picker_element, ".picker-refresh")?;
+        let chrome = ChromeElements {
+            breadcrumb_bar: by_id(&document, "crumbs")?,
+            status_element: by_id(&document, "status")?,
+            path_text_element: by_id(&document, "path-text")?,
+            path_size_element: by_id(&document, "path-size")?,
+            tooltip_name: query(&tooltip_element, ".tip-name")?,
+            tooltip_size: query(&tooltip_element, ".tip-size")?,
+            tooltip_percent: query(&tooltip_element, ".tip-percent")?,
+            tooltip_mtime: query(&tooltip_element, ".tip-mtime")?,
+            treemap_view: by_id(&document, "treemap-view")?,
+            change_button: by_id(&document, "change")?,
+            rescan_button: by_id(&document, "rescan")?,
+            depth_select: by_id(&document, "depth")?,
+            color_mode_select: by_id(&document, "color-mode")?,
+            filter_ext_input: by_id(&document, "filter-ext")?,
+            filter_name_input: by_id(&document, "filter-name")?,
+            filter_min_input: by_id(&document, "filter-min")?,
+            filter_min_unit_select: by_id(&document, "filter-min-unit")?,
+            filter_clear_button: by_id(&document, "filter-clear")?,
+            picker_grid: query(&picker_element, ".picker-grid")?,
+            picker_refresh_button: query(&picker_element, ".picker-refresh")?,
+            tooltip_element,
+            picker_element,
+        };
 
         let buffer_canvas = document
             .create_element("canvas")?
@@ -221,30 +199,7 @@ impl TreemapApp {
         Ok(Self {
             window,
             document,
-            chrome: ChromeElements {
-                breadcrumb_bar,
-                tooltip_element,
-                status_element,
-                path_text_element,
-                path_size_element,
-                tooltip_name,
-                tooltip_size,
-                tooltip_percent,
-                tooltip_mtime,
-                treemap_view,
-                picker_element,
-                change_button,
-                rescan_button,
-                depth_select,
-                color_mode_select,
-                filter_ext_input,
-                filter_name_input,
-                filter_min_input,
-                filter_min_unit_select,
-                filter_clear_button,
-                picker_grid,
-                picker_refresh_button,
-            },
+            chrome,
             surface: SurfaceState {
                 canvas,
                 ctx,
@@ -261,7 +216,6 @@ impl TreemapApp {
                 rects: Vec::new(),
                 rect_index_by_id: HashMap::new(),
                 breadcrumb: Vec::new(),
-                breadcrumb_parts: Vec::new(),
                 rendered_breadcrumb: Vec::new(),
                 view_root_size: 0,
                 zoom_anim: None,
@@ -270,8 +224,7 @@ impl TreemapApp {
                 buffer_dirty: true,
                 hovered_index: None,
                 hovered_ancestor_indices: Vec::new(),
-                last_mouse_x: -1.0,
-                last_mouse_y: -1.0,
+                last_mouse: None,
                 scan_done: false,
             },
             session: SessionState {
@@ -291,10 +244,5 @@ impl TreemapApp {
             .performance()
             .map(|performance| performance.now())
             .unwrap_or(0.0)
-    }
-
-    fn rebuild_view_caches(&mut self) {
-        self.view.rect_index_by_id = crate::logic::build_rect_index(&self.view.rects);
-        self.view.breadcrumb_parts = crate::logic::build_breadcrumb_parts(&self.view.breadcrumb);
     }
 }

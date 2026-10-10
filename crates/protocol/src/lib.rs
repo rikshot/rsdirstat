@@ -8,7 +8,7 @@ pub struct BreadcrumbEntry {
 
 /// Layout geometry is kept in f64 (layout-space precision); it is shared by the layout engine,
 /// the server, and the client and serialized as-is.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LayoutRect {
     pub id: i64,
     pub parent_id: u64,
@@ -34,6 +34,38 @@ pub struct LayoutPayload {
     pub scan_done: bool,
     pub breadcrumb: Vec<BreadcrumbEntry>,
     pub rects: Vec<LayoutRect>,
+}
+
+/// Default number of treemap levels shown (the frontend's `#depth` select starts on it too).
+pub const DEFAULT_DEPTH: u8 = 6;
+/// Highest selectable depth; `SetDepth` is clamped to `1..=MAX_DEPTH`.
+pub const MAX_DEPTH: u8 = 10;
+/// `ColorMode` values: colour rects by file type, or by modification time.
+pub const COLOR_MODE_TYPE: u8 = 0;
+pub const COLOR_MODE_AGE: u8 = 1;
+
+/// A mounted volume, as served (JSON, camelCase keys) by the `/volumes` endpoint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeInfo {
+    pub name: String,
+    pub mount_point: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub fs_type: String,
+}
+
+impl VolumeInfo {
+    /// `used_bytes` is `total - free`, saturating in case a filesystem reports more free than total.
+    pub fn new(name: String, mount_point: String, total_bytes: u64, free_bytes: u64, fs_type: String) -> Self {
+        Self {
+            name,
+            mount_point,
+            total_bytes,
+            used_bytes: total_bytes.saturating_sub(free_bytes),
+            fs_type,
+        }
+    }
 }
 
 /// Scanner → server internal events (not sent over WebSocket).
@@ -108,8 +140,8 @@ impl ClientMessage {
     /// mode to their valid ranges and lower-case the name filter for case-insensitive matching.
     fn normalize(&mut self) {
         match self {
-            ClientMessage::SetDepth { depth } => *depth = (*depth).clamp(1, 10),
-            ClientMessage::ColorMode { mode } if *mode > 1 => *mode = 0,
+            ClientMessage::SetDepth { depth } => *depth = (*depth).clamp(1, MAX_DEPTH),
+            ClientMessage::ColorMode { mode } if *mode > COLOR_MODE_AGE => *mode = COLOR_MODE_TYPE,
             ClientMessage::FilterName { pattern } => *pattern = pattern.to_ascii_lowercase(),
             _ => {}
         }

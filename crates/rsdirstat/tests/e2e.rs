@@ -3,28 +3,15 @@ mod common;
 use std::time::Duration;
 
 use common::{TestServer, create_test_dir, launch_browser, wait_for_scan_done};
+use playwright_rs::protocol::WaitForOptions;
 
-async fn setup_with(
-    browser_name: &str,
-) -> (
-    tempfile::TempDir,
-    TestServer,
-    playwright_rs::Playwright,
-    playwright_rs::Browser,
-    playwright_rs::Page,
-) {
-    let dir = create_test_dir();
+/// Serve a scan of `dir`, open it in `browser_name`, wait for the scan, then run `f` on the page.
+/// Traced under `<browser>-<case>` from navigation onward, so a `wait_for_scan_done` timeout — the
+/// most likely cross-OS flake — is captured, not just failures inside `f`.
+async fn run_in<F: AsyncFn(&playwright_rs::Page)>(browser_name: &str, case: &str, dir: tempfile::TempDir, f: F) {
     let server = TestServer::start(dir.path());
-    let (pw, browser, page) = launch_browser(browser_name).await;
-    (dir, server, pw, browser, page)
-}
-
-async fn run<F: AsyncFn(&playwright_rs::Page)>(browser_name: &str, f: F) {
-    let (_dir, server, _pw, browser, page) = setup_with(browser_name).await;
-    let label = common::trace_label(browser_name, std::any::type_name::<F>());
-    // Trace from navigation onward so a `wait_for_scan_done` timeout — the most
-    // likely cross-OS flake — is captured, not just failures inside `f`.
-    common::with_trace_unit(&page, &label, async {
+    let (_pw, browser, page) = launch_browser(browser_name).await;
+    common::with_trace_unit(&page, &common::trace_label(browser_name, case), async {
         page.goto(&server.url, None).await.unwrap();
         wait_for_scan_done(&page).await;
         f(&page).await;
@@ -33,28 +20,17 @@ async fn run<F: AsyncFn(&playwright_rs::Page)>(browser_name: &str, f: F) {
     let _ = browser.close().await;
 }
 
-async fn setup_picker() -> (
-    TestServer,
-    playwright_rs::Playwright,
-    playwright_rs::Browser,
-    playwright_rs::Page,
-) {
-    let server = TestServer::start_picker();
-    let (pw, browser, page) = launch_browser("chromium").await;
-    (server, pw, browser, page)
-}
-
 async fn run_picker<F: AsyncFn(&playwright_rs::Page)>(f: F) {
-    let (server, _pw, browser, page) = setup_picker().await;
+    let server = TestServer::start_picker();
+    let (_pw, browser, page) = launch_browser("chromium").await;
     let label = common::trace_label("chromium", std::any::type_name::<F>());
     common::with_trace_unit(&page, &label, async {
         page.goto(&format!("{}/?picker", server.url), None).await.unwrap();
-        for _ in 0..50 {
-            if page.locator("#picker").is_visible().await.unwrap_or(false) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        // Best effort: `f` asserts on the picker itself, with a clearer message.
+        let _ = page
+            .locator("#picker")
+            .wait_for(WaitForOptions::builder().timeout(5_000.0).build())
+            .await;
         f(&page).await;
     })
     .await;
@@ -239,13 +215,10 @@ async fn picker_volume_click_starts_scan(page: &playwright_rs::Page) {
 
     // Just wait for the treemap view to appear (MSG_SCAN_START triggers this immediately,
     // before the actual scan produces results — safe for CI regardless of disk size)
-    for _ in 0..100 {
-        if page.locator("#treemap-view").is_visible().await.unwrap_or(false) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("treemap view did not appear after clicking volume");
+    page.locator("#treemap-view")
+        .wait_for(WaitForOptions::builder().timeout(10_000.0).build())
+        .await
+        .expect("treemap view did not appear after clicking volume");
 }
 
 async fn picker_has_volume_details(page: &playwright_rs::Page) {
@@ -283,46 +256,17 @@ async fn picker_has_volume_details(page: &playwright_rs::Page) {
     assert!(sizes.contains("used of"), "should show usage: {sizes}");
 }
 
-async fn click_leaf_directory_navigates(browser_name: &str) {
-    // Regression test: clicking a directory with no subdirectories (a "leaf" in the
-    // tree) should navigate into it. Before the fix, findNavigableContainer required
-    // isContainer=true, which is only set on directories large enough to show nested
-    // children. Leaf directories aren't containers, so clicking them fell through to
-    // the parent — navigating up instead of into the clicked directory.
-    //
-    // We use a dedicated test dir where the single largest directory ("big") has no
-    // subdirectories, ensuring the center click lands on a non-container rect.
+/// A tree whose largest folder ("big") has no sub-folders, so a click in the middle of the treemap
+/// lands inside it (on its file). Regression fixture: such a folder once wasn't a container, and
+/// clicking it navigated to its parent instead of into it.
+fn leaf_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir(root.join("big")).unwrap();
     std::fs::write(root.join("big").join("a.bin"), vec![0u8; 10_000_000]).unwrap();
     std::fs::create_dir(root.join("small")).unwrap();
     std::fs::write(root.join("small").join("b.bin"), vec![0u8; 1_000_000]).unwrap();
-
-    let server = TestServer::start(root);
-    let (_pw, browser, page) = launch_browser(browser_name).await;
-    let label = common::trace_label(browser_name, "click_leaf_directory_navigates");
-    common::with_trace_unit(&page, &label, async {
-        page.goto(&server.url, None).await.unwrap();
-        wait_for_scan_done(&page).await;
-
-        let crumbs = page.locator("#crumbs");
-        let initial_text = crumbs.text_content().await.unwrap().unwrap();
-        let initial_parts: Vec<&str> = initial_text.split('/').collect();
-
-        page.locator("#treemap").click(None).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-
-        let after_text = crumbs.text_content().await.unwrap().unwrap();
-        let after_parts: Vec<&str> = after_text.split('/').collect();
-
-        assert!(
-            after_parts.len() > initial_parts.len(),
-            "clicking a leaf dir should navigate into it: before={initial_text}, after={after_text}"
-        );
-    })
-    .await;
-    let _ = browser.close().await;
+    dir
 }
 
 async fn rescan_button_works(page: &playwright_rs::Page) {
@@ -340,189 +284,6 @@ async fn rescan_button_works(page: &playwright_rs::Page) {
     );
 }
 
-#[tokio::test]
-async fn e2e_page_title_chromium() {
-    run("chromium", page_title).await;
-}
-#[tokio::test]
-async fn e2e_status_bar_chromium() {
-    run("chromium", status_bar_shows_scan_results).await;
-}
-#[tokio::test]
-async fn e2e_breadcrumb_chromium() {
-    run("chromium", breadcrumb_shows_root).await;
-}
-#[tokio::test]
-async fn e2e_toolbar_chromium() {
-    run("chromium", toolbar_elements_visible).await;
-}
-#[tokio::test]
-async fn e2e_depth_chromium() {
-    run("chromium", depth_selector_changes_value).await;
-}
-#[tokio::test]
-async fn e2e_color_mode_chromium() {
-    run("chromium", color_mode_changes_layout).await;
-}
-#[tokio::test]
-async fn e2e_filter_ext_chromium() {
-    run("chromium", filter_by_extension).await;
-}
-#[tokio::test]
-async fn e2e_filter_name_chromium() {
-    run("chromium", filter_by_name).await;
-}
-#[tokio::test]
-async fn e2e_filter_size_chromium() {
-    run("chromium", filter_by_min_size).await;
-}
-#[tokio::test]
-async fn e2e_tooltip_chromium() {
-    run("chromium", hover_shows_tooltip).await;
-}
-#[tokio::test]
-async fn e2e_path_bar_chromium() {
-    run("chromium", hover_shows_path_bar).await;
-}
-#[tokio::test]
-async fn e2e_navigate_chromium() {
-    run("chromium", click_navigates_into_directory).await;
-}
-#[tokio::test]
-async fn e2e_breadcrumb_back_chromium() {
-    run("chromium", breadcrumb_click_navigates_back).await;
-}
-#[tokio::test]
-async fn e2e_click_leaf_dir_chromium() {
-    click_leaf_directory_navigates("chromium").await;
-}
-#[tokio::test]
-async fn e2e_rescan_chromium() {
-    run("chromium", rescan_button_works).await;
-}
-
-#[tokio::test]
-async fn e2e_page_title_firefox() {
-    run("firefox", page_title).await;
-}
-#[tokio::test]
-async fn e2e_status_bar_firefox() {
-    run("firefox", status_bar_shows_scan_results).await;
-}
-#[tokio::test]
-async fn e2e_breadcrumb_firefox() {
-    run("firefox", breadcrumb_shows_root).await;
-}
-#[tokio::test]
-async fn e2e_toolbar_firefox() {
-    run("firefox", toolbar_elements_visible).await;
-}
-#[tokio::test]
-async fn e2e_depth_firefox() {
-    run("firefox", depth_selector_changes_value).await;
-}
-#[tokio::test]
-async fn e2e_color_mode_firefox() {
-    run("firefox", color_mode_changes_layout).await;
-}
-#[tokio::test]
-async fn e2e_filter_ext_firefox() {
-    run("firefox", filter_by_extension).await;
-}
-#[tokio::test]
-async fn e2e_filter_name_firefox() {
-    run("firefox", filter_by_name).await;
-}
-#[tokio::test]
-async fn e2e_filter_size_firefox() {
-    run("firefox", filter_by_min_size).await;
-}
-#[tokio::test]
-async fn e2e_tooltip_firefox() {
-    run("firefox", hover_shows_tooltip).await;
-}
-#[tokio::test]
-async fn e2e_path_bar_firefox() {
-    run("firefox", hover_shows_path_bar).await;
-}
-#[tokio::test]
-async fn e2e_navigate_firefox() {
-    run("firefox", click_navigates_into_directory).await;
-}
-#[tokio::test]
-async fn e2e_breadcrumb_back_firefox() {
-    run("firefox", breadcrumb_click_navigates_back).await;
-}
-#[tokio::test]
-async fn e2e_click_leaf_dir_firefox() {
-    click_leaf_directory_navigates("firefox").await;
-}
-#[tokio::test]
-async fn e2e_rescan_firefox() {
-    run("firefox", rescan_button_works).await;
-}
-
-#[tokio::test]
-async fn e2e_page_title_webkit() {
-    run("webkit", page_title).await;
-}
-#[tokio::test]
-async fn e2e_status_bar_webkit() {
-    run("webkit", status_bar_shows_scan_results).await;
-}
-#[tokio::test]
-async fn e2e_breadcrumb_webkit() {
-    run("webkit", breadcrumb_shows_root).await;
-}
-#[tokio::test]
-async fn e2e_toolbar_webkit() {
-    run("webkit", toolbar_elements_visible).await;
-}
-#[tokio::test]
-async fn e2e_depth_webkit() {
-    run("webkit", depth_selector_changes_value).await;
-}
-#[tokio::test]
-async fn e2e_color_mode_webkit() {
-    run("webkit", color_mode_changes_layout).await;
-}
-#[tokio::test]
-async fn e2e_filter_ext_webkit() {
-    run("webkit", filter_by_extension).await;
-}
-#[tokio::test]
-async fn e2e_filter_name_webkit() {
-    run("webkit", filter_by_name).await;
-}
-#[tokio::test]
-async fn e2e_filter_size_webkit() {
-    run("webkit", filter_by_min_size).await;
-}
-#[tokio::test]
-async fn e2e_tooltip_webkit() {
-    run("webkit", hover_shows_tooltip).await;
-}
-#[tokio::test]
-async fn e2e_path_bar_webkit() {
-    run("webkit", hover_shows_path_bar).await;
-}
-#[tokio::test]
-async fn e2e_navigate_webkit() {
-    run("webkit", click_navigates_into_directory).await;
-}
-#[tokio::test]
-async fn e2e_breadcrumb_back_webkit() {
-    run("webkit", breadcrumb_click_navigates_back).await;
-}
-#[tokio::test]
-async fn e2e_click_leaf_dir_webkit() {
-    click_leaf_directory_navigates("webkit").await;
-}
-#[tokio::test]
-async fn e2e_rescan_webkit() {
-    run("webkit", rescan_button_works).await;
-}
-
 async fn js_unit_tests(page: &playwright_rs::Page) {
     let result = page
         .evaluate_value(
@@ -534,18 +295,47 @@ async fn js_unit_tests(page: &playwright_rs::Page) {
     assert!(result.starts_with("PASS"), "JS unit tests failed: {result}");
 }
 
-// Browser unit tests — run in browser via Playwright, testing actual wasm exports
-#[tokio::test]
-async fn e2e_js_unit_tests_chromium() {
-    run("chromium", js_unit_tests).await;
+/// Every case runs once per browser, as `e2e_<browser>::<name>` (CI selects them by the `e2e`
+/// prefix). A case runs against `create_test_dir()` unless it names another fixture with `in`.
+macro_rules! browser_tests {
+    (@fixture) => { create_test_dir() };
+    (@fixture $fixture:ident) => { $fixture() };
+    (@browser $module:ident, $browser:literal, $($name:ident => $case:ident $(in $fixture:ident)?),*) => {
+        mod $module {
+            use super::*;
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    run_in($browser, stringify!($name), browser_tests!(@fixture $($fixture)?), super::$case).await;
+                }
+            )*
+        }
+    };
+    ($($name:ident => $case:ident $(in $fixture:ident)?),* $(,)?) => {
+        browser_tests!(@browser e2e_chromium, "chromium", $($name => $case $(in $fixture)?),*);
+        browser_tests!(@browser e2e_firefox, "firefox", $($name => $case $(in $fixture)?),*);
+        browser_tests!(@browser e2e_webkit, "webkit", $($name => $case $(in $fixture)?),*);
+    };
 }
-#[tokio::test]
-async fn e2e_js_unit_tests_firefox() {
-    run("firefox", js_unit_tests).await;
-}
-#[tokio::test]
-async fn e2e_js_unit_tests_webkit() {
-    run("webkit", js_unit_tests).await;
+
+browser_tests! {
+    page_title => page_title,
+    status_bar => status_bar_shows_scan_results,
+    breadcrumb => breadcrumb_shows_root,
+    toolbar => toolbar_elements_visible,
+    depth => depth_selector_changes_value,
+    color_mode => color_mode_changes_layout,
+    filter_ext => filter_by_extension,
+    filter_name => filter_by_name,
+    filter_size => filter_by_min_size,
+    tooltip => hover_shows_tooltip,
+    path_bar => hover_shows_path_bar,
+    navigate => click_navigates_into_directory,
+    breadcrumb_back => breadcrumb_click_navigates_back,
+    click_leaf_dir => click_navigates_into_directory in leaf_dir,
+    rescan => rescan_button_works,
+    // In-browser unit checks of the actual wasm exports.
+    js_unit_tests => js_unit_tests,
 }
 
 // Picker mode tests (chromium only — testing server/UI logic, not browser compat)

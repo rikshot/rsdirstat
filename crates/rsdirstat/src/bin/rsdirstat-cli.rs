@@ -1,3 +1,7 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use std::cmp::Reverse;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -42,32 +46,19 @@ fn main() -> Result<()> {
     let handle = std::thread::spawn(move || scanner::scan::scan(&scan_root, args.all, tx));
 
     let mut tree = DirTree::new();
-    let mut file_entries: Vec<(u64, String, u64)> = Vec::new();
+    let mut files: Vec<(u64, String, u64)> = Vec::new();
 
     while let Ok(event) = rx.recv() {
         match event {
-            ScanEvent::ScanStart { .. } => {}
-            ScanEvent::Dir {
-                id,
-                parent,
-                name,
-                size,
-                mtime,
-            } => {
-                tree.insert_dir(id, parent, &name, size, mtime);
-            }
-            ScanEvent::File {
-                parent,
-                name,
-                size,
-                mtime,
-            } => {
-                tree.insert_file(parent, &name, size, mtime);
+            // Directory sizes come from the `Dir` events alone, so files are only kept (outside
+            // the tree) when listing them.
+            ScanEvent::File { parent, name, size, .. } => {
                 if args.files {
-                    file_entries.push((parent, name, size));
+                    files.push((parent, name, size));
                 }
             }
             ScanEvent::ScanDone => break,
+            event => tree.apply(event),
         }
     }
 
@@ -75,45 +66,40 @@ fn main() -> Result<()> {
     tree.recompute_sizes();
 
     if args.files {
-        let top = args.top.min(file_entries.len());
-        if top > 0 {
-            file_entries.select_nth_unstable_by(top - 1, |a, b| b.2.cmp(&a.2));
-            file_entries.truncate(top);
-            file_entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.2));
-            print_entries(file_entries.iter().map(|(parent, name, size)| {
-                let mut path = tree.full_path(*parent, &root).unwrap_or_default();
-                path.push(name);
-                (path, *size)
-            }));
-        }
+        top_n(&mut files, args.top, |&(_, _, size)| size);
+        print_entries(
+            files
+                .iter()
+                .map(|(parent, name, size)| (tree.full_path(*parent, &root).unwrap_or_default().join(name), *size)),
+        );
     } else {
-        let mut dir_list: Vec<(u64, u64)> = tree.recursive_sizes.iter().map(|(&id, &size)| (id, size)).collect();
-        let top = args.top.min(dir_list.len());
-        if top > 0 {
-            dir_list.select_nth_unstable_by(top - 1, |a, b| b.1.cmp(&a.1));
-            dir_list.truncate(top);
-            dir_list.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
-            print_entries(
-                dir_list
-                    .iter()
-                    .map(|(id, size)| (tree.full_path(*id, &root).unwrap_or_default(), *size)),
-            );
-        }
+        let mut dirs: Vec<(u64, u64)> = tree.recursive_sizes.iter().map(|(&id, &size)| (id, size)).collect();
+        top_n(&mut dirs, args.top, |&(_, size)| size);
+        print_entries(
+            dirs.iter()
+                .map(|&(id, size)| (tree.full_path(id, &root).unwrap_or_default(), size)),
+        );
     }
 
     Ok(())
 }
 
+/// Keep only the `n` entries with the largest `key`, sorted largest first.
+fn top_n<T>(items: &mut Vec<T>, n: usize, key: impl Fn(&T) -> u64) {
+    let n = n.min(items.len());
+    if n == 0 {
+        items.clear();
+        return;
+    }
+    items.select_nth_unstable_by_key(n - 1, |item| Reverse(key(item)));
+    items.truncate(n);
+    items.sort_unstable_by_key(|item| Reverse(key(item)));
+}
+
 fn print_entries(entries: impl Iterator<Item = (PathBuf, u64)>) {
-    let entries: Vec<_> = entries.collect();
-    let formatted: Vec<(String, &PathBuf)> = entries
-        .iter()
-        .map(|(path, size)| (format_size(*size, BINARY), path))
-        .collect();
-
-    let max_width = formatted.iter().map(|(s, _)| s.len()).max().unwrap_or(0);
-
-    for (size_str, path) in &formatted {
-        println!("{size_str:>width$}  {}", path.display(), width = max_width);
+    let rows: Vec<(String, PathBuf)> = entries.map(|(path, size)| (format_size(size, BINARY), path)).collect();
+    let width = rows.iter().map(|(size, _)| size.len()).max().unwrap_or(0);
+    for (size, path) in &rows {
+        println!("{size:>width$}  {}", path.display());
     }
 }

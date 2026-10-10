@@ -21,31 +21,15 @@ fn scan_to_tree(root: &Path) -> (DirTree, Vec<(u64, String, u64)>) {
     let mut tree = DirTree::new();
     let mut files = Vec::new();
 
-    while let Ok(event) = rx.recv() {
-        match event {
-            ScanEvent::ScanStart { .. } => {}
-            ScanEvent::Dir {
-                id,
-                parent,
-                name,
-                size,
-                mtime,
-            } => tree.insert_dir(id, parent, &name, size, mtime),
-            ScanEvent::File {
-                parent,
-                name,
-                size,
-                mtime,
-            } => {
-                tree.insert_file(parent, &name, size, mtime);
-                files.push((parent, name, size));
-            }
-            ScanEvent::ScanDone => break,
+    // Runs until the scanner and its workers drop their senders; `ScanDone` recomputes sizes.
+    for event in rx {
+        if let ScanEvent::File { parent, name, size, .. } = &event {
+            files.push((*parent, name.clone(), *size));
         }
+        tree.apply(event);
     }
 
     handle.join().unwrap();
-    tree.recompute_sizes();
     (tree, files)
 }
 
@@ -167,7 +151,7 @@ fn scanner_handles_empty_directory() {
 #[test]
 fn scanner_reports_positive_mtime() {
     let dir = create_test_dir();
-    let (tree, files) = scan_to_tree(dir.path());
+    let (tree, _) = scan_to_tree(dir.path());
 
     for node in tree.nodes.values() {
         if node.parent != 0 {
@@ -180,15 +164,13 @@ fn scanner_reports_positive_mtime() {
         }
     }
 
-    for (_, name, _) in &files {
-        // Files are in node.files, check via the tree
-        for node in tree.nodes.values() {
-            for file in &node.files {
-                if &*file.name == name.as_str() {
-                    assert!(file.mtime > 0, "file '{}' has non-positive mtime {}", name, file.mtime);
-                }
-            }
-        }
+    for file in tree.nodes.values().flat_map(|node| &node.files) {
+        assert!(
+            file.mtime > 0,
+            "file '{}' has non-positive mtime {}",
+            file.name,
+            file.mtime
+        );
     }
 }
 

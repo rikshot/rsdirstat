@@ -123,9 +123,17 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest,trunk,cargo-llvm-cov
+      # Each playwright-rs release bundles one driver build, so its version (read from the lockfile,
+      # never repeated here) keys the browser cache and pins the CLI below.
+      - id: playwright
+        shell: bash
+        run: |
+          version=$(tr -d '\r' < Cargo.lock | grep -A1 '^name = "playwright-rs"$' | sed -n 's/^version = "\(.*\)"$/\1/p')
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v6
         with:
-          key: playwright-1.63.0-${{ runner.os }}
+          key: playwright-rs-${{ steps.playwright.outputs.version }}-${{ runner.os }}
           path: |
             ~/.cache/ms-playwright
             ~/Library/Caches/ms-playwright
@@ -137,9 +145,9 @@ jobs:
       # library's build.rs put the driver in the OS user cache (~/.cache/playwright-rust/<version>/).
       # Because that cache is independent of the build's target/, it survives compile caching — so we
       # no longer need the old `cargo clean -p playwright-rs` dance (which forced build.rs to
-      # re-download into target/), nor Node/npx. Pin the CLI to the same version as the
-      # dev-dependency so the bundled driver matches.
-      - run: cargo install --locked playwright-rs@0.19.0 --features cli
+      # re-download into target/), nor Node/npx. The CLI matches the dev-dependency's version so the
+      # bundled driver matches.
+      - run: cargo install --locked playwright-rs@${{ steps.playwright.outputs.version }} --features cli
       - run: playwright-rs install --with-deps chromium firefox webkit
       - uses: actions/cache@v6
         with:

@@ -1,5 +1,4 @@
 use std::sync::{Condvar, Mutex};
-use std::thread;
 use std::time::Duration;
 
 /// Combine a `(device, inode)` pair into a stable node id. Inodes are only unique within a single
@@ -67,7 +66,11 @@ struct WorkQueueInner<T> {
 
 pub struct WorkQueue<T> {
     inner: Mutex<WorkQueueInner<T>>,
+    /// Wakes workers blocked in `take()` when items arrive or the work runs out.
     condvar: Condvar,
+    /// Wakes `wait_with_stall_detection` once `pending` reaches zero. Kept apart from `condvar` so
+    /// a `push`'s `notify_one` can never be absorbed by the waiter instead of an idle worker.
+    idle: Condvar,
 }
 
 impl<T> Default for WorkQueue<T> {
@@ -84,6 +87,7 @@ impl<T> WorkQueue<T> {
                 pending: 0,
             }),
             condvar: Condvar::new(),
+            idle: Condvar::new(),
         }
     }
 
@@ -130,6 +134,7 @@ impl<T> WorkQueue<T> {
         inner.pending = inner.pending.saturating_sub(1);
         if inner.pending == 0 {
             self.condvar.notify_all();
+            self.idle.notify_all();
         }
     }
 
@@ -142,6 +147,7 @@ impl<T> WorkQueue<T> {
         inner.pending = 0;
         inner.queue.clear();
         self.condvar.notify_all();
+        self.idle.notify_all();
     }
 
     #[cfg(test)]
@@ -149,22 +155,31 @@ impl<T> WorkQueue<T> {
         self.inner.lock().unwrap().queue.len()
     }
 
+    /// Block until all work is done. Returns as soon as `pending` hits zero; while work remains it
+    /// samples progress every 200ms and gives up (calling `on_stall`, then `cancel`) after ~3s
+    /// without any change.
     pub fn wait_with_stall_detection(&self, on_stall: impl Fn()) {
         let mut stall_count = 0u32;
         let mut last_pending = usize::MAX;
+        let mut inner = self.inner.lock().unwrap();
         loop {
-            thread::sleep(Duration::from_millis(200));
-            let pending = self.pending();
+            inner = self
+                .idle
+                .wait_timeout_while(inner, Duration::from_millis(200), |inner| inner.pending != 0)
+                .unwrap()
+                .0;
+            let pending = inner.pending;
             if pending == 0 {
                 break;
             }
             if pending == last_pending {
                 stall_count += 1;
                 if stall_count >= 15 {
+                    drop(inner);
                     eprintln!("Scan stalled with {pending} items pending, finishing with partial results");
                     on_stall();
                     self.cancel();
-                    break;
+                    return;
                 }
             } else {
                 stall_count = 0;
@@ -178,6 +193,7 @@ impl<T> WorkQueue<T> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn push_and_take_lifo() {
@@ -326,6 +342,30 @@ mod tests {
             unique_threads >= 2,
             "only {unique_threads} thread(s) participated — work queue lost parallelism"
         );
+    }
+
+    #[test]
+    fn wait_returns_as_soon_as_work_finishes() {
+        let q = Arc::new(WorkQueue::new());
+        q.push(vec![1]);
+        let worker = {
+            let q = Arc::clone(&q);
+            thread::spawn(move || {
+                while q.take().is_some() {
+                    thread::sleep(Duration::from_millis(10));
+                    q.finish_one();
+                }
+            })
+        };
+        let started = std::time::Instant::now();
+        q.wait_with_stall_detection(|| panic!("no stall expected"));
+        // Well under the 200ms progress-sampling interval: completion wakes the waiter directly.
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "took {:?}",
+            started.elapsed()
+        );
+        worker.join().unwrap();
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::color::{COLOR_MODE_AGE, age_hue, hash_id_to_hue};
 pub use crate::tree::{BreadcrumbEntry, DirTree, FilterConfig};
+use crate::tree::{DirNode, FileEntry};
 pub use rsdirstat_protocol::LayoutRect;
 
 const NEST_HEADER: f64 = 18.0;
@@ -31,412 +32,312 @@ pub fn compute_layout(
     canvas_h: f64,
     config: &LayoutConfig,
 ) -> Vec<LayoutRect> {
+    let Some(root) = tree.nodes.get(&view_root) else {
+        return Vec::new();
+    };
+    let filtering = config.filter.is_active();
     let filtered;
-    let sizes = if config.filter.is_active() {
-        filtered = tree.compute_filtered_sizes(&config.filter);
+    let sizes = if filtering {
+        filtered = tree.compute_filtered_sizes(&config.filter, view_root);
         &filtered
     } else {
         &tree.recursive_sizes
     };
 
-    let mut out = Vec::new();
-    let mut file_id = -1i64;
-    layout_node(
+    let mut ctx = LayoutCtx {
         tree,
         sizes,
         config,
-        view_root,
-        0.0,
-        0.0,
-        canvas_w,
-        canvas_h,
-        0,
-        &mut out,
-        &mut file_id,
-    );
-    out
+        filtering,
+        out: Vec::new(),
+        next_file_id: -1,
+    };
+    let canvas = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: canvas_w,
+        h: canvas_h,
+    };
+    let total_size = sizes.get(&view_root).copied().unwrap_or(1);
+    ctx.layout_node(view_root, root, total_size, canvas, 0.0, 0);
+    ctx.out
+}
+
+#[derive(Clone, Copy)]
+struct Rect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
 }
 
 enum ItemKind<'a> {
-    Dir {
-        child_id: u64,
-    },
-    File {
-        name: &'a str,
-        hue: u16,
-        parent_id: u64,
-        size: u64,
-        mtime: i64,
-    },
-    Aggregate {
-        hue: u16,
-        parent_id: u64,
-    },
+    Dir(&'a DirNode),
+    File(&'a FileEntry),
+    /// Files too small to draw individually, summed into one "(other files)" rect.
+    Aggregate,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn layout_node(
-    tree: &DirTree,
-    sizes: &HashMap<u64, u64>,
-    config: &LayoutConfig,
-    node_id: u64,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    depth: u8,
-    out: &mut Vec<LayoutRect>,
-    file_id: &mut i64,
-) {
-    let node = match tree.nodes.get(&node_id) {
-        Some(node) => node,
-        None => return,
-    };
-
-    let header = if depth > 0 { header_height(w, h) } else { 0.0 };
-    let content_y = y + header;
-    let content_h = (h - header).max(0.0);
-    if w < 2.0 || content_h < 2.0 {
-        return;
-    }
-
-    struct LayoutItem<'a> {
-        id: i64,
-        size: f64,
-        kind: ItemKind<'a>,
-    }
-
-    let mut layout_items: Vec<LayoutItem<'_>> = Vec::new();
-    let filtering = config.filter.is_active();
-
-    for &child_id in &node.children {
-        let child_size = sizes.get(&child_id).copied().unwrap_or(0);
-        if child_size > 0 {
-            layout_items.push(LayoutItem {
-                id: child_id as i64,
-                size: child_size as f64,
-                kind: ItemKind::Dir { child_id },
-            });
-        }
-    }
-
-    let total_size = sizes.get(&node_id).copied().unwrap_or(1) as f64;
-    let area = w * content_h;
-    let min_file_size = if area > 0.0 && total_size > 0.0 {
-        (4.0 / area) * total_size
-    } else {
-        f64::MAX
-    };
-
-    let mut residual: u64 = 0;
-    for file in &node.files {
-        if file.size == 0 {
-            continue;
-        }
-        if filtering && !config.filter.matches_file(&file.name, file.size) {
-            continue;
-        }
-        if (file.size as f64) >= min_file_size {
-            let id = *file_id;
-            *file_id -= 1;
-            layout_items.push(LayoutItem {
-                id,
-                size: file.size as f64,
-                kind: ItemKind::File {
-                    name: &file.name,
-                    hue: file.hue,
-                    parent_id: node_id,
-                    size: file.size,
-                    mtime: file.mtime,
-                },
-            });
-        } else {
-            residual += file.size;
-        }
-    }
-
-    if residual > 0 {
-        let id = *file_id;
-        *file_id -= 1;
-        let hue = hash_id_to_hue(node_id);
-        layout_items.push(LayoutItem {
-            id,
-            size: residual as f64,
-            kind: ItemKind::Aggregate {
-                hue,
-                parent_id: node_id,
-            },
-        });
-    }
-
-    if layout_items.is_empty() {
-        return;
-    }
-    layout_items.sort_unstable_by(|a, b| b.size.total_cmp(&a.size));
-
-    let squarify_items: Vec<(i64, f64)> = layout_items.iter().map(|item| (item.id, item.size)).collect();
-    let mut rects = Vec::new();
-    squarify(&squarify_items, x, content_y, w, content_h, &mut rects);
-
-    let (min_time, max_time) = config.mtime_range;
-
-    // The zip below relies on squarify emitting exactly one rect per item, in input order.
-    debug_assert_eq!(rects.len(), layout_items.len(), "squarify must emit one rect per item");
-    for (raw, item) in rects.iter().zip(layout_items.iter()) {
-        // Skip any rect the client won't draw (it filters `w >= 1 && h >= 1`) before it is
-        // serialized + deflated into the payload broadcast ~20×/sec during a scan. This pays off
-        // because directories — unlike files, which aggregate below `min_file_size` — get a rect per
-        // non-empty child with no size floor, so a high-fan-out dir (Windows WinSxS, the driver/
-        // component store) otherwise emits thousands of sub-pixel rects. A sub-pixel rect never
-        // satisfies `can_nest` (which needs >= MIN_NEST_PX), so culling here drops nothing nested.
-        if raw.w < 1.0 || raw.h < 1.0 {
-            continue;
-        }
-        match &item.kind {
-            ItemKind::Dir { child_id } => {
-                let child_node = tree.nodes.get(child_id);
-                let name = child_node.map_or_else(|| "?".to_string(), |n| n.name.to_string());
-                let mut hue = child_node.map_or(0, |n| n.hue);
-                let size = sizes.get(child_id).copied().unwrap_or(0);
-                let mtime = child_node.map_or(0, |n| n.mtime);
-
-                if config.color_mode == COLOR_MODE_AGE {
-                    hue = age_hue(mtime, min_time, max_time);
-                }
-
-                // `max_depth` is the number of levels shown: this rect sits on level `depth + 1`,
-                // so opening it puts its contents on `depth + 2`. Any folder with room opens up,
-                // including one holding only files — gating on "has sub-folders" left files-only
-                // folders as solid blocks at every depth (issue #5).
-                let can_nest = depth + 1 < config.max_depth
-                    && raw.w >= MIN_NEST_PX
-                    && raw.h >= MIN_NEST_PX
-                    && child_node.is_some();
-
-                let (is_container, header_height_value) = if can_nest {
-                    (true, header_height(raw.w, raw.h))
-                } else {
-                    (false, 0.0)
-                };
-                out.push(LayoutRect {
-                    id: raw.id,
-                    parent_id: node_id,
-                    x: raw.x,
-                    y: raw.y,
-                    w: raw.w,
-                    h: raw.h,
-                    name,
-                    hue,
-                    size,
-                    depth,
-                    is_container,
-                    header_height: header_height_value,
-                    is_files: false,
-                    is_file: false,
-                    mtime,
-                });
-                if can_nest {
-                    layout_node(
-                        tree,
-                        sizes,
-                        config,
-                        *child_id,
-                        raw.x,
-                        raw.y,
-                        raw.w,
-                        raw.h,
-                        depth + 1,
-                        out,
-                        file_id,
-                    );
-                }
-            }
-            ItemKind::File {
-                name,
-                hue,
-                parent_id,
-                size,
-                mtime,
-            } => {
-                let final_hue = if config.color_mode == COLOR_MODE_AGE {
-                    age_hue(*mtime, min_time, max_time)
-                } else {
-                    *hue
-                };
-                out.push(LayoutRect {
-                    id: raw.id,
-                    parent_id: *parent_id,
-                    x: raw.x,
-                    y: raw.y,
-                    w: raw.w,
-                    h: raw.h,
-                    name: name.to_string(),
-                    hue: final_hue,
-                    size: *size,
-                    depth,
-                    is_container: false,
-                    header_height: 0.0,
-                    is_files: false,
-                    is_file: true,
-                    mtime: *mtime,
-                });
-            }
-            ItemKind::Aggregate { hue, parent_id } => {
-                out.push(LayoutRect {
-                    id: raw.id,
-                    parent_id: *parent_id,
-                    x: raw.x,
-                    y: raw.y,
-                    w: raw.w,
-                    h: raw.h,
-                    name: "(other files)".to_string(),
-                    hue: *hue,
-                    size: residual,
-                    depth,
-                    is_container: false,
-                    header_height: 0.0,
-                    is_files: true,
-                    is_file: false,
-                    mtime: 0,
-                });
-            }
-        }
-    }
-}
-
-struct RawRect {
+struct LayoutItem<'a> {
     id: i64,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
+    size: u64,
+    kind: ItemKind<'a>,
 }
 
-fn squarify(items: &[(i64, f64)], x: f64, y: f64, w: f64, h: f64, out: &mut Vec<RawRect>) {
-    if items.is_empty() || w <= 0.0 || h <= 0.0 {
-        return;
-    }
-    let total: f64 = items.iter().map(|item| item.1).sum();
-    if total <= 0.0 {
-        return;
-    }
-    squarify_slice(items, 0, items.len(), x, y, w, h, total, out);
+/// Per-call layout state: the inputs every level needs plus the output and file-id counter.
+struct LayoutCtx<'a> {
+    tree: &'a DirTree,
+    sizes: &'a HashMap<u64, u64>,
+    config: &'a LayoutConfig,
+    filtering: bool,
+    out: Vec<LayoutRect>,
+    /// Files and aggregates get negative ids (directories are positive), handed out in layout order.
+    next_file_id: i64,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn squarify_slice(
-    items: &[(i64, f64)],
-    lo: usize,
-    hi: usize,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    area_left: f64,
-    out: &mut Vec<RawRect>,
-) {
-    if lo >= hi || w <= 0.0 || h <= 0.0 || area_left <= 0.0 {
-        return;
-    }
-    if hi - lo == 1 {
-        out.push(RawRect {
-            id: items[lo].0,
-            x,
-            y,
-            w,
-            h,
-        });
-        return;
+impl<'a> LayoutCtx<'a> {
+    fn take_file_id(&mut self) -> i64 {
+        let id = self.next_file_id;
+        self.next_file_id -= 1;
+        id
     }
 
-    let vertical = w >= h;
-    let short_side = if vertical { h } else { w };
-    let scale = (w * h) / area_left;
-
-    let mut row_area = 0.0_f64;
-    let mut best_worst = f64::INFINITY;
-    let mut split = lo;
-
-    for i in lo..hi {
-        let test_area = row_area + items[i].1;
-        let test_len = (test_area * scale) / short_side;
-        if test_len <= 0.0 {
-            row_area = test_area;
-            split = i + 1;
-            continue;
-        }
-
-        let worst = {
-            let first = (items[lo].1 * scale) / test_len;
-            let last = (items[i].1 * scale) / test_len;
-            let ar_first = if first > 0.0 {
-                (test_len / first).max(first / test_len)
-            } else {
-                0.0
-            };
-            let ar_last = if last > 0.0 {
-                (test_len / last).max(last / test_len)
-            } else {
-                0.0
-            };
-            ar_first.max(ar_last)
-        };
-
-        if worst <= best_worst {
-            best_worst = worst;
-            row_area = test_area;
-            split = i + 1;
+    fn hue(&self, hue: u16, mtime: i64) -> u16 {
+        if self.config.color_mode == COLOR_MODE_AGE {
+            let (min_time, max_time) = self.config.mtime_range;
+            age_hue(mtime, min_time, max_time)
         } else {
-            break;
+            hue
         }
     }
 
-    if split == lo {
-        split = lo + 1;
-    }
-    let row_frac = row_area / area_left;
+    /// Lay out `node`'s sub-directories and files inside `rect`, below a header strip of height
+    /// `header` (0 for the view root), as rects at nesting level `depth`.
+    fn layout_node(&mut self, node_id: u64, node: &'a DirNode, total_size: u64, rect: Rect, header: f64, depth: u8) {
+        let content = Rect {
+            y: rect.y + header,
+            h: (rect.h - header).max(0.0),
+            ..rect
+        };
+        if content.w < 2.0 || content.h < 2.0 {
+            return;
+        }
 
-    let row_items = &items[lo..split];
-    if vertical {
-        let row_w = w * row_frac;
-        let mut cy = y;
-        for (i, item) in row_items.iter().enumerate() {
-            // Last item fills the remainder; clamp so float drift can't yield a negative extent.
-            let ih = if i == row_items.len() - 1 {
-                (y + h - cy).max(0.0)
-            } else {
-                (item.1 / row_area) * h
-            };
-            out.push(RawRect {
-                id: item.0,
-                x,
-                y: cy,
-                w: row_w,
-                h: ih,
-            });
-            cy += ih;
+        let mut items: Vec<LayoutItem<'a>> = Vec::new();
+        for &id in &node.children {
+            let size = self.sizes.get(&id).copied().unwrap_or(0);
+            if size > 0
+                && let Some(child) = self.tree.nodes.get(&id)
+            {
+                items.push(LayoutItem {
+                    id: id as i64,
+                    size,
+                    kind: ItemKind::Dir(child),
+                });
+            }
         }
-        squarify_slice(items, split, hi, x + row_w, y, w - row_w, h, area_left - row_area, out);
-    } else {
-        let row_h = h * row_frac;
-        let mut cx = x;
-        for (i, item) in row_items.iter().enumerate() {
-            // Last item fills the remainder; clamp so float drift can't yield a negative extent.
-            let iw = if i == row_items.len() - 1 {
-                (x + w - cx).max(0.0)
+
+        // Files that would get less than ~4px² are folded into one aggregate rect.
+        let area = content.w * content.h;
+        let min_file_size = if area > 0.0 && total_size > 0 {
+            (4.0 / area) * total_size as f64
+        } else {
+            f64::MAX
+        };
+        let mut residual: u64 = 0;
+        for file in &node.files {
+            if file.size == 0 || (self.filtering && !self.config.filter.matches_file(&file.name, file.size)) {
+                continue;
+            }
+            if (file.size as f64) >= min_file_size {
+                items.push(LayoutItem {
+                    id: self.take_file_id(),
+                    size: file.size,
+                    kind: ItemKind::File(file),
+                });
             } else {
-                (item.1 / row_area) * w
-            };
-            out.push(RawRect {
-                id: item.0,
-                x: cx,
-                y,
-                w: iw,
-                h: row_h,
-            });
-            cx += iw;
+                residual += file.size;
+            }
         }
-        squarify_slice(items, split, hi, x, y + row_h, w, h - row_h, area_left - row_area, out);
+        if residual > 0 {
+            items.push(LayoutItem {
+                id: self.take_file_id(),
+                size: residual,
+                kind: ItemKind::Aggregate,
+            });
+        }
+
+        if items.is_empty() {
+            return;
+        }
+        items.sort_unstable_by_key(|item| std::cmp::Reverse(item.size));
+
+        let mut rects = Vec::with_capacity(items.len());
+        squarify(&items, |item| item.size as f64, content, &mut rects);
+
+        // The zip relies on squarify emitting exactly one rect per item, in input order.
+        debug_assert_eq!(rects.len(), items.len(), "squarify must emit one rect per item");
+        for (r, item) in rects.into_iter().zip(&items) {
+            // Skip any rect the client won't draw (it filters `w >= 1 && h >= 1`) before it is
+            // serialized + deflated into the payload broadcast ~20×/sec during a scan. This pays off
+            // because directories — unlike files, which aggregate below `min_file_size` — get a rect per
+            // non-empty child with no size floor, so a high-fan-out dir (Windows WinSxS, the driver/
+            // component store) otherwise emits thousands of sub-pixel rects. A sub-pixel rect never
+            // satisfies `can_nest` (which needs >= MIN_NEST_PX), so culling here drops nothing nested.
+            if r.w < 1.0 || r.h < 1.0 {
+                continue;
+            }
+            let mut rect = LayoutRect {
+                id: item.id,
+                parent_id: node_id,
+                x: r.x,
+                y: r.y,
+                w: r.w,
+                h: r.h,
+                size: item.size,
+                depth,
+                ..LayoutRect::default()
+            };
+            let mut nest = None;
+            match item.kind {
+                ItemKind::Dir(child) => {
+                    rect.name = child.name.to_string();
+                    rect.hue = self.hue(child.hue, child.mtime);
+                    rect.mtime = child.mtime;
+                    // `max_depth` is the number of levels shown: this rect sits on level `depth + 1`,
+                    // so opening it puts its contents on `depth + 2`. Any folder with room opens up,
+                    // including one holding only files — gating on "has sub-folders" left files-only
+                    // folders as solid blocks at every depth (issue #5).
+                    if depth + 1 < self.config.max_depth && r.w >= MIN_NEST_PX && r.h >= MIN_NEST_PX {
+                        rect.is_container = true;
+                        rect.header_height = header_height(r.w, r.h);
+                        nest = Some(child);
+                    }
+                }
+                ItemKind::File(file) => {
+                    rect.name = file.name.to_string();
+                    rect.hue = self.hue(file.hue, file.mtime);
+                    rect.mtime = file.mtime;
+                    rect.is_file = true;
+                }
+                ItemKind::Aggregate => {
+                    rect.name = "(other files)".to_string();
+                    rect.hue = hash_id_to_hue(node_id);
+                    rect.is_files = true;
+                }
+            }
+            let header = rect.header_height;
+            self.out.push(rect);
+            if let Some(child) = nest {
+                self.layout_node(item.id as u64, child, item.size, r, header, depth + 1);
+            }
+        }
+    }
+}
+
+/// Squarified treemap: split `bounds` among `items` (sorted by descending size) and push exactly
+/// one rect per item, in input order, until the space or the remaining size runs out.
+fn squarify<T>(items: &[T], size: impl Fn(&T) -> f64, bounds: Rect, out: &mut Vec<Rect>) {
+    let Rect {
+        mut x,
+        mut y,
+        mut w,
+        mut h,
+    } = bounds;
+    let mut area_left: f64 = items.iter().map(&size).sum();
+    let mut lo = 0;
+    let hi = items.len();
+    while lo < hi && w > 0.0 && h > 0.0 && area_left > 0.0 {
+        if hi - lo == 1 {
+            out.push(Rect { x, y, w, h });
+            return;
+        }
+
+        let vertical = w >= h;
+        let short_side = if vertical { h } else { w };
+        let scale = (w * h) / area_left;
+
+        let mut row_area = 0.0_f64;
+        let mut best_worst = f64::INFINITY;
+        let mut split = lo;
+
+        for i in lo..hi {
+            let test_area = row_area + size(&items[i]);
+            let test_len = (test_area * scale) / short_side;
+            if test_len <= 0.0 {
+                row_area = test_area;
+                split = i + 1;
+                continue;
+            }
+
+            let aspect = |item_size: f64| {
+                let extent = (item_size * scale) / test_len;
+                if extent > 0.0 {
+                    (test_len / extent).max(extent / test_len)
+                } else {
+                    0.0
+                }
+            };
+            let worst = aspect(size(&items[lo])).max(aspect(size(&items[i])));
+
+            if worst <= best_worst {
+                best_worst = worst;
+                row_area = test_area;
+                split = i + 1;
+            } else {
+                break;
+            }
+        }
+
+        if split == lo {
+            split = lo + 1;
+        }
+        let row_frac = row_area / area_left;
+
+        let row = &items[lo..split];
+        if vertical {
+            let row_w = w * row_frac;
+            let mut cy = y;
+            for (i, item) in row.iter().enumerate() {
+                // Last item fills the remainder; clamp so float drift can't yield a negative extent.
+                let ih = if i == row.len() - 1 {
+                    (y + h - cy).max(0.0)
+                } else {
+                    (size(item) / row_area) * h
+                };
+                out.push(Rect {
+                    x,
+                    y: cy,
+                    w: row_w,
+                    h: ih,
+                });
+                cy += ih;
+            }
+            x += row_w;
+            w -= row_w;
+        } else {
+            let row_h = h * row_frac;
+            let mut cx = x;
+            for (i, item) in row.iter().enumerate() {
+                // Last item fills the remainder; clamp so float drift can't yield a negative extent.
+                let iw = if i == row.len() - 1 {
+                    (x + w - cx).max(0.0)
+                } else {
+                    (size(item) / row_area) * w
+                };
+                out.push(Rect {
+                    x: cx,
+                    y,
+                    w: iw,
+                    h: row_h,
+                });
+                cx += iw;
+            }
+            y += row_h;
+            h -= row_h;
+        }
+        area_left -= row_area;
+        lo = split;
     }
 }
 
@@ -767,7 +668,7 @@ mod tests {
         let mut tree = DirTree::new();
         tree.insert_dir(1, 0, "root", 0, 100);
         for i in 2..=21u64 {
-            tree.insert_dir(i, 1, &format!("dir{i}"), i * 100, 100);
+            tree.insert_dir(i, 1, format!("dir{i}"), i * 100, 100);
         }
 
         let config = default_config();

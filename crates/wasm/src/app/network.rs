@@ -1,12 +1,12 @@
-use super::dom::{add_class, remove_class, set_hidden, with_app};
+use super::dom::{set_hidden, with_app};
 use super::*;
 
 impl TreemapApp {
-    pub(super) fn send_message(&self, bytes: Vec<u8>) -> Result<(), JsValue> {
+    pub(super) fn send_message(&self, message: ClientMessage) -> Result<(), JsValue> {
         if let Some(ws) = &self.session.ws
             && ws.ready_state() == WebSocket::OPEN
         {
-            ws.send_with_u8_array(&bytes)?;
+            ws.send_with_u8_array(&message.encode())?;
         }
         Ok(())
     }
@@ -15,13 +15,10 @@ impl TreemapApp {
         if self.surface.canvas_width <= 0.0 {
             return Ok(());
         }
-        self.send_message(
-            wire::ClientMessage::Viewport {
-                width: self.surface.canvas_width as f32,
-                height: self.surface.canvas_height as f32,
-            }
-            .encode(),
-        )
+        self.send_message(ClientMessage::Viewport {
+            width: self.surface.canvas_width as f32,
+            height: self.surface.canvas_height as f32,
+        })
     }
 
     pub(super) fn start_scan_timer(&mut self) -> Result<(), JsValue> {
@@ -159,7 +156,6 @@ impl TreemapApp {
                 self.view.rects.clear();
                 self.view.rect_index_by_id.clear();
                 self.view.breadcrumb.clear();
-                self.view.breadcrumb_parts.clear();
                 self.view.view_root_size = 0;
                 self.view.zoom_anim = None;
                 self.view.pending_old_rects = None;
@@ -171,10 +167,10 @@ impl TreemapApp {
                 self.stop_scan_timer();
                 self.start_scan_timer()?;
                 self.build_breadcrumb()?;
-                add_class(&self.chrome.change_button, "hidden")?;
+                set_hidden(&self.chrome.change_button, true)?;
             }
             Some(ServerMessage::Layout(payload)) => {
-                remove_class(&self.chrome.treemap_view, "hidden")?;
+                set_hidden(&self.chrome.treemap_view, false)?;
                 self.handle_layout(payload)?;
             }
             None => {}
@@ -221,17 +217,18 @@ impl TreemapApp {
     pub(super) fn handle_layout(&mut self, payload: LayoutPayload) -> Result<(), JsValue> {
         let rects = payload.rects.into_iter().map(RenderRect::from_wire).collect::<Vec<_>>();
         if let Some(from) = self.view.pending_old_rects.take() {
-            self.view.zoom_anim = Some(ZoomAnim::new(from, &rects, self.now()));
-            self.view.dirty = true;
-            self.schedule_tick()?;
+            self.view.zoom_anim = Some(ZoomAnim {
+                plan: InterpolationPlan::new(&from, &rects),
+                start_time: self.now(),
+            });
         }
         let root_size = payload.root_size;
         let dir_count = payload.dir_count;
         let new_scan_done = payload.scan_done;
+        self.view.rect_index_by_id = crate::logic::build_rect_index(&rects);
         self.view.rects = rects;
         self.view.view_root_size = root_size;
         self.view.breadcrumb = payload.breadcrumb;
-        self.rebuild_view_caches();
         self.build_breadcrumb()?;
         self.recompute_hover()?;
         self.view.buffer_dirty = true;
@@ -247,20 +244,19 @@ impl TreemapApp {
             let elapsed = (self.now() - self.session.scan_start_time) / 1000.0;
             self.chrome.status_element.set_text_content(Some(&format!(
                 "{dir_count} dirs in {elapsed:.1}s — {}",
-                format_size_impl(root_size as f64)
+                format_size(root_size)
             )));
         } else {
-            self.chrome.status_element.set_text_content(Some(&format!(
-                "{dir_count} dirs — {}",
-                format_size_impl(root_size as f64)
-            )));
+            self.chrome
+                .status_element
+                .set_text_content(Some(&format!("{dir_count} dirs — {}", format_size(root_size))));
         }
         self.view.scan_done = new_scan_done;
         Ok(())
     }
 }
 
-pub(super) async fn fetch_volumes() -> Result<Vec<VolumeEntry>, JsValue> {
+pub(super) async fn fetch_volumes() -> Result<Vec<VolumeInfo>, JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("missing window"))?;
     let response = JsFuture::from(window.fetch_with_str("/volumes")).await?;
     let response = response
@@ -275,7 +271,7 @@ pub(super) async fn fetch_volumes() -> Result<Vec<VolumeEntry>, JsValue> {
         let total_bytes = field_number(&value, "totalBytes")? as u64;
         let used_bytes = field_number(&value, "usedBytes")? as u64;
         let fs_type = field_string(&value, "fsType").unwrap_or_default();
-        volumes.push(VolumeEntry {
+        volumes.push(VolumeInfo {
             name,
             mount_point,
             total_bytes,

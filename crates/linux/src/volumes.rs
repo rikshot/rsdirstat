@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::path::Path;
 
-use rsdirstat_core::volume::VolumeInfo;
+use rsdirstat_core::volume::{VolumeInfo, statvfs_usage};
 
 pub fn list_volumes() -> Vec<VolumeInfo> {
     let mut volumes = Vec::new();
@@ -31,17 +31,9 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
             continue;
         };
 
-        let mut stat = libc::statvfs::default();
-        if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        let Some((total, free)) = statvfs_usage(&c_path) else {
             continue;
-        }
-
-        #[allow(clippy::useless_conversion)]
-        let block_size: u64 = stat.f_frsize.into();
-        #[allow(clippy::useless_conversion)]
-        let total: u64 = u64::from(stat.f_blocks) * block_size;
-        #[allow(clippy::useless_conversion)]
-        let free: u64 = u64::from(stat.f_bavail) * block_size;
+        };
 
         let name = if mount_point == "/" {
             "Root".to_string()
@@ -53,13 +45,7 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
                 .to_string()
         };
 
-        volumes.push(VolumeInfo {
-            name,
-            mount_point,
-            total_bytes: total,
-            used_bytes: total.saturating_sub(free),
-            fs_type: fs_type.to_string(),
-        });
+        volumes.push(VolumeInfo::new(name, mount_point, total, free, fs_type.to_string()));
     }
 
     volumes.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));

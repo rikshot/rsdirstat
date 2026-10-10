@@ -1,7 +1,16 @@
+use super::dom::window_inner_size;
 use super::*;
 use crate::logic::{build_hover_state, find_navigable_target_index, find_rect_index};
 
 impl TreemapApp {
+    /// The pointer position in canvas coordinates.
+    fn canvas_point(&self, event: &MouseEvent) -> (f64, f64) {
+        (
+            event.client_x() as f64 - self.surface.canvas_left,
+            event.client_y() as f64 - self.surface.canvas_top,
+        )
+    }
+
     pub(super) fn clear_hover(&mut self) -> Result<(), JsValue> {
         self.view.hovered_index = None;
         self.view.hovered_ancestor_indices.clear();
@@ -11,7 +20,7 @@ impl TreemapApp {
         Ok(())
     }
 
-    pub(super) fn begin_navigation(&mut self, message: Vec<u8>) -> Result<(), JsValue> {
+    pub(super) fn begin_navigation(&mut self, message: ClientMessage) -> Result<(), JsValue> {
         if self.view.zoom_anim.is_some() {
             return Ok(());
         }
@@ -26,25 +35,25 @@ impl TreemapApp {
     }
 
     pub(super) fn recompute_hover(&mut self) -> Result<(), JsValue> {
-        if self.view.last_mouse_x < 0.0 {
+        let Some((mouse_x, mouse_y)) = self.view.last_mouse else {
             self.view.hovered_index = None;
             self.view.hovered_ancestor_indices.clear();
             return Ok(());
-        }
+        };
         let hover = build_hover_state(
             &self.view.rects,
             &self.view.rect_index_by_id,
-            &self.view.breadcrumb_parts,
-            self.view.last_mouse_x,
-            self.view.last_mouse_y,
+            &self.view.breadcrumb,
+            mouse_x,
+            mouse_y,
         );
         if let Some(state) = hover {
-            self.view.hovered_index = state.hovered_index;
+            self.view.hovered_index = Some(state.hovered_index);
             self.view.hovered_ancestor_indices = state.hovered_ancestor_indices;
             self.chrome.path_text_element.set_text_content(Some(&state.path_text));
             self.chrome
                 .path_size_element
-                .set_text_content(Some(&format_size_impl(state.size as f64)));
+                .set_text_content(Some(&format_size(self.view.rects[state.hovered_index].size)));
         } else {
             self.view.hovered_index = None;
             self.view.hovered_ancestor_indices.clear();
@@ -58,8 +67,7 @@ impl TreemapApp {
         if self.view.zoom_anim.is_some() {
             return Ok(());
         }
-        self.view.last_mouse_x = event.client_x() as f64 - self.surface.canvas_left;
-        self.view.last_mouse_y = event.client_y() as f64 - self.surface.canvas_top;
+        self.view.last_mouse = Some(self.canvas_point(&event));
 
         let previous = self.view.hovered_index;
         self.recompute_hover()?;
@@ -69,9 +77,7 @@ impl TreemapApp {
             if let Some(rect) = self.view.hovered_index.and_then(|index| self.view.rects.get(index)) {
                 self.chrome.tooltip_element.style().set_property("display", "block")?;
                 self.chrome.tooltip_name.set_text_content(Some(&rect.name));
-                self.chrome
-                    .tooltip_size
-                    .set_text_content(Some(&format_size_impl(rect.size as f64)));
+                self.chrome.tooltip_size.set_text_content(Some(&format_size(rect.size)));
                 let percent = if self.view.view_root_size > 0 {
                     (rect.size as f64 / self.view.view_root_size as f64) * 100.0
                 } else {
@@ -97,16 +103,7 @@ impl TreemapApp {
         if self.view.hovered_index.is_some() {
             let mut tip_x = event.client_x() as f64 + 14.0;
             let mut tip_y = event.client_y() as f64 + 14.0;
-            let inner_width = self
-                .window
-                .inner_width()?
-                .as_f64()
-                .ok_or_else(|| JsValue::from_str("missing innerWidth"))?;
-            let inner_height = self
-                .window
-                .inner_height()?
-                .as_f64()
-                .ok_or_else(|| JsValue::from_str("missing innerHeight"))?;
+            let (inner_width, inner_height) = window_inner_size(&self.window)?;
             let tooltip_width = self.chrome.tooltip_element.offset_width() as f64;
             let tooltip_height = self.chrome.tooltip_element.offset_height() as f64;
             if tip_x + tooltip_width > inner_width - 8.0 {
@@ -128,8 +125,7 @@ impl TreemapApp {
     }
 
     pub(super) fn handle_mouseleave(&mut self) -> Result<(), JsValue> {
-        self.view.last_mouse_x = -1.0;
-        self.view.last_mouse_y = -1.0;
+        self.view.last_mouse = None;
         self.clear_hover()?;
         self.view.dirty = true;
         self.schedule_tick()
@@ -139,30 +135,25 @@ impl TreemapApp {
         if self.view.zoom_anim.is_some() {
             return Ok(());
         }
-        let mouse_x = event.client_x() as f64 - self.surface.canvas_left;
-        let mouse_y = event.client_y() as f64 - self.surface.canvas_top;
+        let (mouse_x, mouse_y) = self.canvas_point(&event);
         if let Some(index) = find_navigable_target_index(&self.view.rects, mouse_x, mouse_y) {
             let id = self.view.rects[index].id as u64;
-            self.begin_navigation(wire::ClientMessage::Navigate { id }.encode())?;
+            self.begin_navigation(ClientMessage::Navigate { id })?;
         }
         Ok(())
     }
 
     pub(super) fn handle_context_menu(&mut self, event: MouseEvent) -> Result<(), JsValue> {
-        let mouse_x = event.client_x() as f64 - self.surface.canvas_left;
-        let mouse_y = event.client_y() as f64 - self.surface.canvas_top;
+        let (mouse_x, mouse_y) = self.canvas_point(&event);
         if let Some(index) = find_rect_index(&self.view.rects, mouse_x, mouse_y) {
             let rect = &self.view.rects[index];
             if rect.is_file {
-                self.send_message(
-                    wire::ClientMessage::RevealFile {
-                        dir_id: rect.parent_id,
-                        name: rect.name.clone(),
-                    }
-                    .encode(),
-                )?;
+                self.send_message(ClientMessage::RevealFile {
+                    dir_id: rect.parent_id,
+                    name: rect.name.clone(),
+                })?;
             } else if rect.id > 0 {
-                self.send_message(wire::ClientMessage::RevealDir { id: rect.id as u64 }.encode())?;
+                self.send_message(ClientMessage::RevealDir { id: rect.id as u64 })?;
             }
         }
         Ok(())

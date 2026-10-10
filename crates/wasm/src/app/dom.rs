@@ -35,23 +35,41 @@ pub(super) fn canvas_context(canvas: &HtmlCanvasElement) -> Result<CanvasRenderi
         .map_err(|_| JsValue::from_str("failed to cast 2d context"))
 }
 
-pub(super) fn add_class(element: &HtmlElement, class_name: &str) -> Result<(), JsValue> {
-    let element: &Element = element.unchecked_ref();
-    element.class_list().add_1(class_name)
+/// Show or hide an element via the `hidden` class.
+pub(super) fn set_hidden(element: &Element, hidden: bool) -> Result<(), JsValue> {
+    element.class_list().toggle_with_force("hidden", hidden).map(|_| ())
 }
 
-pub(super) fn remove_class(element: &HtmlElement, class_name: &str) -> Result<(), JsValue> {
-    let element: &Element = element.unchecked_ref();
-    element.class_list().remove_1(class_name)
+/// Attach a page-lifetime listener that forwards each event to `handler` on the app. The closure
+/// is deliberately leaked: these listeners live as long as the page does.
+pub(super) fn listen<E: FromWasmAbi + 'static>(
+    target: &EventTarget,
+    event: &str,
+    handler: fn(&mut TreemapApp, E) -> Result<(), JsValue>,
+) -> Result<(), JsValue> {
+    let closure = Closure::<dyn FnMut(E)>::new(move |event: E| {
+        with_app(|app| {
+            let _ = handler(&mut app.borrow_mut(), event);
+        });
+    });
+    target.add_event_listener_with_callback(event, closure.as_ref().unchecked_ref())?;
+    closure.forget();
+    Ok(())
 }
 
-pub(super) fn set_hidden<T: JsCast>(element: &T, hidden: bool) -> Result<(), JsValue> {
-    let element = element
-        .dyn_ref::<HtmlElement>()
-        .ok_or_else(|| JsValue::from_str("element is not HtmlElement"))?;
-    if hidden {
-        add_class(element, "hidden")
-    } else {
-        remove_class(element, "hidden")
-    }
+/// For a delegated listener: `attribute` on the event target or its nearest ancestor that has it.
+pub(super) fn delegated_attribute(event: &Event, attribute: &str) -> Option<String> {
+    let target = event.target()?.dyn_into::<Element>().ok()?;
+    target
+        .closest(&format!("[{attribute}]"))
+        .ok()??
+        .get_attribute(attribute)
+}
+
+pub(super) fn window_inner_size(window: &Window) -> Result<(f64, f64), JsValue> {
+    let width = window.inner_width()?.as_f64();
+    let height = window.inner_height()?.as_f64();
+    width
+        .zip(height)
+        .ok_or_else(|| JsValue::from_str("missing innerWidth/innerHeight"))
 }
