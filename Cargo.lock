@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "rsdirstat"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "rsdirstat-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libc",
  "mime",
@@ -1573,7 +1573,7 @@ dependencies = [
 
 [[package]]
 name = "rsdirstat-linux"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "rsdirstat-macos"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "rsdirstat-protocol"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "miniz_oxide 0.9.1",
  "postcard",
@@ -1604,7 +1604,7 @@ dependencies = [
 
 [[package]]
 name = "rsdirstat-wasm"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "js-sys",
  "rsdirstat-protocol",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "rsdirstat-windows"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "dashmap",
