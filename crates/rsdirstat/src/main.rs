@@ -72,7 +72,9 @@ struct ScanState {
     tree: RwLock<layout::DirTree>,
     version: AtomicU64,
     done: AtomicBool,
-    started: AtomicBool,
+    /// The volume picker is up: no scan is running or finished, so the server waits for a path. Set
+    /// at startup in picker mode and whenever a scan fails to start.
+    awaiting_path: AtomicBool,
     /// Bumped each time a scan starts; lets a superseded scan's relay task detect it has been
     /// replaced and stop writing into the shared tree.
     generation: AtomicU64,
@@ -101,7 +103,6 @@ struct AppState {
     connects: AtomicU64,
     start: Notify,
     shutdown: watch::Sender<bool>,
-    picker_mode: bool,
 }
 
 impl AppState {
@@ -150,7 +151,7 @@ async fn run_server(args: Args) -> Result<()> {
             tree: RwLock::new(layout::DirTree::new()),
             version: AtomicU64::new(0),
             done: AtomicBool::new(false),
-            started: AtomicBool::new(false),
+            awaiting_path: AtomicBool::new(picker_mode),
             generation: AtomicU64::new(0),
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             root: Mutex::new(scan_root),
@@ -172,7 +173,6 @@ async fn run_server(args: Args) -> Result<()> {
         connects: AtomicU64::new(0),
         start: Notify::new(),
         shutdown: watch::channel(false).0,
-        picker_mode,
     });
 
     let scan_state = Arc::clone(&state);
@@ -321,7 +321,7 @@ fn start_scan(state: &Arc<AppState>) {
     // it writes more events into the shared tree.
     let generation = state.scan.generation.fetch_add(1, Ordering::Relaxed) + 1;
     state.scan.done.store(false, Ordering::Relaxed);
-    state.scan.started.store(true, Ordering::Relaxed);
+    state.scan.awaiting_path.store(false, Ordering::Relaxed);
 
     // Trip the previous scan's cancel flag so its worker threads stop walking the filesystem (the
     // generation bump only stops the relay), then install a fresh flag for this scan.
@@ -375,9 +375,18 @@ fn start_scan(state: &Arc<AppState>) {
 
     let path = state.scan.root.lock().clone();
     let cross_filesystems = state.scan.cross_filesystems;
+    let scan_state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         if let Err(e) = scanner::scan::scan_cancellable(&path, cross_filesystems, tx, cancel) {
             eprintln!("Scan error: {e}");
+            // A scanner only fails before it sends `ScanStart` (it couldn't open the root), so no
+            // `ScanDone` will ever end this scan. Go back to waiting for a path, and send open tabs
+            // to the volume picker so the user can choose another one.
+            scan_state.scan.awaiting_path.store(true, Ordering::Relaxed);
+            let _ = scan_state
+                .layout
+                .tx
+                .send(wire::ServerMessage::PickerMode.encode().into());
         }
     });
 }
@@ -508,17 +517,15 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     let mut layout_rx = state.layout.tx.subscribe();
     let mut shutdown_rx = state.shutdown.subscribe();
 
-    let last = state.layout.last.lock().clone();
-    if let Some(message) = last {
-        if socket.send(Message::Binary(message)).await.is_err() {
-            return;
-        }
-    } else if state.picker_mode
-        && !state.scan.started.load(Ordering::Relaxed)
-        && socket
-            .send(Message::Binary(wire::ServerMessage::PickerMode.encode().into()))
-            .await
-            .is_err()
+    // A new client starts on the picker while the server waits for a path, else on the latest
+    // layout (a reload while a previous scan's result is still current).
+    let initial = if state.scan.awaiting_path.load(Ordering::Relaxed) {
+        Some(wire::ServerMessage::PickerMode.encode().into())
+    } else {
+        state.layout.last.lock().clone()
+    };
+    if let Some(message) = initial
+        && socket.send(Message::Binary(message)).await.is_err()
     {
         return;
     }
@@ -609,7 +616,8 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
         ClientMessage::FilterName { pattern } => state.update_view(|v| v.filter.name_pattern = pattern),
         ClientMessage::ClearFilter => state.update_view(|v| v.filter = FilterConfig::default()),
         ClientMessage::ScanPath { path } => {
-            let can_start = !state.scan.started.load(Ordering::Relaxed) || state.scan.done.load(Ordering::Relaxed);
+            // Only from the picker, or once the current scan is done (never mid-scan).
+            let can_start = state.scan.awaiting_path.load(Ordering::Relaxed) || state.scan.done.load(Ordering::Relaxed);
             if can_start {
                 let scan_root = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
                 *state.scan.root.lock() = scan_root;

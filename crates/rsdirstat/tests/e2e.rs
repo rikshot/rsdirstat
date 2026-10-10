@@ -3,7 +3,7 @@ mod common;
 use std::time::Duration;
 
 use common::{TestServer, create_test_dir, launch_browser, wait_for_scan_done};
-use playwright_rs::protocol::WaitForOptions;
+use playwright_rs::protocol::{WaitForFunctionOptions, WaitForOptions};
 
 /// Serve a scan of `dir`, open it in `browser_name`, wait for the scan, then run `f` on the page.
 /// Traced under `<browser>-<case>` from navigation onward, so a `wait_for_scan_done` timeout — the
@@ -346,6 +346,50 @@ async fn e2e_picker_volume_details() {
 #[tokio::test]
 async fn e2e_picker_click_starts_scan() {
     run_picker(picker_volume_click_starts_scan).await;
+}
+
+/// A scan whose root can't be opened (here: a volume that vanished between listing and clicking)
+/// must not wedge the server: the tab is sent back to the volume picker, a reloaded tab starts
+/// there too, and picking a real volume from it starts a scan.
+#[tokio::test]
+async fn e2e_unopenable_root_falls_back_to_picker() {
+    let server = TestServer::start_picker();
+    let (_pw, browser, page) = launch_browser("chromium").await;
+    let label = common::trace_label("chromium", "unopenable_root_falls_back_to_picker");
+    common::with_trace_unit(&page, &label, async {
+        let picker = page.locator("#picker");
+        let visible = || WaitForOptions::builder().timeout(10_000.0).build();
+
+        page.goto(&format!("{}/?picker", server.url), None).await.unwrap();
+        page.locator(".volume-card").first().wait_for(visible()).await.unwrap();
+        page.evaluate_expression(
+            "document.querySelector('.picker-grid').insertAdjacentHTML('afterbegin', \
+             '<div class=\"volume-card\" id=\"gone\" data-mount=\"/nonexistent/rsdirstat-e2e\">gone</div>')",
+        )
+        .await
+        .unwrap();
+        page.locator("#gone").click(None).await.unwrap();
+        picker
+            .wait_for(visible())
+            .await
+            .expect("the failed scan should send the tab back to the volume picker");
+
+        page.reload(None).await.unwrap();
+        picker
+            .wait_for(visible())
+            .await
+            .expect("a new tab should start on the volume picker");
+
+        page.locator(".volume-card").first().click(None).await.unwrap();
+        page.wait_for_function(
+            "() => /Scanning|dirs/.test(document.querySelector('#status')?.textContent ?? '')",
+            WaitForFunctionOptions::default().timeout(10_000.0),
+        )
+        .await
+        .expect("picking a volume should start a scan");
+    })
+    .await;
+    let _ = browser.close().await;
 }
 
 // Server lifecycle (no browser). SIGTERM mid-scan must cancel the walk: it runs on tokio's blocking
