@@ -1,4 +1,4 @@
-use super::dom::{set_hidden, with_app};
+use super::dom::{listen, set_hidden, with_app};
 use super::*;
 
 impl TreemapApp {
@@ -105,21 +105,14 @@ impl TreemapApp {
     pub(super) fn handle_ws_open(&mut self) -> Result<(), JsValue> {
         self.session.reconnect_attempts = 0;
         if self.session.wait_mode {
+            // The Start button lives in the status bar, inside the treemap view — which otherwise
+            // stays hidden until the first layout, and none comes before the scan is started.
+            set_hidden(&self.chrome.treemap_view, false)?;
             self.chrome.status_element.set_text_content(Some(""));
-            let button = self
-                .document
-                .create_element("button")?
-                .dyn_into::<HtmlButtonElement>()
-                .map_err(|_| JsValue::from_str("start button is not HtmlButtonElement"))?;
+            let button = self.document.create_element("button")?;
             button.set_text_content(Some("Start Scan"));
             button.set_class_name("action-button");
-            let click = Closure::wrap(Box::new(move |_event: Event| {
-                with_app(|app| {
-                    let _ = app.borrow_mut().handle_manual_start();
-                });
-            }) as Box<dyn FnMut(_)>);
-            button.add_event_listener_with_callback("click", click.as_ref().unchecked_ref())?;
-            click.forget();
+            listen(&button, "click", |app, _: Event| app.handle_manual_start())?;
             self.chrome.status_element.append_child(&button)?;
         } else {
             self.chrome

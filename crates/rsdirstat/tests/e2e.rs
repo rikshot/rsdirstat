@@ -392,6 +392,28 @@ async fn e2e_unopenable_root_falls_back_to_picker() {
     let _ = browser.close().await;
 }
 
+/// `--wait` (for profiling) holds the scan until the page's Start button is clicked, so that button
+/// must be visible before any layout exists.
+#[tokio::test]
+async fn e2e_wait_mode_start_button_starts_scan() {
+    let dir = create_test_dir();
+    let server = TestServer::start_waiting(dir.path());
+    let (_pw, browser, page) = launch_browser("chromium").await;
+    let label = common::trace_label("chromium", "wait_mode_start_button_starts_scan");
+    common::with_trace_unit(&page, &label, async {
+        page.goto(&format!("{}/?wait", server.url), None).await.unwrap();
+        let start = page.locator("#status button");
+        start
+            .wait_for(WaitForOptions::builder().timeout(10_000.0).build())
+            .await
+            .expect("the Start button should be visible");
+        start.click(None).await.unwrap();
+        wait_for_scan_done(&page).await;
+    })
+    .await;
+    let _ = browser.close().await;
+}
+
 // Server lifecycle (no browser). SIGTERM mid-scan must cancel the walk: it runs on tokio's blocking
 // pool, which the runtime waits on at exit, so an uncancelled whole-disk scan kept the process alive
 // until it finished (60–100s on CI runners).

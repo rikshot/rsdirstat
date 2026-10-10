@@ -68,6 +68,12 @@ impl TestServer {
         Self::spawn(&["--port", "0", "--no-open"])
     }
 
+    /// Like `start`, but with `--wait`: the scan begins when the page's Start button is clicked
+    /// (load the page with `?wait`).
+    pub fn start_waiting(scan_path: &Path) -> Self {
+        Self::spawn(&["--port", "0", "--no-open", "--wait", scan_path.to_str().unwrap()])
+    }
+
     fn spawn(args: &[&str]) -> Self {
         ensure_frontend_built();
         let bin = env!("CARGO_BIN_EXE_rsdirstat");
