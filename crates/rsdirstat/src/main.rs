@@ -301,6 +301,9 @@ async fn shutdown_signal(state: Arc<AppState>) {
     }
     // Signal all WS handlers to close
     let _ = state.shutdown.send(true);
+    // Stop an in-flight scan too. It runs on the blocking pool, which the runtime waits on at
+    // exit, so without this a Ctrl+C during a large scan hangs until the whole walk finishes.
+    state.scan.cancel.lock().store(true, Ordering::Relaxed);
 }
 
 fn start_scan(state: &Arc<AppState>) {

@@ -557,3 +557,20 @@ async fn e2e_picker_volume_details() {
 async fn e2e_picker_click_starts_scan() {
     run_picker(picker_volume_click_starts_scan).await;
 }
+
+// Server lifecycle (no browser). SIGTERM mid-scan must cancel the walk: it runs on tokio's blocking
+// pool, which the runtime waits on at exit, so an uncancelled whole-disk scan kept the process alive
+// until it finished (60–100s on CI runners).
+#[cfg(unix)]
+#[test]
+fn e2e_sigterm_mid_scan_exits_promptly() {
+    let server = TestServer::start(std::path::Path::new("/"));
+    std::thread::sleep(Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    drop(server); // SIGTERM, then wait for exit
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "server took {took:?} to exit after SIGTERM mid-scan"
+    );
+}
