@@ -103,9 +103,6 @@ impl TreemapApp {
             0.0,
         )?;
 
-        let bounds = self.surface.canvas.get_bounding_client_rect();
-        self.surface.canvas_left = bounds.left();
-        self.surface.canvas_top = bounds.top();
         self.view.buffer_dirty = true;
         self.view.dirty = true;
         self.schedule_tick()?;

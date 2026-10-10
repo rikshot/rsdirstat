@@ -3,7 +3,7 @@ mod common;
 use std::time::Duration;
 
 use common::{TestServer, create_test_dir, launch_browser, wait_for_scan_done};
-use playwright_rs::protocol::{WaitForFunctionOptions, WaitForOptions};
+use playwright_rs::protocol::{HoverOptions, Position, WaitForFunctionOptions, WaitForOptions};
 
 /// Serve a scan of `dir`, open it in `browser_name`, wait for the scan, then run `f` on the page.
 /// Traced under `<browser>-<case>` from navigation onward, so a `wait_for_scan_done` timeout — the
@@ -176,6 +176,34 @@ async fn hover_shows_path_bar(page: &playwright_rs::Page) {
     );
 }
 
+/// Hover must resolve to the rect under the cursor. The canvas sits below the breadcrumb and tool
+/// bars: just inside its top-left is the "src" folder's header strip, just inside its bottom-left is
+/// `src/main.rs`. Regression: hover once landed on whatever was ~60px below the cursor.
+async fn hover_hits_rect_under_cursor(page: &playwright_rs::Page) {
+    let canvas = page.locator("#treemap");
+    let height: f64 = page
+        .evaluate_value("() => document.querySelector('#treemap').clientHeight")
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    for (y, expected) in [(5.0, "/src"), (height - 5.0, "/src/main.rs")] {
+        let at = HoverOptions::builder().position(Position { x: 20.0, y }).build();
+        canvas.hover(Some(at)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let path = page
+            .locator("#path-text")
+            .text_content()
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            path.ends_with(expected),
+            "hover at canvas y={y}: path {path:?}, expected …{expected}"
+        );
+    }
+}
+
 async fn click_navigates_into_directory(page: &playwright_rs::Page) {
     let crumbs = page.locator("#crumbs");
     let initial_text = crumbs.text_content().await.unwrap().unwrap();
@@ -330,6 +358,7 @@ browser_tests! {
     filter_size => filter_by_min_size,
     tooltip => hover_shows_tooltip,
     path_bar => hover_shows_path_bar,
+    hover_position => hover_hits_rect_under_cursor,
     navigate => click_navigates_into_directory,
     breadcrumb_back => breadcrumb_click_navigates_back,
     click_leaf_dir => click_navigates_into_directory in leaf_dir,

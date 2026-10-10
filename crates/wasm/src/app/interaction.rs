@@ -3,12 +3,12 @@ use super::*;
 use crate::logic::{build_hover_state, find_navigable_target_index, find_rect_index};
 
 impl TreemapApp {
-    /// The pointer position in canvas coordinates.
-    fn canvas_point(&self, event: &MouseEvent) -> (f64, f64) {
-        (
-            event.client_x() as f64 - self.surface.canvas_left,
-            event.client_y() as f64 - self.surface.canvas_top,
-        )
+    /// The pointer position in canvas coordinates. Taken from the event itself (`offsetX/Y` are
+    /// relative to the canvas, the listeners' target) rather than from a stored canvas position:
+    /// one measured at startup, while the treemap view was still hidden, read as (0, 0) and put
+    /// every hover and click 60px below the cursor until the window was resized.
+    fn canvas_point(event: &MouseEvent) -> (f64, f64) {
+        (event.offset_x() as f64, event.offset_y() as f64)
     }
 
     pub(super) fn clear_hover(&mut self) -> Result<(), JsValue> {
@@ -67,7 +67,7 @@ impl TreemapApp {
         if self.view.zoom_anim.is_some() {
             return Ok(());
         }
-        self.view.last_mouse = Some(self.canvas_point(&event));
+        self.view.last_mouse = Some(Self::canvas_point(&event));
 
         let previous = self.view.hovered_index;
         self.recompute_hover()?;
@@ -135,7 +135,7 @@ impl TreemapApp {
         if self.view.zoom_anim.is_some() {
             return Ok(());
         }
-        let (mouse_x, mouse_y) = self.canvas_point(&event);
+        let (mouse_x, mouse_y) = Self::canvas_point(&event);
         if let Some(index) = find_navigable_target_index(&self.view.rects, mouse_x, mouse_y) {
             let id = self.view.rects[index].id as u64;
             self.begin_navigation(ClientMessage::Navigate { id })?;
@@ -144,7 +144,7 @@ impl TreemapApp {
     }
 
     pub(super) fn handle_context_menu(&mut self, event: MouseEvent) -> Result<(), JsValue> {
-        let (mouse_x, mouse_y) = self.canvas_point(&event);
+        let (mouse_x, mouse_y) = Self::canvas_point(&event);
         if let Some(index) = find_rect_index(&self.view.rects, mouse_x, mouse_y) {
             let rect = &self.view.rects[index];
             if rect.is_file {

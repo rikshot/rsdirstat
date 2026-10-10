@@ -90,8 +90,6 @@ struct SurfaceState {
     pixel_ratio: f64,
     canvas_width: f64,
     canvas_height: f64,
-    canvas_left: f64,
-    canvas_top: f64,
     raf_pending: bool,
 }
 
@@ -208,8 +206,6 @@ impl TreemapApp {
                 pixel_ratio,
                 canvas_width: 0.0,
                 canvas_height: 0.0,
-                canvas_left: 0.0,
-                canvas_top: 0.0,
                 raf_pending: false,
             },
             view: ViewState {
