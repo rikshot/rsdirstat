@@ -94,9 +94,11 @@ struct AppState {
     scan: ScanState,
     view: Mutex<ViewConfig>,
     layout: LayoutBroadcast,
-    /// Open WebSocket connections; the layout loop idles at zero and the server exits after a
-    /// grace period once the last one closes.
+    /// Open WebSocket connections (see `Connection`); the layout loop idles at zero and the server
+    /// exits after a grace period once the last one closes.
     connections: AtomicU64,
+    /// Connections ever opened. A shutdown timer only fires if this hasn't moved since it was armed.
+    connects: AtomicU64,
     start: Notify,
     shutdown: watch::Sender<bool>,
     picker_mode: bool,
@@ -167,6 +169,7 @@ async fn run_server(args: Args) -> Result<()> {
             notify: Notify::new(),
         },
         connections: AtomicU64::new(0),
+        connects: AtomicU64::new(0),
         start: Notify::new(),
         shutdown: watch::channel(false).0,
         picker_mode,
@@ -459,8 +462,44 @@ fn is_safe_component(name: &str) -> bool {
     matches!(components.next(), Some(std::path::Component::Normal(_))) && components.next().is_none()
 }
 
+/// Holds one count in `AppState::connections` for the life of a WebSocket handler, whichever way it
+/// exits. Dropping the last one arms the auto-shutdown timer.
+struct Connection(Arc<AppState>);
+
+impl Connection {
+    fn open(state: &Arc<AppState>) -> Self {
+        state.connections.fetch_add(1, Ordering::Relaxed);
+        state.connects.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(state))
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if self.0.connections.fetch_sub(1, Ordering::Relaxed) != 1 {
+            return;
+        }
+        // A handler dropped while the runtime itself shuts down has no timer to arm.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let state = Arc::clone(&self.0);
+        let armed_at = state.connects.load(Ordering::Relaxed);
+        runtime.spawn(async move {
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            // Shut down only if nobody connected during the grace period. Checking just the count
+            // would let an earlier disconnect's timer fire right after a later reconnect-and-leave
+            // (two quick reloads), well inside that second disconnect's grace period.
+            if state.connects.load(Ordering::Relaxed) == armed_at {
+                let _ = state.shutdown.send(true);
+            }
+        });
+    }
+}
+
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
-    state.connections.fetch_add(1, Ordering::Relaxed);
+    // Held to the end of the handler, including the early returns when a send fails.
+    let _connection = Connection::open(&state);
 
     // Subscribe before reading the snapshot: a layout produced between the snapshot read and the
     // subscribe would otherwise be lost to this client (absent from the snapshot, broadcast before
@@ -508,17 +547,6 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
             }
             _ = shutdown_rx.changed() => break,
         }
-    }
-
-    if state.connections.fetch_sub(1, Ordering::Relaxed) == 1 {
-        let server = Arc::clone(&state);
-        tokio::spawn(async move {
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
-            // This timer only spawns when the last connection drops, so a connection always existed.
-            if server.connections.load(Ordering::Relaxed) == 0 {
-                let _ = server.shutdown.send(true);
-            }
-        });
     }
 }
 
