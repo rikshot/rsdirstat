@@ -178,9 +178,11 @@ jobs:
           path: crates/rsdirstat/tests/snapshots/
           retention-days: 14
       # Playwright traces are written only for failing browser tests (retain-on-failure);
-      # upload them so a red cross-OS run is debuggable without reproducing locally.
+      # upload them so a red cross-OS run is debuggable without reproducing locally. `always()`
+      # rather than `failure()`: a test that fails and then passes on retry leaves its trace
+      # behind in a green job, and those flakes are the ones hardest to reproduce.
       - uses: actions/upload-artifact@v7
-        if: failure()
+        if: always()
         with:
           name: playwright-traces-${{ matrix.os }}
           path: crates/rsdirstat/tests/traces/
