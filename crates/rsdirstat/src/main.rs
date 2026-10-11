@@ -338,7 +338,8 @@ fn start_scan(state: &Arc<AppState>) {
     tokio::task::spawn_blocking(move || {
         // Reused across iterations so the per-batch drain doesn't reallocate each wakeup.
         let mut events = Vec::new();
-        while let Ok(event) = rx.recv() {
+        let mut scan_done = false;
+        while !scan_done && let Ok(event) = rx.recv() {
             if relay_state.scan.generation.load(Ordering::Relaxed) != generation {
                 break;
             }
@@ -349,12 +350,15 @@ fn start_scan(state: &Arc<AppState>) {
             }
 
             let mut tree = relay_state.scan.tree.write();
+            // `ScanDone` is the last event to apply: a cancelled or stalled scan can leave a worker
+            // that is still inside a directory, and what it sends afterwards would change a result
+            // already shown as finished.
             for event in events.drain(..) {
                 let start_path = match &event {
                     ScanEvent::ScanStart { path } => Some(path.clone()),
                     _ => None,
                 };
-                let done = matches!(event, ScanEvent::ScanDone);
+                scan_done = matches!(event, ScanEvent::ScanDone);
                 tree.apply(event);
                 if let Some(path) = start_path {
                     relay_state.view.lock().view_root = None;
@@ -364,8 +368,9 @@ fn start_scan(state: &Arc<AppState>) {
                         .tx
                         .send(wire::ServerMessage::ScanStart { path }.encode().into());
                 }
-                if done {
+                if scan_done {
                     relay_state.scan.done.store(true, Ordering::Relaxed);
+                    break;
                 }
             }
             drop(tree);

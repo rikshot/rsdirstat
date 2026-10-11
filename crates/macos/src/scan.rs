@@ -1,15 +1,14 @@
 use std::ffi::{CStr, CString};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use dashmap::DashSet;
-use rsdirstat_core::scan::{WorkQueue, node_id, raise_fd_limit};
+use rsdirstat_core::scan::{
+    DirJob, DirSink, ScanOutcome, node_id, open_dir, open_dir_at, raise_fd_limit, root_name, run_scan,
+};
 use rsdirstat_protocol::ScanEvent;
 
 const VREG: u32 = 1;
@@ -20,8 +19,6 @@ const VDIR: u32 = 2;
 // the full "online" size while 0 bytes are allocated on disk, so we count it as 0. Read-only flag,
 // surfaced via ATTR_CMN_FLAGS; reading attributes never triggers a download.
 const SF_DATALESS: u32 = 0x4000_0000;
-
-const BUF_SIZE: usize = 1024 * 1024;
 
 static SCAN_ATTRS: libc::attrlist = libc::attrlist {
     bitmapcount: libc::ATTR_BIT_MAP_COUNT,
@@ -43,49 +40,8 @@ static SCAN_ATTRS: libc::attrlist = libc::attrlist {
     forkattr: 0,
 };
 
-struct WorkItem {
-    fd: OwnedFd,
-    file_id: u64,
-    parent_id: u64,
-    name: String,
-    path: String,
-}
-
-struct RootInfo {
-    path: std::path::PathBuf,
-    ino: u64,
-    dev: u64,
-    name: String,
-    fd: OwnedFd,
-}
-
-fn open_root(root: &Path) -> Result<RootInfo> {
-    raise_fd_limit();
-    let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
-    let meta = std::fs::metadata(&path).context("failed to stat root path")?;
-    let dev = meta.dev();
-    let ino = meta.ino();
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    let c_path = CString::new(path.as_os_str().as_bytes()).context("path contains null byte")?;
-    let raw_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-    if raw_fd < 0 {
-        anyhow::bail!("failed to open root directory");
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-    Ok(RootInfo {
-        path,
-        ino,
-        dev,
-        name,
-        fd,
-    })
-}
-
-pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
-    scan_cancellable(root, cross_filesystems, tx, Arc::new(AtomicBool::new(false)))
+pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<ScanOutcome> {
+    scan_cancellable(root, cross_filesystems, tx, Arc::default())
 }
 
 /// Scan, aborting promptly if `cancel` is set. The server trips this when a scan is superseded by a
@@ -95,110 +51,37 @@ pub fn scan_cancellable(
     cross_filesystems: bool,
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
-) -> Result<()> {
-    let root_info = open_root(root)?;
-
-    let _ = tx.send(ScanEvent::ScanStart {
-        path: root_info.name.clone(),
-    });
-
-    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-
-    let root_id = node_id(root_info.dev, root_info.ino);
-    let visited = {
-        let set = DashSet::new();
-        set.insert(root_id);
-        Arc::new(set)
-    };
-    // Hardlinked files (nlink > 1) are deduped across the whole scan by their (dev, ino) identity.
-    let visited_files: Arc<DashSet<u64>> = Arc::new(DashSet::new());
-
-    let work = Arc::new(WorkQueue::new());
-    work.push(vec![WorkItem {
-        fd: root_info.fd,
-        file_id: root_id,
+) -> Result<ScanOutcome> {
+    raise_fd_limit();
+    let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
+    let meta = std::fs::metadata(&path).context("failed to stat root path")?;
+    let fd = open_dir(&path).context("failed to open root directory")?;
+    let root = DirJob {
+        handle: fd,
+        id: node_id(meta.dev(), meta.ino()),
         parent_id: 0,
-        name: root_info.name.clone(),
-        path: root_info.path.display().to_string(),
-    }]);
-
-    let active_dirs: Arc<Vec<Mutex<String>>> = Arc::new((0..num_threads).map(|_| Mutex::new(String::new())).collect());
-
-    let _handles: Vec<_> = (0..num_threads)
-        .map(|tid| {
-            let work = Arc::clone(&work);
-            let tx = tx.clone();
-            let visited = Arc::clone(&visited);
-            let visited_files = Arc::clone(&visited_files);
-            let root_dev_i32 = root_info.dev as i32;
-            let active = Arc::clone(&active_dirs);
-            let cancel = Arc::clone(&cancel);
-            thread::spawn(move || {
-                let mut buffer = vec![0u8; BUF_SIZE];
-
-                while let Some(item) = work.take() {
-                    if cancel.load(Ordering::Relaxed) {
-                        work.cancel(); // unwind every worker: clears the queue and wakes blocked takers
-                        break;
-                    }
-                    *active[tid].lock().unwrap() = item.path.clone();
-                    scan_directory(
-                        item.fd,
-                        item.file_id,
-                        item.parent_id,
-                        &item.name,
-                        root_dev_i32,
-                        cross_filesystems,
-                        &mut buffer,
-                        &work,
-                        &tx,
-                        &visited,
-                        &visited_files,
-                        &item.path,
-                    );
-                    work.finish_one();
-                }
-            })
-        })
-        .collect();
-
-    work.wait_with_stall_detection(|| {
-        eprintln!("Stuck directories:");
-        for dir in active_dirs.iter() {
-            let name = dir.lock().unwrap();
-            if !name.is_empty() {
-                eprintln!("  {name}");
-            }
-        }
-    });
-
-    let _ = tx.send(ScanEvent::ScanDone);
-    Ok(())
+        name: root_name(&path),
+        path: path.display().to_string(),
+    };
+    let root_dev = meta.dev() as i32;
+    Ok(run_scan(root, tx, cancel, move |dir, buffer, sink| {
+        read_dir(dir, buffer, sink, root_dev, cross_filesystems)
+    }))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn scan_directory(
-    fd: OwnedFd,
-    dir_file_id: u64,
-    parent_id: u64,
-    dir_name: &str,
+/// Read one directory with `getattrlistbulk`, which returns entries and their attributes in
+/// batches, so files need no further syscalls.
+fn read_dir(
+    dir: &DirJob<OwnedFd>,
+    buffer: &mut [u8],
+    sink: &mut DirSink<'_, OwnedFd>,
     root_dev: i32,
     cross_filesystems: bool,
-    buffer: &mut [u8],
-    work: &WorkQueue<WorkItem>,
-    tx: &std::sync::mpsc::Sender<ScanEvent>,
-    visited: &DashSet<u64>,
-    visited_files: &DashSet<u64>,
-    dir_path: &str,
 ) {
-    let mut new_work = Vec::new();
-    let mut dir_total: u64 = 0;
-    let mut dir_mtime: i64 = 0;
-
     loop {
         let count = unsafe {
             libc::getattrlistbulk(
-                fd.as_raw_fd(),
+                dir.handle.as_raw_fd(),
                 &SCAN_ATTRS as *const libc::attrlist as *mut libc::c_void,
                 buffer.as_mut_ptr() as *mut libc::c_void,
                 buffer.len(),
@@ -208,7 +91,8 @@ fn scan_directory(
 
         if count < 0 {
             eprintln!(
-                "getattrlistbulk failed for {dir_name}: {}",
+                "getattrlistbulk failed for {}: {}",
+                dir.name,
                 std::io::Error::last_os_error()
             );
             break;
@@ -234,54 +118,21 @@ fn scan_directory(
                 && parsed.name != ".."
                 && (cross_filesystems || parsed.dev_id == root_dev)
             {
+                let id = || node_id(parsed.dev_id as u32 as u64, parsed.file_id);
                 match parsed.obj_type {
                     VDIR => {
-                        if let Ok(c_name) = CString::new(parsed.name) {
-                            let raw_fd = unsafe {
-                                libc::openat(
-                                    fd.as_raw_fd(),
-                                    c_name.as_ptr(),
-                                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                                )
-                            };
-                            if raw_fd >= 0 {
-                                let child_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-                                let child_id = node_id(parsed.dev_id as u32 as u64, parsed.file_id);
-                                if visited.insert(child_id) {
-                                    new_work.push(WorkItem {
-                                        fd: child_fd,
-                                        file_id: child_id,
-                                        parent_id: dir_file_id,
-                                        name: parsed.name.to_string(),
-                                        path: if dir_path.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!("{}/{}", dir_path.trim_end_matches('/'), parsed.name)
-                                        },
-                                    });
-                                }
-                            }
+                        if let Some(child) = CString::new(parsed.name)
+                            .ok()
+                            .and_then(|name| open_dir_at(&dir.handle, &name))
+                        {
+                            sink.dir(id(), parsed.name, sink.child_path(parsed.name), child);
                         }
                     }
                     VREG => {
-                        // Skip hardlinks already counted under another name (matches `du`).
-                        let counted = parsed.nlink <= 1
-                            || visited_files.insert(node_id(parsed.dev_id as u32 as u64, parsed.file_id));
-                        if counted {
-                            // Unmaterialized cloud placeholders occupy 0 bytes on disk; count them
-                            // as such rather than their "online" logical length.
-                            let file_size = if parsed.dataless { 0 } else { parsed.file_size };
-                            dir_total += file_size;
-                            dir_mtime = dir_mtime.max(parsed.mtime);
-                            if file_size > 0 {
-                                let _ = tx.send(ScanEvent::File {
-                                    parent: dir_file_id,
-                                    name: parsed.name.to_string(),
-                                    size: file_size,
-                                    mtime: parsed.mtime,
-                                });
-                            }
-                        }
+                        // Unmaterialized cloud placeholders occupy 0 bytes on disk; count them as
+                        // such rather than their "online" logical length.
+                        let size = if parsed.dataless { 0 } else { parsed.file_size };
+                        sink.file(parsed.name, size, parsed.mtime, (parsed.nlink > 1).then(id));
                     }
                     _ => {}
                 }
@@ -289,19 +140,11 @@ fn scan_directory(
 
             offset += entry_length;
         }
+
+        if !sink.checkpoint() {
+            break;
+        }
     }
-
-    drop(fd);
-
-    let _ = tx.send(ScanEvent::Dir {
-        id: dir_file_id,
-        parent: parent_id,
-        name: dir_name.to_string(),
-        size: dir_total,
-        mtime: dir_mtime,
-    });
-
-    work.push(new_work);
 }
 
 struct ParsedEntry<'a> {

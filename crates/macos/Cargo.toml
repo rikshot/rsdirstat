@@ -18,4 +18,3 @@ rsdirstat-core.workspace = true
 rsdirstat-protocol.workspace = true
 anyhow.workspace = true
 libc.workspace = true
-dashmap.workspace = true

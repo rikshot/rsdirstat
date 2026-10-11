@@ -87,6 +87,8 @@ pub enum ScanEvent {
         size: u64,
         mtime: i64,
     },
+    /// The last event a consumer should apply. After a cancelled or stalled scan, a worker still
+    /// inside a directory may send a few more, which must be ignored.
     ScanDone,
 }
 

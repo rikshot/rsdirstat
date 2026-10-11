@@ -5,11 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Core library for rsdirstat: treemap layout, directory tree, and work queue"
+description = "Core library for rsdirstat: treemap layout, directory tree, and the scan driver"
 categories = ["filesystem", "visualization"]
 
 [dependencies]
 rsdirstat-protocol.workspace = true
+dashmap.workspace = true
 mime = "0.3"
 mime_guess = "2"
 

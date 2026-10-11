@@ -1,20 +1,17 @@
-use std::ffi::{CStr, CString};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::ffi::CStr;
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use dashmap::DashSet;
-use rsdirstat_core::scan::{WorkQueue, node_id, raise_fd_limit};
+use rsdirstat_core::scan::{
+    DirJob, DirSink, ScanOutcome, node_id, open_dir, open_dir_at, raise_fd_limit, root_name, run_scan,
+};
 use rsdirstat_protocol::ScanEvent;
 
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
-
-const BUF_SIZE: usize = 1024 * 1024;
 
 const STATX_TYPE: u32 = 0x0001;
 const STATX_MODE: u32 = 0x0002;
@@ -97,49 +94,8 @@ fn statx_fd(fd: i32, mask: u32) -> Option<Statx> {
     if ret == 0 { Some(buf) } else { None }
 }
 
-struct WorkItem {
-    fd: OwnedFd,
-    file_id: u64,
-    parent_id: u64,
-    name: String,
-    path: String,
-}
-
-struct RootInfo {
-    path: std::path::PathBuf,
-    ino: u64,
-    dev: u64,
-    mnt_id: u64,
-    name: String,
-    fd: OwnedFd,
-}
-
-fn open_root(root: &Path) -> Result<RootInfo> {
-    raise_fd_limit();
-    let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    let c_path = CString::new(path.as_os_str().as_bytes()).context("path contains null byte")?;
-    let raw_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-    if raw_fd < 0 {
-        anyhow::bail!("failed to open root directory");
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-    let sx = statx_fd(fd.as_raw_fd(), STATX_MNT_ID).context("failed to statx root directory")?;
-    Ok(RootInfo {
-        path,
-        ino: sx.stx_ino,
-        dev: makedev(sx.stx_dev_major, sx.stx_dev_minor),
-        mnt_id: sx.stx_mnt_id,
-        name,
-        fd,
-    })
-}
-
-pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
-    scan_cancellable(root, cross_filesystems, tx, Arc::new(AtomicBool::new(false)))
+pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<ScanOutcome> {
+    scan_cancellable(root, cross_filesystems, tx, Arc::default())
 }
 
 /// Scan, aborting promptly if `cancel` is set. The server trips this when a scan is superseded by a
@@ -149,118 +105,50 @@ pub fn scan_cancellable(
     cross_filesystems: bool,
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
-) -> Result<()> {
-    let root_info = open_root(root)?;
-
-    let _ = tx.send(ScanEvent::ScanStart {
-        path: root_info.name.clone(),
-    });
-
-    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-
-    let root_id = node_id(root_info.dev, root_info.ino);
-    let visited = {
-        let set = DashSet::new();
-        set.insert(root_id);
-        Arc::new(set)
-    };
-    // Hardlinked files (nlink > 1) are deduped across the whole scan by their (dev, ino) identity.
-    let visited_files: Arc<DashSet<u64>> = Arc::new(DashSet::new());
-
-    let work = Arc::new(WorkQueue::new());
-    work.push(vec![WorkItem {
-        fd: root_info.fd,
-        file_id: root_id,
+) -> Result<ScanOutcome> {
+    raise_fd_limit();
+    let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
+    let fd = open_dir(&path).context("failed to open root directory")?;
+    let sx = statx_fd(fd.as_raw_fd(), STATX_MNT_ID).context("failed to statx root directory")?;
+    let root = DirJob {
+        handle: fd,
+        id: node_id(makedev(sx.stx_dev_major, sx.stx_dev_minor), sx.stx_ino),
         parent_id: 0,
-        name: root_info.name.clone(),
-        path: root_info.path.display().to_string(),
-    }]);
-
-    let active_dirs: Arc<Vec<Mutex<String>>> = Arc::new((0..num_threads).map(|_| Mutex::new(String::new())).collect());
-    let root_mnt_id = root_info.mnt_id;
-
-    let _handles: Vec<_> = (0..num_threads)
-        .map(|tid| {
-            let work = Arc::clone(&work);
-            let tx = tx.clone();
-            let visited = Arc::clone(&visited);
-            let visited_files = Arc::clone(&visited_files);
-            let active = Arc::clone(&active_dirs);
-            let cancel = Arc::clone(&cancel);
-            thread::spawn(move || {
-                let mut buffer = vec![0u8; BUF_SIZE];
-
-                while let Some(item) = work.take() {
-                    if cancel.load(Ordering::Relaxed) {
-                        work.cancel(); // unwind every worker: clears the queue and wakes blocked takers
-                        break;
-                    }
-                    *active[tid].lock().unwrap() = item.path.clone();
-                    scan_directory(
-                        item.fd,
-                        item.file_id,
-                        item.parent_id,
-                        &item.name,
-                        root_mnt_id,
-                        cross_filesystems,
-                        &mut buffer,
-                        &work,
-                        &tx,
-                        &visited,
-                        &visited_files,
-                        &item.path,
-                    );
-                    work.finish_one();
-                }
-            })
-        })
-        .collect();
-
-    work.wait_with_stall_detection(|| {
-        eprintln!("Stuck directories:");
-        for dir in active_dirs.iter() {
-            let name = dir.lock().unwrap();
-            if !name.is_empty() {
-                eprintln!("  {name}");
-            }
-        }
-    });
-
-    let _ = tx.send(ScanEvent::ScanDone);
-    Ok(())
+        name: root_name(&path),
+        path: path.display().to_string(),
+    };
+    let root_mnt_id = sx.stx_mnt_id;
+    Ok(run_scan(root, tx, cancel, move |dir, buffer, sink| {
+        read_dir(dir, buffer, sink, root_mnt_id, cross_filesystems)
+    }))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn scan_directory(
-    fd: OwnedFd,
-    dir_file_id: u64,
-    parent_id: u64,
-    dir_name: &str,
+/// Read one directory with raw `getdents64`, then `statx` each file for its size and mtime, and
+/// each subdirectory for its device and mount.
+fn read_dir(
+    dir: &DirJob<OwnedFd>,
+    buffer: &mut [u8],
+    sink: &mut DirSink<'_, OwnedFd>,
     root_mnt_id: u64,
     cross_filesystems: bool,
-    buffer: &mut [u8],
-    work: &WorkQueue<WorkItem>,
-    tx: &std::sync::mpsc::Sender<ScanEvent>,
-    visited: &DashSet<u64>,
-    visited_files: &DashSet<u64>,
-    dir_path: &str,
 ) {
-    let mut new_work = Vec::new();
-    let mut dir_total: u64 = 0;
-    let mut dir_mtime: i64 = 0;
-
+    let dir_fd = dir.handle.as_raw_fd();
     loop {
         let nread = unsafe {
             libc::syscall(
                 libc::SYS_getdents64,
-                fd.as_raw_fd(),
+                dir_fd,
                 buffer.as_mut_ptr() as *mut libc::c_void,
                 buffer.len(),
             )
         };
 
         if nread < 0 {
-            eprintln!("getdents64 failed for {dir_name}: {}", std::io::Error::last_os_error());
+            eprintln!(
+                "getdents64 failed for {}: {}",
+                dir.name,
+                std::io::Error::last_os_error()
+            );
             break;
         }
         if nread == 0 {
@@ -283,35 +171,26 @@ fn scan_directory(
             if d_reclen == 0 || offset + d_reclen > nread {
                 break;
             }
+            let record = &buffer[offset..offset + d_reclen];
+            offset += d_reclen;
 
-            let name = match CStr::from_bytes_until_nul(&buffer[offset + 19..offset + d_reclen]) {
-                Ok(cstr) => cstr,
-                Err(_) => {
-                    offset += d_reclen;
-                    continue;
-                }
+            let Ok(name) = CStr::from_bytes_until_nul(&record[19..]) else {
+                continue;
             };
-
             let name_str = match name.to_str() {
                 Ok(s) if s != "." && s != ".." => s,
-                _ => {
-                    offset += d_reclen;
-                    continue;
-                }
+                _ => continue,
             };
 
             // Resolve DT_UNKNOWN via statx
             let entry_type = if d_type == 0 {
-                match statx_path(fd.as_raw_fd(), name.as_ptr(), STATX_TYPE | STATX_MODE) {
+                match statx_path(dir_fd, name.as_ptr(), STATX_TYPE | STATX_MODE) {
                     Some(sx) => match sx.stx_mode as u32 & libc::S_IFMT {
                         libc::S_IFDIR => DT_DIR,
                         libc::S_IFREG => DT_REG,
                         _ => 0,
                     },
-                    None => {
-                        offset += d_reclen;
-                        continue;
-                    }
+                    None => continue,
                 }
             } else {
                 d_type
@@ -319,86 +198,33 @@ fn scan_directory(
 
             match entry_type {
                 DT_DIR => {
-                    let raw_fd = unsafe {
-                        libc::openat(
-                            fd.as_raw_fd(),
-                            name.as_ptr(),
-                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                        )
+                    let Some(child) = open_dir_at(&dir.handle, name) else {
+                        continue;
                     };
-                    if raw_fd >= 0 {
-                        let child_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-
-                        // statx the child for its device (node identity) and mount id (the
-                        // filesystem-boundary check). stx_dev is always populated; stx_mnt_id needs
-                        // the mask.
-                        let sx = statx_fd(child_fd.as_raw_fd(), STATX_MNT_ID);
-                        if !cross_filesystems {
-                            match &sx {
-                                Some(s) if s.stx_mnt_id == root_mnt_id => {}
-                                _ => {
-                                    offset += d_reclen;
-                                    continue;
-                                }
-                            }
-                        }
-
-                        let child_dev = sx.as_ref().map_or(0, |s| makedev(s.stx_dev_major, s.stx_dev_minor));
-                        let child_id = node_id(child_dev, d_ino);
-                        if visited.insert(child_id) {
-                            new_work.push(WorkItem {
-                                fd: child_fd,
-                                file_id: child_id,
-                                parent_id: dir_file_id,
-                                name: name_str.to_string(),
-                                path: if dir_path.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!("{}/{}", dir_path.trim_end_matches('/'), name_str)
-                                },
-                            });
-                        }
+                    // statx the child for its device (node identity) and mount id (the
+                    // filesystem-boundary check). stx_dev is always populated; stx_mnt_id needs
+                    // the mask.
+                    let sx = statx_fd(child.as_raw_fd(), STATX_MNT_ID);
+                    if !cross_filesystems && sx.as_ref().is_none_or(|s| s.stx_mnt_id != root_mnt_id) {
+                        continue;
                     }
+                    let child_dev = sx.as_ref().map_or(0, |s| makedev(s.stx_dev_major, s.stx_dev_minor));
+                    sink.dir(node_id(child_dev, d_ino), name_str, sink.child_path(name_str), child);
                 }
                 DT_REG => {
-                    if let Some(sx) = statx_path(fd.as_raw_fd(), name.as_ptr(), STATX_SIZE | STATX_MTIME | STATX_NLINK)
-                    {
-                        // Skip hardlinks already counted under another name (matches `du`). Use the
-                        // entry's inode (d_ino) with the file's device for identity.
-                        let dev = makedev(sx.stx_dev_major, sx.stx_dev_minor);
-                        let counted = sx.stx_nlink <= 1 || visited_files.insert(node_id(dev, d_ino));
-                        if counted {
-                            let file_size = sx.stx_size;
-                            let mtime = sx.stx_mtime.tv_sec;
-                            dir_total += file_size;
-                            dir_mtime = dir_mtime.max(mtime);
-                            if file_size > 0 {
-                                let _ = tx.send(ScanEvent::File {
-                                    parent: dir_file_id,
-                                    name: name_str.to_string(),
-                                    size: file_size,
-                                    mtime,
-                                });
-                            }
-                        }
+                    if let Some(sx) = statx_path(dir_fd, name.as_ptr(), STATX_SIZE | STATX_MTIME | STATX_NLINK) {
+                        // Hardlink identity: the entry's inode (d_ino) with the file's device.
+                        let hardlink =
+                            (sx.stx_nlink > 1).then(|| node_id(makedev(sx.stx_dev_major, sx.stx_dev_minor), d_ino));
+                        sink.file(name_str, sx.stx_size, sx.stx_mtime.tv_sec, hardlink);
                     }
                 }
                 _ => {}
             }
+        }
 
-            offset += d_reclen;
+        if !sink.checkpoint() {
+            break;
         }
     }
-
-    drop(fd);
-
-    let _ = tx.send(ScanEvent::Dir {
-        id: dir_file_id,
-        parent: parent_id,
-        name: dir_name.to_string(),
-        size: dir_total,
-        mtime: dir_mtime,
-    });
-
-    work.push(new_work);
 }

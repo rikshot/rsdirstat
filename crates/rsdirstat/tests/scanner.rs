@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::mpsc;
 
+use rsdirstat_core::scan::ScanOutcome;
 use rsdirstat_core::tree::DirTree;
 use rsdirstat_protocol::ScanEvent;
 
@@ -21,15 +22,19 @@ fn scan_to_tree(root: &Path) -> (DirTree, Vec<(u64, String, u64)>) {
     let mut tree = DirTree::new();
     let mut files = Vec::new();
 
-    // Runs until the scanner and its workers drop their senders; `ScanDone` recomputes sizes.
+    // `ScanDone` is the last event, and applying it recomputes the sizes.
     for event in rx {
         if let ScanEvent::File { parent, name, size, .. } = &event {
             files.push((*parent, name.clone(), *size));
         }
+        let done = matches!(event, ScanEvent::ScanDone);
         tree.apply(event);
+        if done {
+            break;
+        }
     }
 
-    handle.join().unwrap();
+    assert_eq!(handle.join().unwrap(), ScanOutcome::Complete);
     (tree, files)
 }
 

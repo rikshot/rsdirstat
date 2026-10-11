@@ -1565,6 +1565,7 @@ dependencies = [
 name = "rsdirstat-core"
 version = "0.1.3"
 dependencies = [
+ "dashmap",
  "libc",
  "mime",
  "mime_guess",
@@ -1576,7 +1577,6 @@ name = "rsdirstat-linux"
 version = "0.1.3"
 dependencies = [
  "anyhow",
- "dashmap",
  "libc",
  "rsdirstat-core",
  "rsdirstat-protocol",
@@ -1587,7 +1587,6 @@ name = "rsdirstat-macos"
 version = "0.1.3"
 dependencies = [
  "anyhow",
- "dashmap",
  "libc",
  "rsdirstat-core",
  "rsdirstat-protocol",
@@ -1618,7 +1617,6 @@ name = "rsdirstat-windows"
 version = "0.1.3"
 dependencies = [
  "anyhow",
- "dashmap",
  "rsdirstat-core",
  "rsdirstat-protocol",
  "windows-sys 0.61.2",
