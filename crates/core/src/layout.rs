@@ -1,14 +1,15 @@
-use crate::color::{COLOR_MODE_AGE, age_hue, hash_id_to_hue};
+use rsdirstat_protocol::{ColorMode, LayoutRect, RectKind};
+
+use crate::color::{age_hue, hash_id_to_hue};
 use crate::tree::{DirNode, DirTree, FileEntry, FilterConfig, NodeMap};
-pub use rsdirstat_protocol::{LayoutRect, RectKind};
 
 const MIN_NEST_PX: f64 = 40.0;
 
-pub struct LayoutConfig {
+/// How a view is laid out.
+pub struct LayoutConfig<'a> {
     pub max_depth: u8,
-    pub color_mode: u8,
-    pub filter: FilterConfig,
-    pub mtime_range: (i64, i64),
+    pub color_mode: ColorMode,
+    pub filter: &'a FilterConfig,
 }
 
 /// A view's treemap.
@@ -20,29 +21,47 @@ pub struct Layout {
     pub rects: Vec<LayoutRect>,
 }
 
-pub fn compute_layout(tree: &DirTree, view_root: u64, canvas_w: f64, canvas_h: f64, config: &LayoutConfig) -> Layout {
-    let filtered_sizes = config
-        .filter
-        .is_active()
-        .then(|| tree.compute_filtered_sizes(&config.filter, view_root));
-    compute_layout_with(tree, view_root, canvas_w, canvas_h, config, filtered_sizes.as_ref())
+/// Sizes under a filter, kept from one layout of a view to the next while the tree, the filter and
+/// the view root stay the same. Filtering visits every file under the view, too much to repeat for
+/// each layout of a big tree that hasn't changed (resizing a window lays it out many times).
+#[derive(Default)]
+pub struct FilteredSizes {
+    /// What `sizes` were computed for: the tree as of its `changes`, the view root and the filter.
+    key: Option<(u64, u64, FilterConfig)>,
+    sizes: NodeMap<u64>,
 }
 
-/// `compute_layout` with the sizes under `config`'s filter already computed (by
-/// `DirTree::compute_filtered_sizes`, over at least `view_root`'s subtree), or `None` with no
-/// filter active. Filtering means visiting every file under the view, so a caller laying out an
-/// unchanged tree again (a resize, another depth) can keep them.
-pub fn compute_layout_with(
+impl FilteredSizes {
+    fn get(&mut self, tree: &DirTree, filter: &FilterConfig, view_root: u64) -> &NodeMap<u64> {
+        let fresh = self
+            .key
+            .as_ref()
+            .is_some_and(|(changes, root, cached)| *changes == tree.changes && *root == view_root && cached == filter);
+        if !fresh {
+            self.sizes = tree.compute_filtered_sizes(filter, view_root);
+            self.key = Some((tree.changes, view_root, filter.clone()));
+        }
+        &self.sizes
+    }
+}
+
+/// Lay out `view_root`'s subtree on a `canvas_w` × `canvas_h` canvas. With a filter active,
+/// `filtered` holds on to the sizes it leaves for the view's next layout.
+pub fn compute_layout(
     tree: &DirTree,
     view_root: u64,
     canvas_w: f64,
     canvas_h: f64,
     config: &LayoutConfig,
-    filtered_sizes: Option<&NodeMap<u64>>,
+    filtered: &mut FilteredSizes,
 ) -> Layout {
     let Some(root) = tree.nodes.get(&view_root) else {
         return Layout::default();
     };
+    let filtered_sizes = config
+        .filter
+        .is_active()
+        .then(|| filtered.get(tree, config.filter, view_root));
     let mut ctx = LayoutCtx {
         tree,
         filtered_sizes,
@@ -88,7 +107,7 @@ struct LayoutCtx<'a> {
     /// With a filter active, sizes counting only the files it matches; otherwise each directory's
     /// own `size` is used.
     filtered_sizes: Option<&'a NodeMap<u64>>,
-    config: &'a LayoutConfig,
+    config: &'a LayoutConfig<'a>,
     out: Vec<LayoutRect>,
 }
 
@@ -101,8 +120,8 @@ impl<'a> LayoutCtx<'a> {
     }
 
     fn hue(&self, hue: u16, mtime: i64) -> u16 {
-        if self.config.color_mode == COLOR_MODE_AGE {
-            let (min_time, max_time) = self.config.mtime_range;
+        if self.config.color_mode == ColorMode::Age {
+            let (min_time, max_time) = self.tree.mtime_range;
             age_hue(mtime, min_time, max_time)
         } else {
             hue
@@ -346,13 +365,32 @@ fn squarify<T>(items: &[T], size: impl Fn(&T) -> f64, bounds: Rect, out: &mut Ve
 mod tests {
     use super::*;
 
-    fn default_config() -> LayoutConfig {
+    const NO_FILTER: &FilterConfig = &FilterConfig {
+        extensions: Vec::new(),
+        min_size: 0,
+        max_size: 0,
+        name_pattern: String::new(),
+    };
+
+    fn default_config() -> LayoutConfig<'static> {
         LayoutConfig {
             max_depth: 3,
-            color_mode: 0,
-            filter: FilterConfig::default(),
-            mtime_range: (0, 0),
+            color_mode: ColorMode::Type,
+            filter: NO_FILTER,
         }
+    }
+
+    /// The rects of a layout made afresh.
+    fn layout(tree: &DirTree, view_root: u64, canvas_w: f64, canvas_h: f64, config: &LayoutConfig) -> Vec<LayoutRect> {
+        compute_layout(
+            tree,
+            view_root,
+            canvas_w,
+            canvas_h,
+            config,
+            &mut FilteredSizes::default(),
+        )
+        .rects
     }
 
     /// In Age mode a folder drawn as one block takes the colour of its newest content, not of its
@@ -367,11 +405,10 @@ mod tests {
         tree.insert_dir(5, 4, "inside-new", 500, 2_000);
         let config = LayoutConfig {
             max_depth: 1,
-            color_mode: COLOR_MODE_AGE,
-            mtime_range: tree.mtime_range,
+            color_mode: ColorMode::Age,
             ..default_config()
         };
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
+        let rects = layout(&tree, 1, 800.0, 600.0, &config);
         let rect = |name: &str| rects.iter().find(|rect| rect.name == name).unwrap();
         assert_eq!((rect("old").hue, rect("old").mtime), (0, 1_000), "oldest: red");
         assert_eq!((rect("new").hue, rect("new").mtime), (120, 2_000), "newest: green");
@@ -381,7 +418,7 @@ mod tests {
     fn empty_tree_produces_empty_layout() {
         let tree = DirTree::new();
         let config = default_config();
-        let rects = compute_layout(&tree, 0, 800.0, 600.0, &config).rects;
+        let rects = layout(&tree, 0, 800.0, 600.0, &config);
         assert!(rects.is_empty());
     }
 
@@ -390,7 +427,7 @@ mod tests {
         let mut tree = DirTree::new();
         tree.insert_dir(1, 0, "root", 100, 100);
         let config = default_config();
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
+        let rects = layout(&tree, 1, 800.0, 600.0, &config);
         assert!(rects.is_empty());
     }
 
@@ -402,7 +439,7 @@ mod tests {
         tree.insert_dir(3, 1, "b", 500, 100);
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
+        let rects = layout(&tree, 1, 800.0, 600.0, &config);
 
         let top_level: Vec<&LayoutRect> = rects.iter().filter(|r| r.depth == 0).collect();
         assert_eq!(top_level.len(), 2);
@@ -424,7 +461,7 @@ mod tests {
         tree.insert_dir(3, 1, "small", 100, 100);
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
+        let rects = layout(&tree, 1, 800.0, 600.0, &config);
 
         let top_level: Vec<&LayoutRect> = rects.iter().filter(|r| r.depth == 0).collect();
         assert_eq!(top_level.len(), 2);
@@ -457,7 +494,7 @@ mod tests {
         tree.insert_dir(5, 1, "d", 100, 100);
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
+        let rects = layout(&tree, 1, 800.0, 600.0, &config);
 
         let siblings: Vec<&LayoutRect> = rects.iter().filter(|r| r.depth == 0).collect();
         for i in 0..siblings.len() {
@@ -484,7 +521,7 @@ mod tests {
         tree.insert_dir(4, 1, "c", 200, 100);
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config).rects;
+        let rects = layout(&tree, 1, canvas_w, canvas_h, &config);
 
         let eps = 0.01_f64;
         for r in &rects {
@@ -518,7 +555,7 @@ mod tests {
         tree.insert_dir(4, 1, "c", 100, 100);
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config).rects;
+        let rects = layout(&tree, 1, canvas_w, canvas_h, &config);
 
         let top_area: f64 = rects
             .iter()
@@ -536,13 +573,10 @@ mod tests {
     #[test]
     fn layout_includes_file_rects() {
         let mut tree = DirTree::new();
-        tree.insert_dir(1, 0, "root", 0, 100);
-        tree.insert_file(1, "big.txt", 5000, 200);
-        tree.insert_file(1, "huge.rs", 10000, 300);
-        tree.nodes.get_mut(&1).unwrap().size += 15000;
+        tree.add_dir(1, 0, "root", &[("big.txt", 5000, 200), ("huge.rs", 10000, 300)]);
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
+        let rects = layout(&tree, 1, 800.0, 600.0, &config);
 
         let file_rects: Vec<&LayoutRect> = rects.iter().filter(|r| r.kind == RectKind::File).collect();
         assert!(
@@ -559,18 +593,12 @@ mod tests {
     #[test]
     fn filter_affects_layout() {
         let mut tree = DirTree::new();
-        tree.insert_dir(1, 0, "root", 0, 100);
-        tree.insert_dir(2, 1, "src", 0, 100);
-        tree.insert_dir(3, 1, "docs", 0, 100);
-        tree.insert_file(2, "main.rs", 5000, 200);
-        tree.insert_file(2, "lib.rs", 3000, 200);
-        tree.insert_file(3, "readme.txt", 4000, 200);
-        for (id, size) in [(2, 8000), (3, 4000), (1, 12000)] {
-            tree.nodes.get_mut(&id).unwrap().size = size;
-        }
+        tree.add_dir(1, 0, "root", &[]);
+        tree.add_dir(2, 1, "src", &[("main.rs", 5000, 200), ("lib.rs", 3000, 200)]);
+        tree.add_dir(3, 1, "docs", &[("readme.txt", 4000, 200)]);
 
         let config_no_filter = default_config();
-        let rects_no_filter = compute_layout(&tree, 1, 800.0, 600.0, &config_no_filter).rects;
+        let rects_no_filter = layout(&tree, 1, 800.0, 600.0, &config_no_filter);
         let dirs_no_filter: Vec<&str> = rects_no_filter
             .iter()
             .filter(|r| r.depth == 0 && r.kind.is_dir())
@@ -579,18 +607,15 @@ mod tests {
         assert!(dirs_no_filter.contains(&"src"));
         assert!(dirs_no_filter.contains(&"docs"));
 
-        let config_filtered = LayoutConfig {
-            max_depth: 3,
-            color_mode: 0,
-            filter: FilterConfig {
-                extensions: vec!["rs".into()],
-                min_size: 0,
-                max_size: 0,
-                name_pattern: String::new(),
-            },
-            mtime_range: (0, 0),
+        let rs_files = FilterConfig {
+            extensions: vec!["rs".into()],
+            ..FilterConfig::default()
         };
-        let rects_filtered = compute_layout(&tree, 1, 800.0, 600.0, &config_filtered).rects;
+        let config_filtered = LayoutConfig {
+            filter: &rs_files,
+            ..default_config()
+        };
+        let rects_filtered = layout(&tree, 1, 800.0, 600.0, &config_filtered);
 
         let filtered_names: Vec<&str> = rects_filtered
             .iter()
@@ -605,8 +630,14 @@ mod tests {
 
         // The total is what the rects divide up: with a filter, only the files it matches. The
         // page measures each rect's share of the view against it.
-        assert_eq!(compute_layout(&tree, 1, 800.0, 600.0, &config_no_filter).size, 12_000);
-        assert_eq!(compute_layout(&tree, 1, 800.0, 600.0, &config_filtered).size, 8_000);
+        assert_eq!(
+            compute_layout(&tree, 1, 800.0, 600.0, &config_no_filter, &mut FilteredSizes::default()).size,
+            12_000
+        );
+        assert_eq!(
+            compute_layout(&tree, 1, 800.0, 600.0, &config_filtered, &mut FilteredSizes::default()).size,
+            8_000
+        );
     }
 
     /// `max_depth` is the number of levels drawn: 1 is a flat map of the view root's children, and
@@ -625,7 +656,7 @@ mod tests {
                 max_depth,
                 ..default_config()
             };
-            let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
+            let rects = layout(&tree, 1, 800.0, 600.0, &config);
             rects.iter().map(|r| r.depth + 1).max().unwrap_or(0)
         };
         for max_depth in 1..=4 {
@@ -637,7 +668,7 @@ mod tests {
             max_depth: 1,
             ..default_config()
         };
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
+        let rects = layout(&tree, 1, 800.0, 600.0, &config);
         assert!(
             rects.iter().all(|r| r.kind != RectKind::Container),
             "max_depth=1 should not open any folder"
@@ -649,12 +680,10 @@ mod tests {
     #[test]
     fn files_only_folder_shows_its_files() {
         let mut tree = DirTree::new();
-        tree.insert_dir(1, 0, "root", 0, 100);
-        tree.insert_dir(2, 1, "scans", 3000, 100);
-        tree.insert_file(2, "a.pdf", 2000, 100);
-        tree.insert_file(2, "b.pdf", 1000, 100);
+        tree.add_dir(1, 0, "root", &[]);
+        tree.add_dir(2, 1, "scans", &[("a.pdf", 2000, 100), ("b.pdf", 1000, 100)]);
 
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &default_config()).rects;
+        let rects = layout(&tree, 1, 800.0, 600.0, &default_config());
         let folder = rects.iter().find(|r| r.name == "scans").unwrap();
         assert_eq!(folder.kind, RectKind::Container, "a files-only folder should open up");
         let mut files: Vec<&str> = rects
@@ -678,7 +707,7 @@ mod tests {
         }
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config).rects;
+        let rects = layout(&tree, 1, canvas_w, canvas_h, &config);
 
         let top_level: Vec<&LayoutRect> = rects.iter().filter(|r| r.depth == 0).collect();
         assert_eq!(top_level.len(), 20);

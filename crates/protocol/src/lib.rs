@@ -102,13 +102,18 @@ pub const DEFAULT_DEPTH: u8 = 6;
 pub const MAX_DEPTH: u8 = 10;
 /// Largest viewport side the server lays out, in CSS pixels: past any real display.
 pub const MAX_VIEWPORT: f32 = 16_384.0;
-/// `ColorMode` values: colour rects by file type, or by modification time.
-pub const COLOR_MODE_TYPE: u8 = 0;
-pub const COLOR_MODE_AGE: u8 = 1;
+/// What the treemap colours rects by.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorMode {
+    /// By file type; a folder drawn as one block by its name.
+    #[default]
+    Type,
+    /// By modification time, from red (oldest) to green (newest).
+    Age,
+}
 
-/// A mounted volume, as served (JSON, camelCase keys) by the `/volumes` endpoint.
+/// A mounted volume, as the `/volumes` endpoint lists them (`encode_list`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct VolumeInfo {
     pub name: String,
     pub mount_point: String,
@@ -127,6 +132,15 @@ impl VolumeInfo {
             used_bytes: total_bytes.saturating_sub(free_bytes),
             fs_type,
         }
+    }
+
+    /// The `/volumes` response: `volumes` in the same encoding as the WebSocket messages.
+    pub fn encode_list(volumes: &[VolumeInfo]) -> Vec<u8> {
+        pack(postcard::to_allocvec(volumes).expect("volumes must serialize"))
+    }
+
+    pub fn decode_list(data: &[u8]) -> Option<Vec<VolumeInfo>> {
+        postcard::from_bytes(&unpack(data)?).ok()
     }
 }
 
@@ -159,7 +173,7 @@ pub enum ClientMessage {
     RevealFile { dir_id: u64, name: String },
     Rescan,
     SetDepth { depth: u8 },
-    ColorMode { mode: u8 },
+    ColorMode { mode: ColorMode },
     FilterExt { extensions: Vec<Box<str>> },
     FilterSize { min: u64, max: u64 },
     FilterName { pattern: String },
@@ -178,8 +192,8 @@ impl ClientMessage {
         Some(msg)
     }
 
-    /// Canonicalize incoming values regardless of what a client sent: clamp the depth and color
-    /// mode to their valid ranges, lower-case the name filter for case-insensitive matching, and
+    /// Canonicalize incoming values regardless of what a client sent: clamp the depth to its valid
+    /// range, lower-case the name filter for case-insensitive matching, and
     /// take extensions without the dot (or `*.`) people often type before them.
     fn normalize(&mut self) {
         match self {
@@ -195,7 +209,6 @@ impl ClientMessage {
                 }
             }
             ClientMessage::SetDepth { depth } => *depth = (*depth).clamp(1, MAX_DEPTH),
-            ClientMessage::ColorMode { mode } if *mode > COLOR_MODE_AGE => *mode = COLOR_MODE_TYPE,
             ClientMessage::FilterName { pattern } => *pattern = pattern.to_ascii_lowercase(),
             ClientMessage::FilterExt { extensions } => {
                 for extension in extensions.iter_mut() {
@@ -385,15 +398,14 @@ mod tests {
     }
 
     #[test]
-    fn color_mode_clamps_unknown_to_type() {
-        assert_eq!(
-            client_roundtrip(ClientMessage::ColorMode { mode: 1 }),
-            ClientMessage::ColorMode { mode: 1 }
-        );
-        assert_eq!(
-            client_roundtrip(ClientMessage::ColorMode { mode: 7 }),
-            ClientMessage::ColorMode { mode: 0 }
-        );
+    fn color_modes_round_trip_and_unknown_ones_are_refused() {
+        for mode in [ColorMode::Type, ColorMode::Age] {
+            let msg = ClientMessage::ColorMode { mode };
+            assert_eq!(client_roundtrip(msg.clone()), msg);
+        }
+        let mut unknown = postcard::to_allocvec(&ClientMessage::ColorMode { mode: ColorMode::Age }).unwrap();
+        *unknown.last_mut().unwrap() = 7;
+        assert_eq!(ClientMessage::decode(&pack(unknown)), None);
     }
 
     #[test]
@@ -434,6 +446,19 @@ mod tests {
             max: u64::MAX,
         };
         assert_eq!(client_roundtrip(msg.clone()), msg);
+    }
+
+    #[test]
+    fn volume_lists_round_trip() {
+        let volumes = vec![
+            VolumeInfo::new("Macintosh HD".into(), "/".into(), 1_000, 400, "apfs".into()),
+            VolumeInfo::new("データ".into(), "/Volumes/データ".into(), 10, 20, "exfat".into()),
+        ];
+        assert_eq!(
+            VolumeInfo::decode_list(&VolumeInfo::encode_list(&volumes)),
+            Some(volumes)
+        );
+        assert_eq!(VolumeInfo::decode_list(&[]), None);
     }
 
     #[test]

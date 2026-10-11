@@ -12,6 +12,13 @@ impl TreemapApp {
         Ok(())
     }
 
+    /// Draw again on the next frame: the hover overlay, and with `buffer` the treemap under it too.
+    pub(super) fn redraw(&mut self, buffer: bool) -> Result<(), JsValue> {
+        self.view.buffer_dirty |= buffer;
+        self.view.dirty = true;
+        self.schedule_tick()
+    }
+
     pub(super) fn tick(&mut self) -> Result<(), JsValue> {
         self.surface.raf_pending = false;
         if self.view.dirty || self.view.zoom_anim.is_some() {
@@ -57,10 +64,11 @@ impl TreemapApp {
             self.surface
                 .ctx
                 .set_transform(self.surface.pixel_ratio, 0.0, 0.0, self.surface.pixel_ratio, 0.0, 0.0)?;
+            let hover = self.view.hover.as_ref();
             draw_hover_overlay(
                 &self.surface.ctx,
-                self.view.hovered_index.and_then(|index| self.view.rects.get(index)),
-                &self.view.hovered_ancestor_indices,
+                hover.and_then(|hover| self.view.rects.get(hover.hovered_index)),
+                hover.map_or(&[], |hover| &hover.hovered_ancestor_indices),
                 &self.view.rects,
             )?;
         }
@@ -101,9 +109,7 @@ impl TreemapApp {
             0.0,
         )?;
 
-        self.view.buffer_dirty = true;
-        self.view.dirty = true;
-        self.schedule_tick()?;
+        self.redraw(true)?;
         self.send_viewport()
     }
 

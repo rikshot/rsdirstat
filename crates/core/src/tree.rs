@@ -100,7 +100,7 @@ impl FilterConfig {
     }
 }
 
-pub use rsdirstat_protocol::BreadcrumbEntry;
+use rsdirstat_protocol::BreadcrumbEntry;
 
 pub struct DirTree {
     pub nodes: NodeMap<DirNode>,
@@ -196,11 +196,6 @@ impl DirTree {
         self.propagate(id, size, mtime);
     }
 
-    pub fn insert_file(&mut self, parent: u64, name: impl Into<Box<str>>, size: u64, mtime: i64) {
-        let entry = self.file_entry(name.into(), size, mtime);
-        self.nodes.entry(parent).or_default().files.push(entry);
-    }
-
     /// A directory's scanned files, added with one lookup of its node.
     fn insert_files(&mut self, parent: u64, files: Vec<ScannedFile>) {
         if files.is_empty() {
@@ -208,23 +203,21 @@ impl DirTree {
         }
         let entries: Vec<FileEntry> = files
             .into_iter()
-            .map(|file| self.file_entry(file.name.into_boxed_str(), file.size, file.mtime))
+            .map(|file| {
+                self.update_mtime_range(file.mtime);
+                FileEntry {
+                    hue: self.cached_extension_hue(&file.name),
+                    name: file.name.into_boxed_str(),
+                    size: file.size,
+                    mtime: file.mtime,
+                }
+            })
             .collect();
         let node = self.nodes.entry(parent).or_default();
         if node.files.is_empty() {
             node.files = entries;
         } else {
             node.files.extend(entries);
-        }
-    }
-
-    fn file_entry(&mut self, name: Box<str>, size: u64, mtime: i64) -> FileEntry {
-        self.update_mtime_range(mtime);
-        FileEntry {
-            hue: self.cached_extension_hue(&name),
-            name,
-            size,
-            mtime,
         }
     }
 
@@ -357,6 +350,29 @@ impl DirTree {
         let mut path = self.root_path.clone();
         path.extend(parts.iter().rev());
         Some(path)
+    }
+}
+
+/// Test trees built the way a scan builds them.
+#[cfg(test)]
+impl DirTree {
+    /// Add directory `id` under `parent` with `files` as (name, size, mtime), as a scan's `Dir`
+    /// event does: its size is theirs, and reaches every directory above it.
+    pub(crate) fn add_dir(&mut self, id: u64, parent: u64, name: &str, files: &[(&str, u64, i64)]) {
+        self.apply(ScanEvent::Dir {
+            id,
+            parent,
+            name: name.into(),
+            mtime: files.iter().map(|&(_, _, mtime)| mtime).max().unwrap_or(0),
+            files: files
+                .iter()
+                .map(|&(name, size, mtime)| ScannedFile {
+                    name: name.into(),
+                    size,
+                    mtime,
+                })
+                .collect(),
+        });
     }
 }
 
@@ -606,17 +622,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_file_adds_to_parent() {
-        let mut tree = sample_tree();
-        tree.insert_file(2, "hello.rs", 75, 5000);
-        tree.insert_file(2, "world.txt", 25, 5001);
-        assert_eq!(tree.nodes[&2].files.len(), 2);
-        assert_eq!(&*tree.nodes[&2].files[0].name, "hello.rs");
-        assert_eq!(tree.nodes[&2].files[0].size, 75);
-        assert_eq!(&*tree.nodes[&2].files[1].name, "world.txt");
-    }
-
-    #[test]
     fn propagate_size_on_insert() {
         let tree = sample_tree();
         // dir_c(50) is under dir_a(100), both under root(0)
@@ -809,20 +814,20 @@ mod tests {
     #[test]
     fn mtime_range_from_files() {
         let mut tree = DirTree::new();
-        tree.insert_dir(1, 0, "root", 0, 500);
-        tree.insert_file(1, "a.txt", 10, 100);
-        tree.insert_file(1, "b.txt", 20, 900);
+        tree.add_dir(1, 0, "root", &[("a.txt", 10, 100), ("b.txt", 20, 900)]);
         assert_eq!(tree.mtime_range, (100, 900));
     }
 
     #[test]
     fn compute_filtered_sizes_with_extension_filter() {
         let mut tree = DirTree::new();
-        tree.insert_dir(1, 0, "root", 0, 100);
-        tree.insert_dir(2, 1, "src", 0, 100);
-        tree.insert_file(2, "main.rs", 500, 100);
-        tree.insert_file(2, "lib.rs", 300, 100);
-        tree.insert_file(2, "notes.txt", 200, 100);
+        tree.add_dir(1, 0, "root", &[]);
+        tree.add_dir(
+            2,
+            1,
+            "src",
+            &[("main.rs", 500, 100), ("lib.rs", 300, 100), ("notes.txt", 200, 100)],
+        );
 
         let filter = FilterConfig {
             extensions: vec!["rs".into()],
@@ -843,9 +848,7 @@ mod tests {
     #[test]
     fn compute_filtered_sizes_no_filter_sums_all_files() {
         let mut tree = DirTree::new();
-        tree.insert_dir(1, 0, "root", 0, 100);
-        tree.insert_file(1, "a.txt", 100, 100);
-        tree.insert_file(1, "b.rs", 200, 100);
+        tree.add_dir(1, 0, "root", &[("a.txt", 100, 100), ("b.rs", 200, 100)]);
 
         let filter = FilterConfig::default();
         let sizes = tree.compute_filtered_sizes(&filter, 1);

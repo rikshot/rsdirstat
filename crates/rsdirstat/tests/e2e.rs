@@ -6,44 +6,47 @@ use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
 use common::{
-    TestServer, assert_no_layout_after, create_test_dir, launch_browser, layout_seq, wait_for_layout_after,
-    wait_for_scan_done,
+    TestServer, assert_no_layout_after, create_test_dir, layout_seq, wait_for_layout_after, wait_for_scan_done,
 };
 use futures_util::future::LocalBoxFuture;
 use futures_util::{FutureExt, StreamExt};
 use playwright_rs::expect;
 use playwright_rs::protocol::{HoverOptions, Position, WaitForFunctionOptions, WaitForOptions};
 
-/// Serve a scan of `dir`, open it in `browser_name`, wait for the scan, then run `f` on the page.
-/// Traced under `<browser>-<case>` from navigation onward, so a `wait_for_scan_done` timeout — the
-/// most likely cross-OS flake — is captured, not just failures inside `f`.
-async fn run_in<F: AsyncFn(&playwright_rs::Page)>(browser_name: &str, case: &str, dir: tempfile::TempDir, f: F) {
+/// Run `f` on a new page in Chromium, traced under `chromium-<case>`; `f` navigates it.
+async fn in_chromium(case: &str, f: impl AsyncFnOnce(&playwright_rs::Page)) {
+    let (_pw, browser) = common::launch("chromium").await;
+    let page = common::new_page(&browser, 1280, 720).await;
+    common::with_trace_unit(&page, &common::trace_label("chromium", case), f(&page)).await;
+    let _ = browser.close().await;
+}
+
+/// Serve a scan of the test tree, open it, wait for the scan, then run `f` on the page. Traced from
+/// navigation onward, so a `wait_for_scan_done` timeout — the most likely cross-OS flake — is
+/// captured, not just failures inside `f`.
+async fn run_scanned(case: &str, f: impl AsyncFn(&playwright_rs::Page)) {
+    let dir = create_test_dir();
     let server = TestServer::start(dir.path());
-    let (_pw, browser, page) = launch_browser(browser_name).await;
-    common::with_trace_unit(&page, &common::trace_label(browser_name, case), async {
+    in_chromium(case, async |page| {
         page.goto(&server.url, None).await.unwrap();
-        wait_for_scan_done(&page).await;
-        f(&page).await;
+        wait_for_scan_done(page).await;
+        f(page).await;
     })
     .await;
-    let _ = browser.close().await;
 }
 
 async fn run_picker<F: AsyncFn(&playwright_rs::Page)>(f: F) {
     let server = TestServer::start_picker();
-    let (_pw, browser, page) = launch_browser("chromium").await;
-    let label = common::trace_label("chromium", std::any::type_name::<F>());
-    common::with_trace_unit(&page, &label, async {
+    in_chromium(std::any::type_name::<F>(), async |page| {
         page.goto(&format!("{}/?picker", server.url), None).await.unwrap();
         // Best effort: `f` asserts on the picker itself, with a clearer message.
         let _ = page
             .locator("#picker")
             .wait_for(WaitForOptions::builder().timeout(5_000.0).build())
             .await;
-        f(&page).await;
+        f(page).await;
     })
     .await;
-    let _ = browser.close().await;
 }
 
 async fn crumbs(page: &playwright_rs::Page) -> String {
@@ -330,10 +333,10 @@ async fn breadcrumb_click_navigates_back(page: &playwright_rs::Page) {
 async fn picker_volume_click_starts_scan(page: &playwright_rs::Page) {
     page.locator(".volume-card:first-child").click(None).await.unwrap();
 
-    // Just wait for the treemap view to appear (MSG_SCAN_START triggers this immediately,
-    // before the actual scan produces results — safe for CI regardless of disk size)
+    // Just wait for the treemap view to appear (the scan's `ScanStart` shows it at once, before
+    // the scan produces anything — safe for CI whatever the disk's size).
     page.locator("#treemap-view")
-        .wait_for(WaitForOptions::builder().timeout(10_000.0).build())
+        .wait_for(visible())
         .await
         .expect("treemap view did not appear after clicking volume");
 }
@@ -401,7 +404,8 @@ async fn rescan_button_works(page: &playwright_rs::Page) {
     assert!(text.contains(" dirs in "), "after rescan: {text}");
 }
 
-async fn js_unit_tests(page: &playwright_rs::Page) {
+/// The frontend's own checks of its logic and codec, run as WebAssembly in the browser.
+async fn wasm_self_checks(page: &playwright_rs::Page) {
     let result = page
         .evaluate_value(
             "() => { const r = window.wasmBindings.runBrowserTests(); return r.failed === 0 ? `PASS ${r.total}` : `FAIL ${r.failed}/${r.total}: ${r.failures.join('; ')}`; }",
@@ -409,7 +413,7 @@ async fn js_unit_tests(page: &playwright_rs::Page) {
         .await
         .unwrap();
 
-    assert!(result.starts_with("PASS"), "JS unit tests failed: {result}");
+    assert!(result.starts_with("PASS"), "wasm self-checks failed: {result}");
 }
 
 /// A case of the cross-browser suite: `run` on the page of a finished scan of `fixture()`.
@@ -532,7 +536,7 @@ browser_tests! {
     rescan => rescan_button_works,
     reload => reload_keeps_treemap_in_sync_with_toolbar,
     // In-browser unit checks of the actual wasm exports.
-    js_unit_tests => js_unit_tests,
+    wasm_self_checks => wasm_self_checks,
 }
 
 // Picker mode tests (chromium only — testing server/UI logic, not browser compat)
@@ -593,19 +597,14 @@ async fn e2e_unopenable_root_falls_back_to_picker() {
 /// picker.
 #[tokio::test]
 async fn e2e_layouts_stay_behind_the_picker() {
-    run_in(
-        "chromium",
-        "layouts_stay_behind_the_picker",
-        create_test_dir(),
-        async |page: &playwright_rs::Page| {
-            page.locator("#change").click(None).await.unwrap();
-            let before = layout_seq(page).await;
-            resize(page).await;
-            wait_for_layout_after(page, before).await;
-            assert!(page.locator("#picker").is_visible().await.unwrap());
-            assert!(!page.locator("#treemap-view").is_visible().await.unwrap());
-        },
-    )
+    run_scanned("layouts_stay_behind_the_picker", async |page: &playwright_rs::Page| {
+        page.locator("#change").click(None).await.unwrap();
+        let before = layout_seq(page).await;
+        resize(page).await;
+        wait_for_layout_after(page, before).await;
+        assert!(page.locator("#picker").is_visible().await.unwrap());
+        assert!(!page.locator("#treemap-view").is_visible().await.unwrap());
+    })
     .await;
 }
 
@@ -614,22 +613,17 @@ async fn e2e_layouts_stay_behind_the_picker() {
 /// a resize) once made it send that stale layout, which brought the treemap back.
 #[tokio::test]
 async fn e2e_failed_rescan_keeps_the_picker() {
-    run_in(
-        "chromium",
-        "failed_rescan_keeps_the_picker",
-        create_test_dir(),
-        async |page: &playwright_rs::Page| {
-            page.locator("#change").click(None).await.unwrap();
-            pick_vanished_volume(page).await;
-            page.locator("#picker").wait_for(visible()).await.unwrap();
+    run_scanned("failed_rescan_keeps_the_picker", async |page: &playwright_rs::Page| {
+        page.locator("#change").click(None).await.unwrap();
+        pick_vanished_volume(page).await;
+        page.locator("#picker").wait_for(visible()).await.unwrap();
 
-            page.reload(None).await.unwrap();
-            page.locator(".volume-card").first().wait_for(visible()).await.unwrap();
-            resize(page).await;
-            assert_no_layout_after(page, 0, "a reloaded tab got a layout while the server waits for a path").await;
-            assert!(!page.locator("#treemap-view").is_visible().await.unwrap());
-        },
-    )
+        page.reload(None).await.unwrap();
+        page.locator(".volume-card").first().wait_for(visible()).await.unwrap();
+        resize(page).await;
+        assert_no_layout_after(page, 0, "a reloaded tab got a layout while the server waits for a path").await;
+        assert!(!page.locator("#treemap-view").is_visible().await.unwrap());
+    })
     .await;
 }
 
@@ -639,9 +633,7 @@ async fn e2e_failed_rescan_keeps_the_picker() {
 async fn e2e_wait_mode_start_button_starts_scan() {
     let dir = create_test_dir();
     let server = TestServer::start_waiting(dir.path());
-    let (_pw, browser, page) = launch_browser("chromium").await;
-    let label = common::trace_label("chromium", "wait_mode_start_button_starts_scan");
-    common::with_trace_unit(&page, &label, async {
+    in_chromium("wait_mode_start_button_starts_scan", async |page| {
         page.goto(&format!("{}/?wait", server.url), None).await.unwrap();
         let start = page.locator("#status button");
         start
@@ -649,10 +641,9 @@ async fn e2e_wait_mode_start_button_starts_scan() {
             .await
             .expect("the Start button should be visible");
         start.click(None).await.unwrap();
-        wait_for_scan_done(&page).await;
+        wait_for_scan_done(page).await;
     })
     .await;
-    let _ = browser.close().await;
 }
 
 // Server lifecycle (no browser). Stopping the server mid-scan (SIGTERM, or Ctrl+Break on Windows)
@@ -743,9 +734,15 @@ fn http_status(server: &TestServer, path: &str, host: Option<&str>, headers: &[(
     }
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).unwrap();
-    let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
-    response.split(' ').nth(1).unwrap_or("0").parse().unwrap()
+    // Bytes: a body (the volume list) needn't be text.
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    String::from_utf8_lossy(&response)
+        .split(' ')
+        .nth(1)
+        .unwrap_or("0")
+        .parse()
+        .unwrap()
 }
 
 /// A DNS-rebinding page sees this server as same-origin under the attacker's hostname; only its
@@ -801,7 +798,8 @@ fn e2e_cross_site_api_requests_are_refused() {
 async fn e2e_tabs_have_independent_views() {
     let dir = create_test_dir();
     let server = TestServer::start(dir.path());
-    let (_pw, browser, first) = launch_browser("chromium").await;
+    let (_pw, browser) = common::launch("chromium").await;
+    let first = common::new_page(&browser, 1280, 720).await;
     let second = common::new_page(&browser, 1280, 720).await;
     let label = common::trace_label("chromium", "tabs_have_independent_views");
     common::with_trace_unit(&first, &label, async {

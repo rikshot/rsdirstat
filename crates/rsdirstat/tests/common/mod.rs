@@ -197,22 +197,6 @@ pub fn create_test_dir() -> tempfile::TempDir {
     dir
 }
 
-pub async fn launch_browser(
-    browser_name: &str,
-) -> (playwright_rs::Playwright, playwright_rs::Browser, playwright_rs::Page) {
-    launch_browser_sized(browser_name, 1280, 720).await
-}
-
-pub async fn launch_browser_sized(
-    browser_name: &str,
-    width: u32,
-    height: u32,
-) -> (playwright_rs::Playwright, playwright_rs::Browser, playwright_rs::Page) {
-    let (pw, browser) = launch(browser_name).await;
-    let page = new_page(&browser, width, height).await;
-    (pw, browser, page)
-}
-
 /// Launch `browser_name` ("chromium", "firefox" or "webkit"), with no page open.
 pub async fn launch(browser_name: &str) -> (playwright_rs::Playwright, playwright_rs::Browser) {
     let pw = playwright_rs::Playwright::launch().await.unwrap();

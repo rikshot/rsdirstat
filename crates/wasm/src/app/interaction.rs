@@ -13,12 +13,22 @@ impl TreemapApp {
     }
 
     pub(super) fn clear_hover(&mut self) -> Result<(), JsValue> {
-        self.view.hovered_index = None;
-        self.view.hovered_ancestor_indices.clear();
-        self.chrome.tooltip_element.style().set_property("display", "none")?;
-        self.chrome.path_text_element.set_text_content(Some(""));
-        self.chrome.path_size_element.set_text_content(Some(""));
-        Ok(())
+        self.view.hover = None;
+        self.show_hover_path();
+        self.chrome.tooltip_element.style().set_property("display", "none")
+    }
+
+    /// The hovered rect's path and size in the path bar, or nothing.
+    fn show_hover_path(&self) {
+        let (path, size) = match &self.view.hover {
+            Some(hover) => (
+                hover.path_text.as_str(),
+                format_size(self.view.rects[hover.hovered_index].size),
+            ),
+            None => ("", String::new()),
+        };
+        self.chrome.path_text_element.set_text_content(Some(path));
+        self.chrome.path_size_element.set_text_content(Some(&size));
     }
 
     pub(super) fn begin_navigation(&mut self, message: ClientMessage) -> Result<(), JsValue> {
@@ -35,102 +45,92 @@ impl TreemapApp {
         self.send_message(message)
     }
 
-    pub(super) fn recompute_hover(&mut self) -> Result<(), JsValue> {
-        let Some((mouse_x, mouse_y)) = self.view.last_mouse else {
-            self.view.hovered_index = None;
-            self.view.hovered_ancestor_indices.clear();
-            return Ok(());
-        };
-        let hover = build_hover_state(
-            &self.view.rects,
-            &self.view.rect_index_by_id,
-            &self.view.breadcrumb,
-            self.view.separator,
-            mouse_x,
-            mouse_y,
-        );
-        if let Some(state) = hover {
-            self.view.hovered_index = Some(state.hovered_index);
-            self.view.hovered_ancestor_indices = state.hovered_ancestor_indices;
-            self.chrome.path_text_element.set_text_content(Some(&state.path_text));
-            self.chrome
-                .path_size_element
-                .set_text_content(Some(&format_size(self.view.rects[state.hovered_index].size)));
-        } else {
-            self.view.hovered_index = None;
-            self.view.hovered_ancestor_indices.clear();
-            self.chrome.path_text_element.set_text_content(Some(""));
-            self.chrome.path_size_element.set_text_content(Some(""));
-        }
-        Ok(())
+    pub(super) fn recompute_hover(&mut self) {
+        self.view.hover = self.view.last_mouse.and_then(|(mouse_x, mouse_y)| {
+            build_hover_state(
+                &self.view.rects,
+                &self.view.rect_index_by_id,
+                &self.view.breadcrumb,
+                self.view.separator,
+                mouse_x,
+                mouse_y,
+            )
+        });
+        self.show_hover_path();
     }
 
     pub(super) fn handle_mousemove(&mut self, event: MouseEvent) -> Result<(), JsValue> {
         if self.view.zoom_anim.is_some() {
             return Ok(());
         }
-        self.view.last_mouse = Some(Self::canvas_point(&event));
+        let (mouse_x, mouse_y) = Self::canvas_point(&event);
+        self.view.last_mouse = Some((mouse_x, mouse_y));
 
-        let previous = self.view.hovered_index;
-        self.recompute_hover()?;
-        if self.view.hovered_index != previous {
-            self.view.dirty = true;
-            self.schedule_tick()?;
-            if let Some(rect) = self.view.hovered_index.and_then(|index| self.view.rects.get(index)) {
-                self.chrome.tooltip_element.style().set_property("display", "block")?;
-                self.chrome.tooltip_name.set_text_content(Some(&rect.name));
-                self.chrome.tooltip_size.set_text_content(Some(&format_size(rect.size)));
-                let percent = if self.view.view_root_size > 0 {
-                    (rect.size as f64 / self.view.view_root_size as f64) * 100.0
-                } else {
-                    0.0
-                };
-                self.chrome
-                    .tooltip_percent
-                    .set_text_content(Some(&format!("{percent:.1}%")));
-                let mtime = if rect.mtime > 0 {
-                    Date::new(&JsValue::from_f64(rect.mtime as f64 * 1000.0))
-                        .to_locale_date_string("default", &JsValue::UNDEFINED)
-                        .as_string()
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                self.chrome.tooltip_mtime.set_text_content(Some(&mtime));
-            } else {
-                self.chrome.tooltip_element.style().set_property("display", "none")?;
-            }
+        // Most moves stay on the same rect, and only the tooltip follows the pointer.
+        let hovered = self.view.hover.as_ref().map(|hover| hover.hovered_index);
+        if find_rect_index(&self.view.rects, mouse_x, mouse_y) != hovered {
+            self.recompute_hover();
+            self.redraw(false)?;
+            self.fill_tooltip()?;
         }
 
-        if self.view.hovered_index.is_some() {
+        if self.view.hover.is_some() {
+            let (tooltip_width, tooltip_height) = self.view.tooltip_size;
             let mut tip_x = event.client_x() as f64 + 14.0;
             let mut tip_y = event.client_y() as f64 + 14.0;
             let (inner_width, inner_height) = window_inner_size(&self.window)?;
-            let tooltip_width = self.chrome.tooltip_element.offset_width() as f64;
-            let tooltip_height = self.chrome.tooltip_element.offset_height() as f64;
             if tip_x + tooltip_width > inner_width - 8.0 {
                 tip_x = event.client_x() as f64 - tooltip_width - 8.0;
             }
             if tip_y + tooltip_height > inner_height - 8.0 {
                 tip_y = event.client_y() as f64 - tooltip_height - 8.0;
             }
-            self.chrome
-                .tooltip_element
-                .style()
-                .set_property("left", &format!("{tip_x}px"))?;
-            self.chrome
-                .tooltip_element
-                .style()
-                .set_property("top", &format!("{tip_y}px"))?;
+            let style = self.chrome.tooltip_element.style();
+            style.set_property("left", &format!("{tip_x}px"))?;
+            style.set_property("top", &format!("{tip_y}px"))?;
         }
+        Ok(())
+    }
+
+    /// Show the hovered rect's details in the tooltip and measure it, or hide it.
+    fn fill_tooltip(&mut self) -> Result<(), JsValue> {
+        let tooltip = &self.chrome.tooltip_element;
+        let Some(rect) = self
+            .view
+            .hover
+            .as_ref()
+            .and_then(|hover| self.view.rects.get(hover.hovered_index))
+        else {
+            return tooltip.style().set_property("display", "none");
+        };
+        tooltip.style().set_property("display", "block")?;
+        self.chrome.tooltip_name.set_text_content(Some(&rect.name));
+        self.chrome.tooltip_size.set_text_content(Some(&format_size(rect.size)));
+        let percent = if self.view.view_root_size > 0 {
+            (rect.size as f64 / self.view.view_root_size as f64) * 100.0
+        } else {
+            0.0
+        };
+        self.chrome
+            .tooltip_percent
+            .set_text_content(Some(&format!("{percent:.1}%")));
+        let mtime = if rect.mtime > 0 {
+            Date::new(&JsValue::from_f64(rect.mtime as f64 * 1000.0))
+                .to_locale_date_string("default", &JsValue::UNDEFINED)
+                .as_string()
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.chrome.tooltip_mtime.set_text_content(Some(&mtime));
+        self.view.tooltip_size = (tooltip.offset_width() as f64, tooltip.offset_height() as f64);
         Ok(())
     }
 
     pub(super) fn handle_mouseleave(&mut self) -> Result<(), JsValue> {
         self.view.last_mouse = None;
         self.clear_hover()?;
-        self.view.dirty = true;
-        self.schedule_tick()
+        self.redraw(false)
     }
 
     pub(super) fn handle_canvas_click(&mut self, event: MouseEvent) -> Result<(), JsValue> {

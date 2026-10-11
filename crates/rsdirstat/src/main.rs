@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
 use clap::Parser;
 use parking_lot::{Mutex, RwLock};
 use rust_embed::RustEmbed;
@@ -21,9 +21,9 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tower_http::compression::CompressionLayer;
 
-use rsdirstat_core::layout::{self, LayoutConfig};
+use rsdirstat_core::layout::{self, FilteredSizes, LayoutConfig};
 use rsdirstat_core::scan::ScanEvent;
-use rsdirstat_core::tree::{DirTree, FilterConfig, NodeMap};
+use rsdirstat_core::tree::{DirTree, FilterConfig};
 use rsdirstat_protocol::{self as wire, ClientMessage};
 
 #[cfg(target_os = "linux")]
@@ -64,20 +64,10 @@ struct ViewConfig {
     viewport: (f64, f64),
     view_root: Option<u64>,
     max_depth: u8,
-    color_mode: u8,
+    color_mode: wire::ColorMode,
     filter: FilterConfig,
-    /// The sizes `filter` left at the last layout, kept while they still hold.
-    filtered: Option<FilteredSizes>,
-}
-
-/// Sizes under a filter, and what they were computed from: the tree as of `changes`, and the
-/// subtree under `view_root`. Filtering visits every file under the view, too much to repeat for
-/// every layout of a big tree that hasn't changed (resizing the window lays it out many times).
-struct FilteredSizes {
-    changes: u64,
-    view_root: u64,
-    filter: FilterConfig,
-    sizes: NodeMap<u64>,
+    /// The sizes `filter` left at the last layout, kept for the next while they still hold.
+    filtered: FilteredSizes,
 }
 
 impl Default for ViewConfig {
@@ -87,9 +77,9 @@ impl Default for ViewConfig {
             viewport: (0.0, 0.0),
             view_root: None,
             max_depth: wire::DEFAULT_DEPTH,
-            color_mode: wire::COLOR_MODE_TYPE,
+            color_mode: wire::ColorMode::default(),
             filter: FilterConfig::default(),
-            filtered: None,
+            filtered: FilteredSizes::default(),
         }
     }
 }
@@ -299,24 +289,9 @@ fn update_tab(state: &AppState, view: &mut ViewConfig) -> (Option<Bytes>, Option
     let config = LayoutConfig {
         max_depth: view.max_depth,
         color_mode: view.color_mode,
-        filter: view.filter.clone(),
-        mtime_range: tree.mtime_range,
+        filter: &view.filter,
     };
-    let filtered = config.filter.is_active().then(|| {
-        let stale = |cached: &FilteredSizes| {
-            cached.changes != tree.changes || cached.view_root != view_root || cached.filter != config.filter
-        };
-        if view.filtered.as_ref().is_none_or(stale) {
-            view.filtered = Some(FilteredSizes {
-                changes: tree.changes,
-                view_root,
-                filter: config.filter.clone(),
-                sizes: tree.compute_filtered_sizes(&config.filter, view_root),
-            });
-        }
-        &view.filtered.as_ref().expect("just filled").sizes
-    });
-    let layout = layout::compute_layout_with(&tree, view_root, vw, vh, &config, filtered);
+    let layout = layout::compute_layout(&tree, view_root, vw, vh, &config, &mut view.filtered);
     let breadcrumb = tree.breadcrumb(view_root);
     let dir_count = tree.nodes.len() as u32;
     let partial = scan_done && !tree.complete;
@@ -469,7 +444,7 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
 #[allow_missing = true]
 struct Assets;
 
-/// Serve the embedded frontend. Unknown paths 404, matching the previous `ServeDir` behavior.
+/// Serve the embedded frontend. Unknown paths 404.
 async fn static_handler(uri: Uri) -> Response {
     let path = match uri.path().trim_start_matches('/') {
         "" => "index.html",
@@ -676,7 +651,9 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
                 last_layout = tokio::time::Instant::now();
                 // Before laying out, so a change made meanwhile makes the tab stale again.
                 tree_changes.mark_unchanged();
-                let (scan_start, layout) = update_tab(&state, &mut view);
+                // Off the async workers: laying out a big filtered view under the tree's lock can
+                // take tens of milliseconds, which would hold up the other tabs and requests.
+                let (scan_start, layout) = tokio::task::block_in_place(|| update_tab(&state, &mut view));
                 layout_took = last_layout.elapsed();
                 for message in [scan_start, layout].into_iter().flatten() {
                     if socket.send(Message::Binary(message)).await.is_err() {
@@ -776,11 +753,14 @@ fn handle_client_message(state: &Arc<AppState>, view: &mut ViewConfig, data: &[u
     }
 }
 
-async fn volumes_handler() -> Json<Vec<wire::VolumeInfo>> {
+async fn volumes_handler() -> impl IntoResponse {
     let volumes = tokio::task::spawn_blocking(scanner::volumes::list_volumes)
         .await
         .unwrap_or_default();
-    Json(volumes)
+    (
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        wire::VolumeInfo::encode_list(&volumes),
+    )
 }
 
 #[cfg(test)]

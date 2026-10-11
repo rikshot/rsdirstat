@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use js_sys::{Array, ArrayBuffer, Date, Reflect, Uint8Array};
+use js_sys::{ArrayBuffer, Date, Uint8Array};
 use rsdirstat_protocol::{self as wire, BreadcrumbEntry, ClientMessage, LayoutPayload, ServerMessage, VolumeInfo};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
@@ -22,7 +22,7 @@ use web_sys::{
 };
 
 use self::dom::{app_callback, by_id, canvas_context, query};
-use crate::logic::{InterpolationPlan, RenderRect, format_size};
+use crate::logic::{HoverState, InterpolationPlan, RenderRect, format_size};
 
 const BACKGROUND: &str = "#1a1a2e";
 const BREADCRUMB_HEIGHT: f64 = 32.0;
@@ -95,8 +95,11 @@ struct ViewState {
     pending_old_rects: Option<Vec<RenderRect>>,
     dirty: bool,
     buffer_dirty: bool,
-    hovered_index: Option<usize>,
-    hovered_ancestor_indices: Vec<usize>,
+    /// The rect under the pointer, with its open ancestors and its path.
+    hover: Option<HoverState>,
+    /// The tooltip's size, measured when its content last changed: measuring on every pointer move
+    /// would make the page lay out on each one.
+    tooltip_size: (f64, f64),
     /// Last pointer position over the canvas, if the pointer is on it.
     last_mouse: Option<(f64, f64)>,
     scan_done: bool,
@@ -251,8 +254,8 @@ impl TreemapApp {
                 pending_old_rects: None,
                 dirty: true,
                 buffer_dirty: true,
-                hovered_index: None,
-                hovered_ancestor_indices: Vec::new(),
+                hover: None,
+                tooltip_size: (0.0, 0.0),
                 last_mouse: None,
                 scan_done: false,
                 layout_seq: 0,

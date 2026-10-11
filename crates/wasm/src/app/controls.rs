@@ -57,12 +57,12 @@ impl TreemapApp {
     }
 
     pub(super) fn handle_color_mode_change(&mut self) -> Result<(), JsValue> {
-        let mode = self
-            .chrome
-            .color_mode_select
-            .value()
-            .parse()
-            .unwrap_or(wire::COLOR_MODE_TYPE);
+        // The `#color-mode` options are 0 (type) and 1 (age).
+        let mode = if self.chrome.color_mode_select.value() == "1" {
+            wire::ColorMode::Age
+        } else {
+            wire::ColorMode::Type
+        };
         self.send_message(ClientMessage::ColorMode { mode })
     }
 

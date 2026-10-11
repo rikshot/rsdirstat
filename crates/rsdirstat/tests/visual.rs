@@ -2,7 +2,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::{TestServer, create_test_dir, launch_browser_sized, wait_for_scan_done};
+use common::{TestServer, create_test_dir, wait_for_scan_done};
 use playwright_rs::{Animations, ScreenshotAssertionOptions, expect_page};
 
 /// Set to re-record the baselines instead of comparing against them (the "Update visual baselines"
@@ -57,7 +57,8 @@ async fn run_visual(
 
     let dir = create_test_dir();
     let server = TestServer::start(dir.path());
-    let (_pw, browser_handle, page) = launch_browser_sized(browser, width, height).await;
+    let (_pw, browser_handle) = common::launch(browser).await;
+    let page = common::new_page(&browser_handle, width, height).await;
 
     let label = common::trace_label(browser, case);
     common::with_trace(&page, &label, async {

@@ -126,11 +126,8 @@ impl TreemapApp {
                 self.view.view_root_size = 0;
                 self.view.zoom_anim = None;
                 self.view.pending_old_rects = None;
-                self.view.hovered_index = None;
-                self.view.hovered_ancestor_indices.clear();
-                self.view.buffer_dirty = true;
-                self.view.dirty = true;
-                self.schedule_tick()?;
+                self.view.hover = None;
+                self.redraw(true)?;
                 self.stop_scan_timer();
                 self.start_scan_timer()?;
                 self.build_breadcrumb()?;
@@ -199,10 +196,8 @@ impl TreemapApp {
         self.view.breadcrumb = payload.breadcrumb;
         self.view.separator = payload.separator;
         self.build_breadcrumb()?;
-        self.recompute_hover()?;
-        self.view.buffer_dirty = true;
-        self.view.dirty = true;
-        self.schedule_tick()?;
+        self.recompute_hover();
+        self.redraw(true)?;
 
         set_hidden(&self.chrome.rescan_button, !new_scan_done)?;
         set_hidden(&self.chrome.change_button, !new_scan_done)?;
@@ -236,34 +231,6 @@ pub(super) async fn fetch_volumes() -> Result<Vec<VolumeInfo>, JsValue> {
     let response = response
         .dyn_into::<Response>()
         .map_err(|_| JsValue::from_str("fetch did not return Response"))?;
-    let json = JsFuture::from(response.json()?).await?;
-    let values = Array::from(&json);
-    let mut volumes = Vec::with_capacity(values.length() as usize);
-    for value in values.iter() {
-        let name = field_string(&value, "name")?;
-        let mount_point = field_string(&value, "mountPoint")?;
-        let total_bytes = field_number(&value, "totalBytes")? as u64;
-        let used_bytes = field_number(&value, "usedBytes")? as u64;
-        let fs_type = field_string(&value, "fsType").unwrap_or_default();
-        volumes.push(VolumeInfo {
-            name,
-            mount_point,
-            total_bytes,
-            used_bytes,
-            fs_type,
-        });
-    }
-    Ok(volumes)
-}
-
-fn field_string(value: &JsValue, key: &str) -> Result<String, JsValue> {
-    Reflect::get(value, &JsValue::from_str(key))?
-        .as_string()
-        .ok_or_else(|| JsValue::from_str(&format!("expected string field '{key}'")))
-}
-
-fn field_number(value: &JsValue, key: &str) -> Result<f64, JsValue> {
-    Reflect::get(value, &JsValue::from_str(key))?
-        .as_f64()
-        .ok_or_else(|| JsValue::from_str(&format!("expected numeric field '{key}'")))
+    let body = JsFuture::from(response.array_buffer()?).await?;
+    VolumeInfo::decode_list(&Uint8Array::new(&body).to_vec()).ok_or_else(|| JsValue::from_str("unreadable /volumes"))
 }

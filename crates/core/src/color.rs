@@ -33,8 +33,6 @@ pub fn age_hue(mtime: i64, min_time: i64, max_time: i64) -> u16 {
     (ratio * 120.0) as u16
 }
 
-pub use rsdirstat_protocol::COLOR_MODE_AGE;
-
 #[cfg(test)]
 mod tests {
     use super::*;
