@@ -79,6 +79,8 @@ pub struct LayoutPayload {
 pub const DEFAULT_DEPTH: u8 = 6;
 /// Highest selectable depth; `SetDepth` is clamped to `1..=MAX_DEPTH`.
 pub const MAX_DEPTH: u8 = 10;
+/// Largest viewport side the server lays out, in CSS pixels: past any real display.
+pub const MAX_VIEWPORT: f32 = 16_384.0;
 /// `ColorMode` values: colour rects by file type, or by modification time.
 pub const COLOR_MODE_TYPE: u8 = 0;
 pub const COLOR_MODE_AGE: u8 = 1;
@@ -157,6 +159,17 @@ impl ClientMessage {
     /// mode to their valid ranges and lower-case the name filter for case-insensitive matching.
     fn normalize(&mut self) {
         match self {
+            ClientMessage::Viewport { width, height } => {
+                // A treemap the size of a NaN, or of a million pixels (where every file would be a
+                // rect), is never what a page meant; 0 lays out nothing.
+                for side in [width, height] {
+                    *side = if side.is_finite() {
+                        side.clamp(0.0, MAX_VIEWPORT)
+                    } else {
+                        0.0
+                    };
+                }
+            }
             ClientMessage::SetDepth { depth } => *depth = (*depth).clamp(1, MAX_DEPTH),
             ClientMessage::ColorMode { mode } if *mode > COLOR_MODE_AGE => *mode = COLOR_MODE_TYPE,
             ClientMessage::FilterName { pattern } => *pattern = pattern.to_ascii_lowercase(),
@@ -278,6 +291,18 @@ mod tests {
                 height: 600.0,
             }
         );
+    }
+
+    #[test]
+    fn viewport_is_clamped_to_a_drawable_size() {
+        let viewport = |width, height| match client_roundtrip(ClientMessage::Viewport { width, height }) {
+            ClientMessage::Viewport { width, height } => (width, height),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(viewport(f32::NAN, 600.0), (0.0, 600.0));
+        assert_eq!(viewport(f32::INFINITY, -5.0), (0.0, 0.0));
+        assert_eq!(viewport(1e9, 720.0), (MAX_VIEWPORT, 720.0));
+        assert_eq!(viewport(1280.0, 720.0), (1280.0, 720.0));
     }
 
     #[test]
