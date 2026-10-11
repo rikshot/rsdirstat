@@ -1,7 +1,8 @@
 name: Set up Playwright
 description: >
   Install the playwright-rs CLI at the version in Cargo.lock, then its driver and the Chromium,
-  Firefox and WebKit builds it pins, cached per version and OS.
+  Firefox and WebKit builds it pins, cached per version and OS (plus their system libraries on
+  Linux).
 
 runs:
   using: composite
@@ -30,5 +31,9 @@ runs:
     # Node nor npx. The CLI matches the dev-dependency's version so the bundled driver matches.
     - shell: bash
       run: cargo install --locked playwright-rs@${{ steps.version.outputs.version }} --features cli
+    # `--with-deps` installs the system libraries the browsers need, which only Linux runners lack.
+    # On Windows it installs the Server Media Foundation feature for Chromium instead: an OS
+    # feature, so no cache can keep it, and it took ~3 minutes every run for nothing the headless
+    # tests use.
     - shell: bash
-      run: playwright-rs install --with-deps chromium firefox webkit
+      run: playwright-rs install ${{ runner.os == 'Linux' && '--with-deps' || '' }} chromium firefox webkit

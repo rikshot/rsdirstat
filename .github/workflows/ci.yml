@@ -53,6 +53,10 @@ jobs:
           components: clippy
       - run: cargo clippy --locked ${{ matrix.packages }} --all-targets --no-deps -- -D warnings
 
+  # Every test, unit and browser, in one instrumented run per OS, so both halves share one build.
+  # The browser tests drive the server binary as a subprocess and stop it cleanly (SIGTERM, or
+  # Ctrl+Break on Windows), so its coverage is written on every OS too. Each OS runner covers its own
+  # native scanner, unit tests included; Codecov merges the three uploads (keyed by flag).
   test:
     needs: lint
     name: test (${{ matrix.os }})
@@ -63,14 +67,16 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
+          target: wasm32-unknown-unknown
           components: llvm-tools
       - uses: taiki-e/install-action@v2
         with:
-          tool: nextest,cargo-llvm-cov
-      # Run the (non-browser) tests under instrumentation and emit lcov. Each OS runner
-      # covers its own native scanner, unit tests included; Codecov merges the three uploads
-      # (keyed by flag).
-      - run: cargo llvm-cov nextest --locked --profile ci ${{ matrix.packages }} -E 'not test(/^visual/) and not test(/^e2e/)' --lcov --output-path lcov.info
+          tool: nextest,trunk,cargo-llvm-cov
+      - uses: ./.github/actions/setup-playwright
+      # Build the frontend up front, outside the instrumented test run. The test harness only
+      # rebuilds a bundle that is missing or older than its sources, so here it never has to.
+      - run: trunk build
+      - run: cargo llvm-cov nextest --locked --profile ci ${{ matrix.packages }} --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v7
         with:
           files: lcov.info
@@ -78,6 +84,29 @@ jobs:
           flags: ${{ matrix.os }}
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
+      # The visual tests compare against the committed per-OS baselines and, on a mismatch, write
+      # `<name>-actual.png` and `<name>-diff.png` next to them. Upload those so a failure (or a
+      # retried flake) can be seen without reproducing it.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: visual-diffs-${{ matrix.os }}
+          path: |
+            crates/rsdirstat/tests/snapshots/*/*-actual.png
+            crates/rsdirstat/tests/snapshots/*/*-diff.png
+          if-no-files-found: ignore
+          retention-days: 14
+      # Playwright traces are written only for failing browser tests (retain-on-failure);
+      # upload them so a red cross-OS run is debuggable without reproducing locally. `always()`
+      # rather than `failure()`: a test that fails and then passes on retry leaves its trace
+      # behind in a green job, and those flakes are the ones hardest to reproduce.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: playwright-traces-${{ matrix.os }}
+          path: crates/rsdirstat/tests/traces/
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Enforce the declared MSRV (rust-version = "1.89"): if a dependency bump or a
   # 2024-edition feature raises the real floor, `cargo install rsdirstat` breaks for
@@ -117,58 +146,3 @@ jobs:
           tool: trunk
       - run: trunk build --release
       - run: cargo build --locked --release
-
-  browser:
-    needs: lint
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
-        with:
-          target: wasm32-unknown-unknown
-          components: llvm-tools
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest,trunk,cargo-llvm-cov
-      - uses: ./.github/actions/setup-playwright
-      # Build the frontend up front, outside the instrumented test run. The test harness only
-      # rebuilds a bundle that is missing or older than its sources, so here it never has to.
-      - run: trunk build
-      # Run under instrumentation: the e2e/visual tests drive the server binary as a
-      # subprocess, so this captures server/main.rs coverage that the unit `test` job can't.
-      # The tests stop the server cleanly (SIGTERM, or Ctrl+Break on Windows), so it writes its
-      # coverage on every OS; Codecov merges the uploads.
-      - run: cargo llvm-cov nextest --locked --profile ci -E 'test(/^visual/) or test(/^e2e/)' --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@v7
-        with:
-          files: lcov.info
-          disable_search: true
-          flags: browser-${{ matrix.os }}
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
-      # The visual tests compare against the committed per-OS baselines and, on a mismatch, write
-      # `<name>-actual.png` and `<name>-diff.png` next to them. Upload those so a failure (or a
-      # retried flake) can be seen without reproducing it.
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: visual-diffs-${{ matrix.os }}
-          path: |
-            crates/rsdirstat/tests/snapshots/*/*-actual.png
-            crates/rsdirstat/tests/snapshots/*/*-diff.png
-          if-no-files-found: ignore
-          retention-days: 14
-      # Playwright traces are written only for failing browser tests (retain-on-failure);
-      # upload them so a red cross-OS run is debuggable without reproducing locally. `always()`
-      # rather than `failure()`: a test that fails and then passes on retry leaves its trace
-      # behind in a green job, and those flakes are the ones hardest to reproduce.
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: playwright-traces-${{ matrix.os }}
-          path: crates/rsdirstat/tests/traces/
-          if-no-files-found: ignore
-          retention-days: 14

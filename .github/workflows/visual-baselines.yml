@@ -35,7 +35,7 @@ jobs:
           tool: nextest,trunk
       - uses: ./.github/actions/setup-playwright
       - run: trunk build
-      # Same profile and environment as the CI browser job (`CI` is set on every runner, so the
+      # Same profile and environment as the CI test job (`CI` is set on every runner, so the
       # tests write to `tests/snapshots/<os>/`), but recording instead of comparing.
       - run: cargo nextest run --locked --profile ci -E 'test(/^visual/)'
         env:
