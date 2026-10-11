@@ -6,25 +6,64 @@ pub struct BreadcrumbEntry {
     pub name: String,
 }
 
-/// Layout geometry is kept in f64 (layout-space precision); it is shared by the layout engine,
-/// the server, and the client and serialized as-is.
+/// What a laid-out rect stands for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RectKind {
+    /// A folder drawn with its contents inside, below a header strip of [`header_height`].
+    Container,
+    /// A folder drawn as one block: at the depth limit, or too small to open.
+    #[default]
+    Dir,
+    File,
+    /// One folder's files that are too small to draw on their own, summed into one block.
+    OtherFiles,
+}
+
+/// One rect of a treemap layout, in canvas pixels. Geometry is f32: a canvas is at most a few
+/// thousand pixels across, so it is exact to well under a pixel, and half the size of f64 on the
+/// wire.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LayoutRect {
-    pub id: i64,
+    /// A folder's node id. 0 for a file or "(other files)" block: those are identified by
+    /// `parent_id` and `name`, which are sent anyway, and a random id per file would cost ~9
+    /// poorly-compressible bytes each.
+    pub id: u64,
     pub parent_id: u64,
-    pub x: f64,
-    pub y: f64,
-    pub w: f64,
-    pub h: f64,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
     pub name: String,
     pub hue: u16,
     pub size: u64,
     pub depth: u8,
-    pub is_container: bool,
-    pub header_height: f64,
-    pub is_files: bool,
-    pub is_file: bool,
+    pub kind: RectKind,
     pub mtime: i64,
+}
+
+impl LayoutRect {
+    /// Height of the header strip above a container's contents (0 for any other rect). The layout
+    /// engine and the client both compute it, so it isn't sent.
+    pub fn header_height(&self) -> f32 {
+        if self.kind == RectKind::Container {
+            header_height(self.w, self.h)
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Height of the header strip above a container of `width` × `height`: 15% of the height, at most
+/// 18px, and none when the result would be under 12px or the container is small.
+pub fn header_height(width: f32, height: f32) -> f32 {
+    const MAX_HEADER: f32 = 18.0;
+    if width > 60.0 && height > 30.0 {
+        let header = (height * 0.15).floor().min(MAX_HEADER);
+        if header >= 12.0 {
+            return header;
+        }
+    }
+    0.0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -196,11 +235,12 @@ mod tests {
     }
 
     fn sample_rects(count: usize) -> Vec<LayoutRect> {
+        let kinds = [RectKind::Container, RectKind::Dir, RectKind::File, RectKind::OtherFiles];
         (0..count)
             .map(|i| LayoutRect {
-                id: i as i64,
+                id: i as u64,
                 parent_id: 0,
-                x: i as f64 * 1.5,
+                x: i as f32 * 1.5,
                 y: 2.0,
                 w: 100.0,
                 h: 50.0,
@@ -208,13 +248,46 @@ mod tests {
                 hue: (i % 360) as u16,
                 size: 1000 + i as u64,
                 depth: (i % 8) as u8,
-                is_container: true,
-                header_height: 18.0,
-                is_files: false,
-                is_file: false,
+                kind: kinds[i % kinds.len()],
                 mtime: 1_700_000_000,
             })
             .collect()
+    }
+
+    #[test]
+    fn header_height_zero_for_small_rect() {
+        assert_eq!(header_height(60.0, 100.0), 0.0);
+        assert_eq!(header_height(100.0, 30.0), 0.0);
+        assert_eq!(header_height(50.0, 20.0), 0.0);
+    }
+
+    #[test]
+    fn header_height_capped_at_18() {
+        assert_eq!(header_height(200.0, 200.0), 18.0);
+    }
+
+    #[test]
+    fn header_height_proportional_in_mid_range() {
+        assert_eq!(header_height(200.0, 100.0), 15.0);
+    }
+
+    #[test]
+    fn header_height_zero_when_below_min() {
+        assert_eq!(header_height(200.0, 40.0), 0.0);
+    }
+
+    #[test]
+    fn only_containers_have_a_header() {
+        let rect = |kind| LayoutRect {
+            w: 200.0,
+            h: 200.0,
+            kind,
+            ..LayoutRect::default()
+        };
+        assert_eq!(rect(RectKind::Container).header_height(), 18.0);
+        for kind in [RectKind::Dir, RectKind::File, RectKind::OtherFiles] {
+            assert_eq!(rect(kind).header_height(), 0.0);
+        }
     }
 
     #[test]

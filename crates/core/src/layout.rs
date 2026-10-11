@@ -3,20 +3,9 @@ use std::collections::HashMap;
 use crate::color::{COLOR_MODE_AGE, age_hue, hash_id_to_hue};
 pub use crate::tree::{BreadcrumbEntry, DirTree, FilterConfig};
 use crate::tree::{DirNode, FileEntry};
-pub use rsdirstat_protocol::LayoutRect;
+pub use rsdirstat_protocol::{LayoutRect, RectKind};
 
-const NEST_HEADER: f64 = 18.0;
 const MIN_NEST_PX: f64 = 40.0;
-
-fn header_height(width: f64, height: f64) -> f64 {
-    if width > 60.0 && height > 30.0 {
-        let header = (height * 0.15).floor().min(NEST_HEADER);
-        if header >= 12.0 {
-            return header;
-        }
-    }
-    0.0
-}
 
 pub struct LayoutConfig {
     pub max_depth: u8,
@@ -50,7 +39,6 @@ pub fn compute_layout(
         config,
         filtering,
         out: Vec::new(),
-        next_file_id: -1,
     };
     let canvas = Rect {
         x: 0.0,
@@ -79,29 +67,22 @@ enum ItemKind<'a> {
 }
 
 struct LayoutItem<'a> {
-    id: i64,
+    /// The folder's node id; 0 for files and "(other files)" (see `LayoutRect::id`).
+    id: u64,
     size: u64,
     kind: ItemKind<'a>,
 }
 
-/// Per-call layout state: the inputs every level needs plus the output and file-id counter.
+/// Per-call layout state: the inputs every level needs plus the output.
 struct LayoutCtx<'a> {
     tree: &'a DirTree,
     sizes: &'a HashMap<u64, u64>,
     config: &'a LayoutConfig,
     filtering: bool,
     out: Vec<LayoutRect>,
-    /// Files and aggregates get negative ids (directories are positive), handed out in layout order.
-    next_file_id: i64,
 }
 
 impl<'a> LayoutCtx<'a> {
-    fn take_file_id(&mut self) -> i64 {
-        let id = self.next_file_id;
-        self.next_file_id -= 1;
-        id
-    }
-
     fn hue(&self, hue: u16, mtime: i64) -> u16 {
         if self.config.color_mode == COLOR_MODE_AGE {
             let (min_time, max_time) = self.config.mtime_range;
@@ -130,7 +111,7 @@ impl<'a> LayoutCtx<'a> {
                 && let Some(child) = self.tree.nodes.get(&id)
             {
                 items.push(LayoutItem {
-                    id: id as i64,
+                    id,
                     size,
                     kind: ItemKind::Dir(child),
                 });
@@ -151,7 +132,7 @@ impl<'a> LayoutCtx<'a> {
             }
             if (file.size as f64) >= min_file_size {
                 items.push(LayoutItem {
-                    id: self.take_file_id(),
+                    id: 0,
                     size: file.size,
                     kind: ItemKind::File(file),
                 });
@@ -161,7 +142,7 @@ impl<'a> LayoutCtx<'a> {
         }
         if residual > 0 {
             items.push(LayoutItem {
-                id: self.take_file_id(),
+                id: 0,
                 size: residual,
                 kind: ItemKind::Aggregate,
             });
@@ -190,10 +171,10 @@ impl<'a> LayoutCtx<'a> {
             let mut rect = LayoutRect {
                 id: item.id,
                 parent_id: node_id,
-                x: r.x,
-                y: r.y,
-                w: r.w,
-                h: r.h,
+                x: r.x as f32,
+                y: r.y as f32,
+                w: r.w as f32,
+                h: r.h as f32,
                 size: item.size,
                 depth,
                 ..LayoutRect::default()
@@ -209,8 +190,7 @@ impl<'a> LayoutCtx<'a> {
                     // including one holding only files — gating on "has sub-folders" left files-only
                     // folders as solid blocks at every depth (issue #5).
                     if depth + 1 < self.config.max_depth && r.w >= MIN_NEST_PX && r.h >= MIN_NEST_PX {
-                        rect.is_container = true;
-                        rect.header_height = header_height(r.w, r.h);
+                        rect.kind = RectKind::Container;
                         nest = Some(child);
                     }
                 }
@@ -218,18 +198,20 @@ impl<'a> LayoutCtx<'a> {
                     rect.name = file.name.to_string();
                     rect.hue = self.hue(file.hue, file.mtime);
                     rect.mtime = file.mtime;
-                    rect.is_file = true;
+                    rect.kind = RectKind::File;
                 }
                 ItemKind::Aggregate => {
                     rect.name = "(other files)".to_string();
                     rect.hue = hash_id_to_hue(node_id);
-                    rect.is_files = true;
+                    rect.kind = RectKind::OtherFiles;
                 }
             }
-            let header = rect.header_height;
+            // From the rect's f32 size, exactly as the client computes it, so the contents start
+            // right below the header it draws.
+            let header = f64::from(rect.header_height());
             self.out.push(rect);
             if let Some(child) = nest {
-                self.layout_node(item.id as u64, child, item.size, r, header, depth + 1);
+                self.layout_node(item.id, child, item.size, r, header, depth + 1);
             }
         }
     }
@@ -355,28 +337,6 @@ mod tests {
     }
 
     #[test]
-    fn header_height_zero_for_small_rect() {
-        assert_eq!(header_height(60.0, 100.0), 0.0);
-        assert_eq!(header_height(100.0, 30.0), 0.0);
-        assert_eq!(header_height(50.0, 20.0), 0.0);
-    }
-
-    #[test]
-    fn header_height_capped_at_18() {
-        assert_eq!(header_height(200.0, 200.0), 18.0);
-    }
-
-    #[test]
-    fn header_height_proportional_in_mid_range() {
-        assert_eq!(header_height(200.0, 100.0), 15.0);
-    }
-
-    #[test]
-    fn header_height_zero_when_below_min() {
-        assert_eq!(header_height(200.0, 40.0), 0.0);
-    }
-
-    #[test]
     fn empty_tree_produces_empty_layout() {
         let tree = DirTree::new();
         let config = default_config();
@@ -485,18 +445,18 @@ mod tests {
         let config = default_config();
         let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config);
 
-        let eps = 0.01;
+        let eps = 0.01_f64;
         for r in &rects {
-            assert!(r.x >= -eps, "Rect '{}' has x={} < 0", r.name, r.x);
-            assert!(r.y >= -eps, "Rect '{}' has y={} < 0", r.name, r.y);
+            assert!(f64::from(r.x) >= -eps, "Rect '{}' has x={} < 0", r.name, r.x);
+            assert!(f64::from(r.y) >= -eps, "Rect '{}' has y={} < 0", r.name, r.y);
             assert!(
-                r.x + r.w <= canvas_w + eps,
+                f64::from(r.x + r.w) <= canvas_w + eps,
                 "Rect '{}' extends past canvas width: x+w={} > {canvas_w}",
                 r.name,
                 r.x + r.w
             );
             assert!(
-                r.y + r.h <= canvas_h + eps,
+                f64::from(r.y + r.h) <= canvas_h + eps,
                 "Rect '{}' extends past canvas height: y+h={} > {canvas_h}",
                 r.name,
                 r.y + r.h
@@ -519,7 +479,11 @@ mod tests {
         let config = default_config();
         let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config);
 
-        let top_area: f64 = rects.iter().filter(|r| r.depth == 0).map(|r| r.w * r.h).sum();
+        let top_area: f64 = rects
+            .iter()
+            .filter(|r| r.depth == 0)
+            .map(|r| f64::from(r.w) * f64::from(r.h))
+            .sum();
 
         let ratio = top_area / canvas_area;
         assert!(
@@ -539,7 +503,7 @@ mod tests {
         let config = default_config();
         let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
 
-        let file_rects: Vec<&LayoutRect> = rects.iter().filter(|r| r.is_file).collect();
+        let file_rects: Vec<&LayoutRect> = rects.iter().filter(|r| r.kind == RectKind::File).collect();
         assert!(
             file_rects.len() >= 2,
             "Expected at least 2 file rects, got {}",
@@ -549,10 +513,6 @@ mod tests {
         let names: Vec<&str> = file_rects.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"big.txt"), "Missing big.txt in {names:?}");
         assert!(names.contains(&"huge.rs"), "Missing huge.rs in {names:?}");
-
-        for r in &file_rects {
-            assert!(r.id < 0, "File rect should have negative id, got {}", r.id);
-        }
     }
 
     #[test]
@@ -572,7 +532,7 @@ mod tests {
         let rects_no_filter = compute_layout(&tree, 1, 800.0, 600.0, &config_no_filter);
         let dirs_no_filter: Vec<&str> = rects_no_filter
             .iter()
-            .filter(|r| r.depth == 0 && !r.is_file && !r.is_files)
+            .filter(|r| r.depth == 0 && matches!(r.kind, RectKind::Container | RectKind::Dir))
             .map(|r| r.name.as_str())
             .collect();
         assert!(dirs_no_filter.contains(&"src"));
@@ -593,7 +553,7 @@ mod tests {
 
         let filtered_names: Vec<&str> = rects_filtered
             .iter()
-            .filter(|r| r.depth == 0 && !r.is_file && !r.is_files)
+            .filter(|r| r.depth == 0 && matches!(r.kind, RectKind::Container | RectKind::Dir))
             .map(|r| r.name.as_str())
             .collect();
         assert!(filtered_names.contains(&"src"), "src should be visible with .rs filter");
@@ -633,7 +593,7 @@ mod tests {
         };
         let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
         assert!(
-            rects.iter().all(|r| !r.is_container),
+            rects.iter().all(|r| r.kind != RectKind::Container),
             "max_depth=1 should not open any folder"
         );
     }
@@ -650,10 +610,10 @@ mod tests {
 
         let rects = compute_layout(&tree, 1, 800.0, 600.0, &default_config());
         let folder = rects.iter().find(|r| r.name == "scans").unwrap();
-        assert!(folder.is_container, "a files-only folder should open up");
+        assert_eq!(folder.kind, RectKind::Container, "a files-only folder should open up");
         let mut files: Vec<&str> = rects
             .iter()
-            .filter(|r| r.is_file && r.parent_id == 2)
+            .filter(|r| r.kind == RectKind::File && r.parent_id == 2)
             .map(|r| r.name.as_str())
             .collect();
         files.sort_unstable();
@@ -688,11 +648,11 @@ mod tests {
             }
         }
 
-        let eps = 0.01;
+        let eps = 0.01_f64;
         for r in &top_level {
-            assert!(r.x >= -eps && r.y >= -eps);
-            assert!(r.x + r.w <= canvas_w + eps);
-            assert!(r.y + r.h <= canvas_h + eps);
+            assert!(f64::from(r.x) >= -eps && f64::from(r.y) >= -eps);
+            assert!(f64::from(r.x + r.w) <= canvas_w + eps);
+            assert!(f64::from(r.y + r.h) <= canvas_h + eps);
         }
     }
 }

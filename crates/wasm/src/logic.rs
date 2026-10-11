@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
-use rsdirstat_protocol::{BreadcrumbEntry, ClientMessage, LayoutPayload, LayoutRect, ServerMessage};
+use rsdirstat_protocol::{BreadcrumbEntry, ClientMessage, LayoutPayload, LayoutRect, RectKind, ServerMessage};
 
 pub(crate) fn format_size(bytes: u64) -> String {
     let mut value = bytes as f64;
@@ -62,7 +62,7 @@ pub(crate) fn crumb_label(entry: &BreadcrumbEntry) -> &str {
 /// hue. This is the single rect representation used throughout the client.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RenderRect {
-    pub id: i64,
+    pub id: u64,
     pub parent_id: u64,
     pub x: f64,
     pub y: f64,
@@ -70,9 +70,9 @@ pub(crate) struct RenderRect {
     pub h: f64,
     pub name: String,
     pub size: u64,
-    pub is_container: bool,
+    pub kind: RectKind,
+    /// A container's header strip (see `LayoutRect::header_height`); 0 for every other rect.
     pub header_height: f64,
-    pub is_file: bool,
     pub mtime: i64,
     pub depth: u8,
     /// Body colour: a dark shade for a container (its children draw on top), a vivid one otherwise.
@@ -83,7 +83,7 @@ pub(crate) struct RenderRect {
 
 impl RenderRect {
     pub(crate) fn from_wire(rect: LayoutRect) -> Self {
-        let (fill, header_fill) = if rect.is_container {
+        let (fill, header_fill) = if rect.kind == RectKind::Container {
             (hsl(rect.hue, 25, 13), hsl(rect.hue, 35, 20))
         } else {
             let vivid = hsl(rect.hue, 62, 38);
@@ -92,19 +92,37 @@ impl RenderRect {
         Self {
             id: rect.id,
             parent_id: rect.parent_id,
-            x: rect.x,
-            y: rect.y,
-            w: rect.w,
-            h: rect.h,
+            x: rect.x.into(),
+            y: rect.y.into(),
+            w: rect.w.into(),
+            h: rect.h.into(),
+            header_height: rect.header_height().into(),
             name: rect.name,
             size: rect.size,
-            is_container: rect.is_container,
-            header_height: rect.header_height,
-            is_file: rect.is_file,
+            kind: rect.kind,
             mtime: rect.mtime,
             depth: rect.depth,
             fill,
             header_fill,
+        }
+    }
+
+    pub(crate) fn is_container(&self) -> bool {
+        self.kind == RectKind::Container
+    }
+
+    /// A folder, drawn open or as one block: something to navigate into or reveal.
+    pub(crate) fn is_dir(&self) -> bool {
+        matches!(self.kind, RectKind::Container | RectKind::Dir)
+    }
+
+    /// What identifies this rect from one layout to the next: a folder's id, or a file's (or
+    /// "(other files)" block's) folder and name. No file is named "", so the two can't collide.
+    fn key(&self) -> (u64, &str) {
+        if self.is_dir() {
+            (self.id, "")
+        } else {
+            (self.parent_id, &self.name)
         }
     }
 }
@@ -137,20 +155,19 @@ pub(crate) fn find_rect_index(rects: &[RenderRect], mouse_x: f64, mouse_y: f64) 
 }
 
 pub(crate) fn find_navigable_target_index(rects: &[RenderRect], mouse_x: f64, mouse_y: f64) -> Option<usize> {
-    // Topmost (last-drawn) directory under the cursor — same back-to-front scan as find_rect_index.
-    // Files and "(other files)" aggregates carry negative ids, so `id > 0` means a real directory.
+    // Topmost (last-drawn) folder under the cursor — same back-to-front scan as find_rect_index.
     rects
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(index, rect)| (hit_test(rect, mouse_x, mouse_y) && rect.id > 0).then_some(index))
+        .find_map(|(index, rect)| (hit_test(rect, mouse_x, mouse_y) && rect.is_dir()).then_some(index))
 }
 
 pub(crate) fn build_rect_index(rects: &[RenderRect]) -> HashMap<u64, usize> {
     let mut id_to_index = HashMap::with_capacity(rects.len());
     for (index, rect) in rects.iter().enumerate() {
-        if rect.id > 0 {
-            id_to_index.insert(rect.id as u64, index);
+        if rect.is_dir() {
+            id_to_index.insert(rect.id, index);
         }
     }
     id_to_index
@@ -169,7 +186,7 @@ pub(crate) fn build_hover_state(
     let mut hovered_ancestor_indices = Vec::new();
     while let Some(index) = id_to_index.get(&current_parent).copied() {
         let rect = &rects[index];
-        if rect.is_container {
+        if rect.is_container() {
             hovered_ancestor_indices.push(index);
         }
         current_parent = rect.parent_id;
@@ -195,16 +212,16 @@ pub(crate) fn build_hover_state(
 
 impl InterpolationPlan {
     pub(crate) fn new(from: &[RenderRect], to: &[RenderRect]) -> Self {
-        let mut from_by_id = HashMap::with_capacity(from.len());
+        let mut from_by_key = HashMap::with_capacity(from.len());
         for rect in from {
-            from_by_id.insert(rect.id, rect);
+            from_by_key.insert(rect.key(), rect);
         }
         let mut seen = HashSet::with_capacity(to.len());
         let mut steps = Vec::with_capacity(to.len() + from.len());
 
         for to_rect in to {
-            seen.insert(to_rect.id);
-            if let Some(from_rect) = from_by_id.get(&to_rect.id) {
+            seen.insert(to_rect.key());
+            if let Some(from_rect) = from_by_key.get(&to_rect.key()) {
                 steps.push(InterpolationStep::Matched {
                     from: (*from_rect).clone(),
                     to: to_rect.clone(),
@@ -215,7 +232,7 @@ impl InterpolationPlan {
         }
 
         for from_rect in from {
-            if seen.contains(&from_rect.id) {
+            if seen.contains(&from_rect.key()) {
                 continue;
             }
             steps.push(InterpolationStep::Exiting {
@@ -289,10 +306,8 @@ pub(crate) fn self_checks() -> Vec<(&'static str, bool)> {
         hue: 120,
         size: 5_000,
         depth: 2,
-        is_container: true,
-        header_height: 18.0,
+        kind: RectKind::Container,
         mtime: 1_700_000_000,
-        ..LayoutRect::default()
     }];
     let layout = ServerMessage::Layout(LayoutPayload {
         root_size: 10_000,
@@ -342,7 +357,7 @@ pub(crate) fn self_checks() -> Vec<(&'static str, bool)> {
 mod tests {
     use super::*;
 
-    fn rect(id: i64, parent_id: u64, x: f64, y: f64, w: f64, h: f64, name: &str) -> RenderRect {
+    fn rect(id: u64, parent_id: u64, x: f64, y: f64, w: f64, h: f64, name: &str) -> RenderRect {
         RenderRect {
             id,
             parent_id,
@@ -352,9 +367,8 @@ mod tests {
             h,
             name: name.into(),
             size: 100,
-            is_container: true,
+            kind: RectKind::Container,
             header_height: 18.0,
-            is_file: false,
             mtime: 0,
             depth: 1,
             fill: "",
@@ -362,16 +376,15 @@ mod tests {
         }
     }
 
-    fn wire_rect(is_container: bool) -> LayoutRect {
+    fn wire_rect(kind: RectKind) -> LayoutRect {
         LayoutRect {
             id: 1,
-            w: 10.0,
-            h: 10.0,
+            w: 100.0,
+            h: 100.0,
             name: "x".into(),
             hue: 120,
             size: 1,
-            is_container,
-            is_file: !is_container,
+            kind,
             ..LayoutRect::default()
         }
     }
@@ -404,12 +417,14 @@ mod tests {
 
     #[test]
     fn from_wire_shades_containers_darker() {
-        let container = RenderRect::from_wire(wire_rect(true));
+        let container = RenderRect::from_wire(wire_rect(RectKind::Container));
         assert_eq!(container.fill, "hsl(120,25%,13%)");
         assert_eq!(container.header_fill, "hsl(120,35%,20%)");
+        assert_eq!(container.header_height, 15.0, "computed from the size, not sent");
 
-        let file = RenderRect::from_wire(wire_rect(false));
+        let file = RenderRect::from_wire(wire_rect(RectKind::File));
         assert_eq!(file.fill, "hsl(120,62%,38%)");
+        assert_eq!(file.header_height, 0.0);
     }
 
     #[test]
@@ -423,11 +438,10 @@ mod tests {
 
     #[test]
     fn find_navigable_target_skips_files_and_aggregates() {
-        let mut files = rect(-1, 0, 0.0, 0.0, 10.0, 10.0, "(other files)");
-        files.is_container = false;
-        let mut file = rect(-2, 0, 0.0, 0.0, 10.0, 10.0, "file");
-        file.is_container = false;
-        file.is_file = true;
+        let mut files = rect(10, 0, 0.0, 0.0, 10.0, 10.0, "(other files)");
+        files.kind = RectKind::OtherFiles;
+        let mut file = rect(11, 0, 0.0, 0.0, 10.0, 10.0, "file");
+        file.kind = RectKind::File;
         let dir = rect(3, 0, 0.0, 0.0, 10.0, 10.0, "dir");
         let rects = vec![dir, files, file];
         assert_eq!(find_navigable_target_index(&rects, 5.0, 5.0), Some(0));
@@ -437,9 +451,8 @@ mod tests {
     fn build_hover_state_includes_breadcrumb_and_ancestors() {
         let root = rect(1, 0, 0.0, 0.0, 100.0, 100.0, "src");
         let child = rect(2, 1, 10.0, 10.0, 40.0, 40.0, "nested");
-        let mut leaf = rect(-1, 2, 15.0, 15.0, 10.0, 10.0, "main.rs");
-        leaf.is_container = false;
-        leaf.is_file = true;
+        let mut leaf = rect(10, 2, 15.0, 15.0, 10.0, 10.0, "main.rs");
+        leaf.kind = RectKind::File;
         leaf.header_height = 0.0;
         let breadcrumb = vec![BreadcrumbEntry {
             id: 0,
@@ -450,6 +463,25 @@ mod tests {
         assert_eq!(hover.hovered_index, 2);
         assert_eq!(hover.hovered_ancestor_indices, vec![1, 0]);
         assert_eq!(hover.path_text, "/tmp/src/nested/main.rs");
+    }
+
+    /// Files arrive without ids and are matched by folder and name: the same file moves between
+    /// layouts, and a same-named file in another folder is a different one.
+    #[test]
+    fn interpolation_matches_files_by_folder_and_name() {
+        let file = |parent, name: &str, x| {
+            let mut rect = rect(0, parent, x, 0.0, 10.0, 10.0, name);
+            rect.kind = RectKind::File;
+            rect
+        };
+        let from = vec![file(7, "a.rs", 0.0), file(7, "b.rs", 10.0)];
+        let to = vec![file(7, "b.rs", 50.0), file(8, "a.rs", 90.0)];
+        let mid = InterpolationPlan::new(&from, &to).interpolate(0.5);
+
+        assert_eq!(mid.len(), 3);
+        assert_eq!((mid[0].name.as_str(), mid[0].x), ("b.rs", 30.0), "7/b.rs moves");
+        assert_eq!((mid[1].parent_id, mid[1].w), (8, 5.0), "8/a.rs enters");
+        assert_eq!((mid[2].parent_id, mid[2].w), (7, 5.0), "7/a.rs exits");
     }
 
     #[test]

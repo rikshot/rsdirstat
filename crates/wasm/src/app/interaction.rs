@@ -1,6 +1,7 @@
 use super::dom::window_inner_size;
 use super::*;
 use crate::logic::{build_hover_state, find_navigable_target_index, find_rect_index};
+use rsdirstat_protocol::RectKind;
 
 impl TreemapApp {
     /// The pointer position in canvas coordinates. Taken from the event itself (`offsetX/Y` are
@@ -137,7 +138,7 @@ impl TreemapApp {
         }
         let (mouse_x, mouse_y) = Self::canvas_point(&event);
         if let Some(index) = find_navigable_target_index(&self.view.rects, mouse_x, mouse_y) {
-            let id = self.view.rects[index].id as u64;
+            let id = self.view.rects[index].id;
             self.begin_navigation(ClientMessage::Navigate { id })?;
         }
         Ok(())
@@ -147,13 +148,13 @@ impl TreemapApp {
         let (mouse_x, mouse_y) = Self::canvas_point(&event);
         if let Some(index) = find_rect_index(&self.view.rects, mouse_x, mouse_y) {
             let rect = &self.view.rects[index];
-            if rect.is_file {
+            if rect.kind == RectKind::File {
                 self.send_message(ClientMessage::RevealFile {
                     dir_id: rect.parent_id,
                     name: rect.name.clone(),
                 })?;
-            } else if rect.id > 0 {
-                self.send_message(ClientMessage::RevealDir { id: rect.id as u64 })?;
+            } else if rect.is_dir() {
+                self.send_message(ClientMessage::RevealDir { id: rect.id })?;
             }
         }
         Ok(())
