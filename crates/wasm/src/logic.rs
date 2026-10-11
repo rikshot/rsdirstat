@@ -36,21 +36,23 @@ pub(crate) fn hsl(hue: u16, saturation: u8, lightness: u8) -> &'static str {
     })
 }
 
-pub(crate) fn collapse_slashes(path: String) -> String {
-    let mut out = String::with_capacity(path.len());
-    let mut last_was_slash = false;
-    for ch in path.chars() {
-        if ch == '/' {
-            if !last_was_slash {
-                out.push(ch);
-            }
-            last_was_slash = true;
-        } else {
-            out.push(ch);
-            last_was_slash = false;
+/// Join path components for display. The separator is `\` when the scan root is a Windows path
+/// (its label holds one, as `C:\` does) and `/` otherwise, and none is added after a component that
+/// already ends with one, such as a root of `/` or `C:\`.
+pub(crate) fn join_path(parts: &[&str]) -> String {
+    let separator = if parts.first().is_some_and(|root| root.contains('\\')) {
+        '\\'
+    } else {
+        '/'
+    };
+    let mut path = String::new();
+    for part in parts {
+        if !path.is_empty() && !path.ends_with(['/', '\\']) {
+            path.push(separator);
         }
+        path.push_str(part);
     }
-    out
+    path
 }
 
 /// A breadcrumb entry's display name; the scan root of `/` arrives with an empty name.
@@ -201,7 +203,7 @@ pub(crate) fn build_hover_state(
             .map(|&index| rects[index].name.as_str()),
     );
     parts.push(&hovered_rect.name);
-    let path_text = collapse_slashes(parts.join("/"));
+    let path_text = join_path(&parts);
 
     Some(HoverState {
         hovered_index,
@@ -349,7 +351,7 @@ pub(crate) fn self_checks() -> Vec<(&'static str, bool)> {
                         && decoded.rects == rects
             ),
         ),
-        ("collapse slashes", collapse_slashes("///a//b".into()) == "/a/b"),
+        ("join a path under /", join_path(&["/", "usr", "lib"]) == "/usr/lib"),
     ]
 }
 
@@ -411,8 +413,12 @@ mod tests {
     }
 
     #[test]
-    fn collapse_slashes_keeps_root() {
-        assert_eq!(collapse_slashes("/".into()), "/");
+    fn join_path_uses_one_separator_of_the_roots_kind() {
+        assert_eq!(join_path(&["/"]), "/");
+        assert_eq!(join_path(&["/", "usr", "lib"]), "/usr/lib");
+        assert_eq!(join_path(&["projects", "src", "main.rs"]), "projects/src/main.rs");
+        // Regression: a Windows drive root showed as `C:\/Windows/System32`.
+        assert_eq!(join_path(&["C:\\", "Windows", "System32"]), "C:\\Windows\\System32");
     }
 
     #[test]
