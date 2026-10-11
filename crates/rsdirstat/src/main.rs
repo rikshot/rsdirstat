@@ -21,8 +21,9 @@ use tokio::sync::{Notify, broadcast, watch};
 use tower_http::compression::CompressionLayer;
 
 use rsdirstat_core::layout::{self, LayoutConfig};
-use rsdirstat_core::tree::FilterConfig;
-use rsdirstat_protocol::{self as wire, ClientMessage, ScanEvent};
+use rsdirstat_core::scan::ScanEvent;
+use rsdirstat_core::tree::{DirTree, FilterConfig};
+use rsdirstat_protocol::{self as wire, ClientMessage};
 
 #[cfg(target_os = "linux")]
 use rsdirstat_linux as scanner;
@@ -83,7 +84,7 @@ enum ScanPhase {
 }
 
 struct ScanState {
-    tree: RwLock<layout::DirTree>,
+    tree: RwLock<DirTree>,
     version: AtomicU64,
     phase: Mutex<ScanPhase>,
     /// The canonical path being (or last) scanned.
@@ -181,7 +182,7 @@ async fn run_server(args: Args) -> Result<()> {
 
     let state = Arc::new(AppState {
         scan: ScanState {
-            tree: RwLock::new(layout::DirTree::new()),
+            tree: RwLock::new(DirTree::new()),
             version: AtomicU64::new(0),
             phase: Mutex::new(phase),
             root: Mutex::new(scan_root),
@@ -300,7 +301,7 @@ async fn layout_loop(state: Arc<AppState>) {
         };
         let rects = layout::compute_layout(&tree, view_root, vw, vh, &config);
         let breadcrumb = tree.breadcrumb(view_root);
-        let root_size = tree.recursive_sizes.get(&view_root).copied().unwrap_or(0);
+        let root_size = tree.nodes.get(&view_root).map_or(0, |node| node.size);
         let dir_count = tree.nodes.len() as u32;
         drop(tree);
 

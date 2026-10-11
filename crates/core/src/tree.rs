@@ -1,9 +1,9 @@
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 
-use rsdirstat_protocol::ScanEvent;
-
 use crate::color::{hash_name, hue_for_extension};
+use crate::scan::ScanEvent;
 
 pub struct FileEntry {
     pub name: Box<str>,
@@ -12,11 +12,40 @@ pub struct FileEntry {
     pub mtime: i64,
 }
 
+/// A map keyed by node id.
+pub type NodeMap<V> = HashMap<u64, V, BuildHasherDefault<NodeIdHasher>>;
+
+/// Hashes a node id by passing it through. Ids come from `scan::node_id`, already a 64-bit mix,
+/// so hashing them again (SipHash is ~4-5× slower per lookup) would be wasted work.
+#[derive(Default)]
+pub struct NodeIdHasher(u64);
+
+impl Hasher for NodeIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        // Only reached for keys other than a lone u64; fold them in (FNV-1a) to stay correct.
+        for &byte in bytes {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3);
+        }
+    }
+
+    fn write_u64(&mut self, id: u64) {
+        self.0 = id;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Default)]
 pub struct DirNode {
     pub parent: u64,
     pub name: Box<str>,
+    /// Total size of this directory's own files.
     pub direct_size: u64,
+    /// Total size of everything under this directory: its files and all its subdirectories.
+    /// Grows as directories are added during a scan; exact after `recompute_sizes`.
+    pub size: u64,
     pub children: Vec<u64>,
     pub files: Vec<FileEntry>,
     pub hue: u16,
@@ -70,9 +99,8 @@ impl FilterConfig {
 pub use rsdirstat_protocol::BreadcrumbEntry;
 
 pub struct DirTree {
-    pub nodes: HashMap<u64, DirNode>,
+    pub nodes: NodeMap<DirNode>,
     pub root_id: Option<u64>,
-    pub recursive_sizes: HashMap<u64, u64>,
     pub scan_path: String,
     pub mtime_range: (i64, i64),
     hue_cache: HashMap<Box<str>, u16>,
@@ -87,9 +115,8 @@ impl Default for DirTree {
 impl DirTree {
     pub fn new() -> Self {
         Self {
-            nodes: HashMap::new(),
+            nodes: NodeMap::default(),
             root_id: None,
-            recursive_sizes: HashMap::new(),
             scan_path: String::new(),
             mtime_range: (i64::MAX, 0),
             hue_cache: HashMap::new(),
@@ -99,7 +126,6 @@ impl DirTree {
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.root_id = None;
-        self.recursive_sizes.clear();
         self.scan_path.clear();
         self.mtime_range = (i64::MAX, 0);
         self.hue_cache.clear();
@@ -188,23 +214,19 @@ impl DirTree {
         hue
     }
 
+    /// Add `delta` to the size of `node_id` and of every directory above it.
     fn propagate_size(&mut self, node_id: u64, delta: u64) {
         let mut current = node_id;
-        loop {
-            let entry = self.recursive_sizes.entry(current).or_insert(0);
-            *entry = entry.saturating_add(delta);
-            match self.nodes.get(&current) {
-                Some(node) if node.parent != 0 => current = node.parent,
-                _ => break,
+        while let Some(node) = self.nodes.get_mut(&current) {
+            node.size = node.size.saturating_add(delta);
+            if node.parent == 0 {
+                break;
             }
+            current = node.parent;
         }
     }
 
-    /// The whole tree in pre-order (every parent before its children), starting at the root.
-    pub fn bottom_up_order(&self) -> Vec<u64> {
-        self.root_id.map_or_else(Vec::new, |root| self.subtree_order(root))
-    }
-
+    /// The subtree under `root` in pre-order: every directory before its children.
     fn subtree_order(&self, root: u64) -> Vec<u64> {
         let mut stack = vec![root];
         let mut order = Vec::new();
@@ -217,40 +239,41 @@ impl DirTree {
         order
     }
 
-    /// Bottom-up fold over the subtree under `root`: each node's size is `own_size(node)` plus the
-    /// already-folded sizes of its children. Shared by the recursive-size and filtered-size passes
-    /// (they differ only in the per-node "own" term).
-    fn fold_sizes(&self, root: u64, own_size: impl Fn(&DirNode) -> u64) -> HashMap<u64, u64> {
-        let order = self.subtree_order(root);
-        let mut sizes = HashMap::with_capacity(order.len());
-        for &id in order.iter().rev() {
-            if let Some(node) = self.nodes.get(&id) {
-                let mut total = own_size(node);
-                for &child in &node.children {
-                    total = total.saturating_add(sizes.get(&child).copied().unwrap_or(0));
-                }
-                sizes.insert(id, total);
+    /// Recompute every directory's `size` bottom-up from the `direct_size`s. The running sizes kept
+    /// during a scan rely on each directory arriving before its subdirectories (as the scanner
+    /// sends them); this makes them exact whatever the order.
+    pub fn recompute_sizes(&mut self) {
+        let Some(root) = self.root_id else { return };
+        for id in self.subtree_order(root).into_iter().rev() {
+            let Some(node) = self.nodes.get(&id) else { continue };
+            let size = node.children.iter().fold(node.direct_size, |total, child| {
+                total.saturating_add(self.nodes.get(child).map_or(0, |child| child.size))
+            });
+            if let Some(node) = self.nodes.get_mut(&id) {
+                node.size = size;
             }
         }
-        sizes
-    }
-
-    pub fn recompute_sizes(&mut self) {
-        self.recursive_sizes = match self.root_id {
-            Some(root) => self.fold_sizes(root, |node| node.direct_size),
-            None => HashMap::new(),
-        };
     }
 
     /// Sizes counting only the files `filter` matches, for the subtree under `root` (the layout
     /// never looks outside the directory being viewed).
-    pub fn compute_filtered_sizes(&self, filter: &FilterConfig, root: u64) -> HashMap<u64, u64> {
-        self.fold_sizes(root, |node| {
-            node.files
-                .iter()
-                .filter(|file| filter.matches_file(&file.name, file.size))
-                .fold(0u64, |acc, file| acc.saturating_add(file.size))
-        })
+    pub fn compute_filtered_sizes(&self, filter: &FilterConfig, root: u64) -> NodeMap<u64> {
+        let order = self.subtree_order(root);
+        let mut sizes = NodeMap::with_capacity_and_hasher(order.len(), Default::default());
+        for &id in order.iter().rev() {
+            if let Some(node) = self.nodes.get(&id) {
+                let own = node
+                    .files
+                    .iter()
+                    .filter(|file| filter.matches_file(&file.name, file.size))
+                    .fold(0u64, |total, file| total.saturating_add(file.size));
+                let size = node.children.iter().fold(own, |total, child| {
+                    total.saturating_add(sizes.get(child).copied().unwrap_or(0))
+                });
+                sizes.insert(id, size);
+            }
+        }
+        sizes
     }
 
     pub fn breadcrumb(&self, view_root: u64) -> Vec<BreadcrumbEntry> {
@@ -447,7 +470,6 @@ mod tests {
         let tree = DirTree::new();
         assert!(tree.nodes.is_empty());
         assert!(tree.root_id.is_none());
-        assert!(tree.recursive_sizes.is_empty());
         assert!(tree.scan_path.is_empty());
         assert_eq!(tree.mtime_range, (i64::MAX, 0));
     }
@@ -506,38 +528,53 @@ mod tests {
         let tree = sample_tree();
         // dir_c(50) is under dir_a(100), both under root(0)
         // root = 0 + 100 + 200 + 50 = 350
-        assert_eq!(tree.recursive_sizes[&1], 350);
+        assert_eq!(tree.nodes[&1].size, 350);
         // dir_a = 100 + 50 = 150
-        assert_eq!(tree.recursive_sizes[&2], 150);
+        assert_eq!(tree.nodes[&2].size, 150);
         // dir_b = 200
-        assert_eq!(tree.recursive_sizes[&3], 200);
+        assert_eq!(tree.nodes[&3].size, 200);
         // dir_c = 50
-        assert_eq!(tree.recursive_sizes[&4], 50);
+        assert_eq!(tree.nodes[&4].size, 50);
     }
 
     #[test]
     fn recompute_sizes_matches_propagated() {
         let mut tree = sample_tree();
-        // Manually corrupt recursive_sizes, then recompute
-        tree.recursive_sizes.clear();
+        for node in tree.nodes.values_mut() {
+            node.size = 0;
+        }
         tree.recompute_sizes();
-        assert_eq!(tree.recursive_sizes[&1], 350);
-        assert_eq!(tree.recursive_sizes[&2], 150);
-        assert_eq!(tree.recursive_sizes[&3], 200);
-        assert_eq!(tree.recursive_sizes[&4], 50);
+        assert_eq!(tree.nodes[&1].size, 350);
+        assert_eq!(tree.nodes[&2].size, 150);
+        assert_eq!(tree.nodes[&3].size, 200);
+        assert_eq!(tree.nodes[&4].size, 50);
+    }
+
+    /// A directory whose own event arrives after a subdirectory's: the running sizes miss the
+    /// subdirectory higher up, and `recompute_sizes` (run at `ScanDone`) corrects them.
+    #[test]
+    fn recompute_sizes_fixes_out_of_order_inserts() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_dir(3, 2, "grandchild", 50, 100); // before its parent, 2
+        tree.insert_dir(2, 1, "child", 10, 100);
+        tree.recompute_sizes();
+        assert_eq!(tree.nodes[&1].size, 60);
+        assert_eq!(tree.nodes[&2].size, 60);
+        assert_eq!(tree.nodes[&3].size, 50);
     }
 
     #[test]
     fn recompute_sizes_empty_tree() {
         let mut tree = DirTree::new();
         tree.recompute_sizes();
-        assert!(tree.recursive_sizes.is_empty());
+        assert!(tree.nodes.is_empty());
     }
 
     #[test]
-    fn bottom_up_order_contains_all_nodes() {
+    fn subtree_order_contains_all_nodes() {
         let tree = sample_tree();
-        let order = tree.bottom_up_order();
+        let order = tree.subtree_order(1);
         assert_eq!(order.len(), 4);
         // root is first (top-down BFS-like via stack)
         assert_eq!(order[0], 1);
@@ -548,15 +585,9 @@ mod tests {
     }
 
     #[test]
-    fn bottom_up_order_empty_tree() {
-        let tree = DirTree::new();
-        assert!(tree.bottom_up_order().is_empty());
-    }
-
-    #[test]
-    fn bottom_up_order_reversed_is_leaves_first() {
+    fn subtree_order_reversed_is_leaves_first() {
         let tree = sample_tree();
-        let order = tree.bottom_up_order();
+        let order = tree.subtree_order(1);
         // When reversed, leaves must come before their parents.
         let mut rev = order.clone();
         rev.reverse();
@@ -637,7 +668,6 @@ mod tests {
         tree.clear();
         assert!(tree.nodes.is_empty());
         assert!(tree.root_id.is_none());
-        assert!(tree.recursive_sizes.is_empty());
         assert!(tree.scan_path.is_empty());
         assert_eq!(tree.mtime_range, (i64::MAX, 0));
     }

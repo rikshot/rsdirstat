@@ -3,9 +3,8 @@ use std::fs;
 use std::path::Path;
 use std::sync::mpsc;
 
-use rsdirstat_core::scan::ScanOutcome;
+use rsdirstat_core::scan::{ScanEvent, ScanOutcome};
 use rsdirstat_core::tree::DirTree;
-use rsdirstat_protocol::ScanEvent;
 
 #[cfg(target_os = "linux")]
 use rsdirstat_linux as scanner;
@@ -105,7 +104,7 @@ fn scanner_tree_sizes_are_consistent() {
     let (tree, _) = scan_to_tree(dir.path());
 
     let root_id = tree.root_id.unwrap();
-    let root_size = tree.recursive_sizes[&root_id];
+    let root_size = tree.nodes[&root_id].size;
 
     // Root size must be at least the sum of known file sizes
     let min_expected =
@@ -214,7 +213,7 @@ fn scanner_dedups_hardlinks() {
 
     let (tree, _) = scan_to_tree(root);
     let root_id = tree.root_id.unwrap();
-    let root_size = tree.recursive_sizes[&root_id];
+    let root_size = tree.nodes[&root_id].size;
     assert_eq!(
         root_size, 10_240,
         "hardlinked file should be counted once, got root size {root_size}"

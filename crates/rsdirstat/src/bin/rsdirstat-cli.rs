@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 use humansize::{BINARY, format_size};
+use rsdirstat_core::scan::ScanEvent;
 use rsdirstat_core::tree::DirTree;
-use rsdirstat_protocol::ScanEvent;
 
 #[cfg(target_os = "linux")]
 use rsdirstat_linux as scanner;
@@ -73,7 +73,7 @@ fn main() -> Result<()> {
                 .map(|(parent, name, size)| (tree.full_path(*parent, &root).unwrap_or_default().join(name), *size)),
         );
     } else {
-        let mut dirs: Vec<(u64, u64)> = tree.recursive_sizes.iter().map(|(&id, &size)| (id, size)).collect();
+        let mut dirs: Vec<(u64, u64)> = tree.nodes.iter().map(|(&id, node)| (id, node.size)).collect();
         top_n(&mut dirs, args.top, |&(_, size)| size);
         print_entries(
             dirs.iter()

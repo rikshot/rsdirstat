@@ -10,6 +10,5 @@ categories = ["filesystem", "os::linux-apis"]
 
 [dependencies]
 rsdirstat-core.workspace = true
-rsdirstat-protocol.workspace = true
 anyhow.workspace = true
 libc.workspace = true

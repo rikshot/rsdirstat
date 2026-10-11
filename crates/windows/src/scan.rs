@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanOutcome, node_id, root_name, run_scan};
-use rsdirstat_protocol::ScanEvent;
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOutcome, node_id, root_name, run_scan};
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,

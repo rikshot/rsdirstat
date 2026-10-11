@@ -1,8 +1,5 @@
-use std::collections::HashMap;
-
 use crate::color::{COLOR_MODE_AGE, age_hue, hash_id_to_hue};
-pub use crate::tree::{BreadcrumbEntry, DirTree, FilterConfig};
-use crate::tree::{DirNode, FileEntry};
+use crate::tree::{DirNode, DirTree, FileEntry, FilterConfig, NodeMap};
 pub use rsdirstat_protocol::{LayoutRect, RectKind};
 
 const MIN_NEST_PX: f64 = 40.0;
@@ -24,20 +21,14 @@ pub fn compute_layout(
     let Some(root) = tree.nodes.get(&view_root) else {
         return Vec::new();
     };
-    let filtering = config.filter.is_active();
-    let filtered;
-    let sizes = if filtering {
-        filtered = tree.compute_filtered_sizes(&config.filter, view_root);
-        &filtered
-    } else {
-        &tree.recursive_sizes
-    };
-
+    let filtered_sizes = config
+        .filter
+        .is_active()
+        .then(|| tree.compute_filtered_sizes(&config.filter, view_root));
     let mut ctx = LayoutCtx {
         tree,
-        sizes,
+        filtered_sizes: filtered_sizes.as_ref(),
         config,
-        filtering,
         out: Vec::new(),
     };
     let canvas = Rect {
@@ -46,7 +37,7 @@ pub fn compute_layout(
         w: canvas_w,
         h: canvas_h,
     };
-    let total_size = sizes.get(&view_root).copied().unwrap_or(1);
+    let total_size = ctx.size(view_root, root);
     ctx.layout_node(view_root, root, total_size, canvas, 0.0, 0);
     ctx.out
 }
@@ -76,13 +67,21 @@ struct LayoutItem<'a> {
 /// Per-call layout state: the inputs every level needs plus the output.
 struct LayoutCtx<'a> {
     tree: &'a DirTree,
-    sizes: &'a HashMap<u64, u64>,
+    /// With a filter active, sizes counting only the files it matches; otherwise each directory's
+    /// own `size` is used.
+    filtered_sizes: Option<&'a NodeMap<u64>>,
     config: &'a LayoutConfig,
-    filtering: bool,
     out: Vec<LayoutRect>,
 }
 
 impl<'a> LayoutCtx<'a> {
+    fn size(&self, id: u64, node: &DirNode) -> u64 {
+        match self.filtered_sizes {
+            Some(sizes) => sizes.get(&id).copied().unwrap_or(0),
+            None => node.size,
+        }
+    }
+
     fn hue(&self, hue: u16, mtime: i64) -> u16 {
         if self.config.color_mode == COLOR_MODE_AGE {
             let (min_time, max_time) = self.config.mtime_range;
@@ -106,9 +105,9 @@ impl<'a> LayoutCtx<'a> {
 
         let mut items: Vec<LayoutItem<'a>> = Vec::new();
         for &id in &node.children {
-            let size = self.sizes.get(&id).copied().unwrap_or(0);
-            if size > 0
-                && let Some(child) = self.tree.nodes.get(&id)
+            if let Some(child) = self.tree.nodes.get(&id)
+                && let size = self.size(id, child)
+                && size > 0
             {
                 items.push(LayoutItem {
                     id,
@@ -127,7 +126,9 @@ impl<'a> LayoutCtx<'a> {
         };
         let mut residual: u64 = 0;
         for file in &node.files {
-            if file.size == 0 || (self.filtering && !self.config.filter.matches_file(&file.name, file.size)) {
+            if file.size == 0
+                || (self.filtered_sizes.is_some() && !self.config.filter.matches_file(&file.name, file.size))
+            {
                 continue;
             }
             if (file.size as f64) >= min_file_size {
@@ -498,7 +499,7 @@ mod tests {
         tree.insert_dir(1, 0, "root", 0, 100);
         tree.insert_file(1, "big.txt", 5000, 200);
         tree.insert_file(1, "huge.rs", 10000, 300);
-        *tree.recursive_sizes.entry(1).or_insert(0) += 15000;
+        tree.nodes.get_mut(&1).unwrap().size += 15000;
 
         let config = default_config();
         let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
@@ -524,9 +525,9 @@ mod tests {
         tree.insert_file(2, "main.rs", 5000, 200);
         tree.insert_file(2, "lib.rs", 3000, 200);
         tree.insert_file(3, "readme.txt", 4000, 200);
-        tree.recursive_sizes.insert(2, 8000);
-        tree.recursive_sizes.insert(3, 4000);
-        tree.recursive_sizes.insert(1, 12000);
+        for (id, size) in [(2, 8000), (3, 4000), (1, 12000)] {
+            tree.nodes.get_mut(&id).unwrap().size = size;
+        }
 
         let config_no_filter = default_config();
         let rects_no_filter = compute_layout(&tree, 1, 800.0, 600.0, &config_no_filter);

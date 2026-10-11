@@ -10,7 +10,32 @@ use std::thread;
 use std::time::Duration;
 
 use dashmap::DashSet;
-use rsdirstat_protocol::ScanEvent;
+
+/// What a scan reports, in order: `ScanStart`, then the entries, then `ScanDone`. In-process only;
+/// nothing here goes over the wire.
+#[derive(Clone, Debug)]
+pub enum ScanEvent {
+    ScanStart {
+        path: String,
+    },
+    /// A directory, sent after all of its files. `size` is the total of those files.
+    Dir {
+        id: u64,
+        parent: u64,
+        name: String,
+        size: u64,
+        mtime: i64,
+    },
+    File {
+        parent: u64,
+        name: String,
+        size: u64,
+        mtime: i64,
+    },
+    /// The last event a consumer should apply. After a cancelled or stalled scan, a worker still
+    /// inside a directory may send a few more, which must be ignored.
+    ScanDone,
+}
 
 /// Combine a `(device, inode)` pair into a stable node id. Inodes are only unique within a single
 /// filesystem, so a cross-filesystem scan (`--all`) can see the same inode number on two devices;

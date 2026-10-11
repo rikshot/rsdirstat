@@ -107,30 +107,6 @@ impl VolumeInfo {
     }
 }
 
-/// Scanner → server internal events (not sent over WebSocket).
-#[derive(Debug)]
-pub enum ScanEvent {
-    ScanStart {
-        path: String,
-    },
-    Dir {
-        id: u64,
-        parent: u64,
-        name: String,
-        size: u64,
-        mtime: i64,
-    },
-    File {
-        parent: u64,
-        name: String,
-        size: u64,
-        mtime: i64,
-    },
-    /// The last event a consumer should apply. After a cancelled or stalled scan, a worker still
-    /// inside a directory may send a few more, which must be ignored.
-    ScanDone,
-}
-
 /// Server → client WebSocket messages.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {

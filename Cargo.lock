@@ -1579,7 +1579,6 @@ dependencies = [
  "anyhow",
  "libc",
  "rsdirstat-core",
- "rsdirstat-protocol",
 ]
 
 [[package]]
@@ -1589,7 +1588,6 @@ dependencies = [
  "anyhow",
  "libc",
  "rsdirstat-core",
- "rsdirstat-protocol",
 ]
 
 [[package]]
@@ -1618,7 +1616,6 @@ version = "0.1.3"
 dependencies = [
  "anyhow",
  "rsdirstat-core",
- "rsdirstat-protocol",
  "windows-sys 0.61.2",
 ]
 

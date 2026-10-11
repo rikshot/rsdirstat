@@ -7,9 +7,8 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use rsdirstat_core::scan::{
-    DirJob, DirSink, ScanOutcome, node_id, open_dir, open_dir_at, raise_fd_limit, root_name, run_scan,
+    DirJob, DirSink, ScanEvent, ScanOutcome, node_id, open_dir, open_dir_at, raise_fd_limit, root_name, run_scan,
 };
-use rsdirstat_protocol::ScanEvent;
 
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
