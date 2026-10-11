@@ -44,6 +44,18 @@ pub(super) fn is_hidden(element: &Element) -> bool {
     element.class_list().contains("hidden")
 }
 
+/// A callback for the browser that forwards each call to `handler` on the app. It captures nothing
+/// but `handler`, so one can be made once and handed over any number of times.
+pub(super) fn app_callback<E: FromWasmAbi + 'static>(
+    handler: fn(&mut TreemapApp, E) -> Result<(), JsValue>,
+) -> Closure<dyn FnMut(E)> {
+    Closure::new(move |event: E| {
+        with_app(|app| {
+            let _ = handler(&mut app.borrow_mut(), event);
+        });
+    })
+}
+
 /// Attach a page-lifetime listener that forwards each event to `handler` on the app. The closure
 /// is deliberately leaked: these listeners live as long as the page does.
 pub(super) fn listen<E: FromWasmAbi + 'static>(
@@ -51,11 +63,7 @@ pub(super) fn listen<E: FromWasmAbi + 'static>(
     event: &str,
     handler: fn(&mut TreemapApp, E) -> Result<(), JsValue>,
 ) -> Result<(), JsValue> {
-    let closure = Closure::<dyn FnMut(E)>::new(move |event: E| {
-        with_app(|app| {
-            let _ = handler(&mut app.borrow_mut(), event);
-        });
-    });
+    let closure = app_callback(handler);
     target.add_event_listener_with_callback(event, closure.as_ref().unchecked_ref())?;
     closure.forget();
     Ok(())

@@ -71,14 +71,10 @@ impl TreemapApp {
         if let Some(id) = self.session.filter_timer_id.take() {
             self.window.clear_timeout_with_handle(id);
         }
-        let callback = Closure::once_into_js(move || {
-            with_app(|app| {
-                let _ = app.borrow_mut().send_filter_now();
-            });
-        });
-        let id = self
-            .window
-            .set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref::<Function>(), 300)?;
+        let id = self.window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            self.callbacks.filter_send.as_ref().unchecked_ref(),
+            300,
+        )?;
         self.session.filter_timer_id = Some(id);
         Ok(())
     }

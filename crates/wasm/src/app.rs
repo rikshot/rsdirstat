@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use js_sys::{Array, ArrayBuffer, Date, Function, Reflect, Uint8Array};
+use js_sys::{Array, ArrayBuffer, Date, Reflect, Uint8Array};
 use rsdirstat_protocol::{self as wire, BreadcrumbEntry, ClientMessage, LayoutPayload, ServerMessage, VolumeInfo};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
@@ -21,7 +21,7 @@ use web_sys::{
     Window,
 };
 
-use self::dom::{by_id, canvas_context, query, with_app};
+use self::dom::{app_callback, by_id, canvas_context, query};
 use crate::logic::{InterpolationPlan, RenderRect, format_size};
 
 const BACKGROUND: &str = "#1a1a2e";
@@ -45,16 +45,6 @@ thread_local! {
 struct ZoomAnim {
     plan: InterpolationPlan,
     start_time: f64,
-}
-
-// Closures are held only to keep them alive for the WebSocket's lifetime (RAII); they are
-// invoked by JS, never read from Rust.
-#[allow(dead_code)]
-struct WebSocketCallbacks {
-    onopen: Closure<dyn FnMut(Event)>,
-    onmessage: Closure<dyn FnMut(MessageEvent)>,
-    onclose: Closure<dyn FnMut(Event)>,
-    onerror: Closure<dyn FnMut(Event)>,
 }
 
 struct ChromeElements {
@@ -119,7 +109,6 @@ struct SessionState {
     scan_timer_id: Option<i32>,
     filter_timer_id: Option<i32>,
     ws: Option<WebSocket>,
-    ws_callbacks: Option<WebSocketCallbacks>,
     /// Consecutive failed reconnect attempts; drives exponential backoff and an eventual give-up.
     reconnect_attempts: u32,
 }
@@ -134,32 +123,38 @@ struct TreemapApp {
     callbacks: Callbacks,
 }
 
-/// Callbacks the app hands to the browser over and over, made once. Each reaches the app through
-/// `with_app` and captures nothing, so one closure serves every call: no allocation per frame, and
-/// no closure leaked per scan.
+/// Every callback the app hands to the browser, made once (see `app_callback`): one closure serves
+/// every call, so none is allocated per frame or per connection, and none is leaked by a timer
+/// cleared before it fires. Timer callbacks take the (undefined) argument the browser passes none
+/// of.
 struct Callbacks {
     /// One animation frame, for `requestAnimationFrame`.
     tick: Closure<dyn FnMut(f64)>,
     /// The "Scanning... Ns" status, for `setInterval` while a scan runs.
-    scan_timer: Closure<dyn FnMut()>,
+    scan_timer: Closure<dyn FnMut(JsValue)>,
+    /// The debounced filter send, for `setTimeout`.
+    filter_send: Closure<dyn FnMut(JsValue)>,
+    /// A reconnection attempt, for `setTimeout`.
+    reconnect: Closure<dyn FnMut(JsValue)>,
+    ws_open: Closure<dyn FnMut(Event)>,
+    ws_message: Closure<dyn FnMut(MessageEvent)>,
+    ws_close: Closure<dyn FnMut(Event)>,
+    ws_error: Closure<dyn FnMut(Event)>,
 }
 
 impl Callbacks {
     fn new() -> Self {
         Self {
-            tick: Closure::new(|_: f64| {
-                with_app(|app| {
-                    let _ = app.borrow_mut().tick();
-                });
-            }),
-            scan_timer: Closure::new(|| {
-                with_app(|app| {
-                    let app = app.borrow();
-                    let seconds = (app.now() - app.session.scan_start_time) / 1000.0;
-                    app.chrome
-                        .status_element
-                        .set_text_content(Some(&format!("Scanning... {seconds:.1}s")));
-                });
+            tick: app_callback(|app, _: f64| app.tick()),
+            scan_timer: app_callback(|app, _: JsValue| app.show_scan_time()),
+            filter_send: app_callback(|app, _: JsValue| app.send_filter_now()),
+            reconnect: app_callback(|app, _: JsValue| app.connect()),
+            ws_open: app_callback(|app, _: Event| app.handle_ws_open()),
+            ws_message: app_callback(TreemapApp::handle_ws_message),
+            ws_close: app_callback(|app, _: Event| app.handle_ws_close()),
+            ws_error: app_callback(|app, _: Event| {
+                app.chrome.status_element.set_text_content(Some("Connection error."));
+                Ok(())
             }),
         }
     }
@@ -265,7 +260,6 @@ impl TreemapApp {
                 scan_timer_id: None,
                 filter_timer_id: None,
                 ws: None,
-                ws_callbacks: None,
                 reconnect_attempts: 0,
             },
             callbacks: Callbacks::new(),

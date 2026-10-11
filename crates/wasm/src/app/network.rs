@@ -1,4 +1,4 @@
-use super::dom::{is_hidden, listen, set_hidden, with_app};
+use super::dom::{is_hidden, listen, set_hidden};
 use super::*;
 
 impl TreemapApp {
@@ -34,6 +34,14 @@ impl TreemapApp {
         Ok(())
     }
 
+    pub(super) fn show_scan_time(&mut self) -> Result<(), JsValue> {
+        let seconds = (self.now() - self.session.scan_start_time) / 1000.0;
+        self.chrome
+            .status_element
+            .set_text_content(Some(&format!("Scanning... {seconds:.1}s")));
+        Ok(())
+    }
+
     pub(super) fn stop_scan_timer(&mut self) {
         if let Some(id) = self.session.scan_timer_id.take() {
             self.window.clear_interval_with_handle(id);
@@ -52,44 +60,12 @@ impl TreemapApp {
         let ws = WebSocket::new(&url)?;
         ws.set_binary_type(BinaryType::Arraybuffer);
 
-        let onopen = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().handle_ws_open();
-            });
-        }) as Box<dyn FnMut(_)>);
-        ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
-
-        let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
-            with_app(|app| {
-                let _ = app.borrow_mut().handle_ws_message(event);
-            });
-        }) as Box<dyn FnMut(_)>);
-        ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-
-        let onclose = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                let _ = app.borrow_mut().handle_ws_close();
-            });
-        }) as Box<dyn FnMut(_)>);
-        ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
-
-        let onerror = Closure::wrap(Box::new(move |_event: Event| {
-            with_app(|app| {
-                app.borrow()
-                    .chrome
-                    .status_element
-                    .set_text_content(Some("Connection error."));
-            });
-        }) as Box<dyn FnMut(_)>);
-        ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-
+        let callbacks = &self.callbacks;
+        ws.set_onopen(Some(callbacks.ws_open.as_ref().unchecked_ref()));
+        ws.set_onmessage(Some(callbacks.ws_message.as_ref().unchecked_ref()));
+        ws.set_onclose(Some(callbacks.ws_close.as_ref().unchecked_ref()));
+        ws.set_onerror(Some(callbacks.ws_error.as_ref().unchecked_ref()));
         self.session.ws = Some(ws);
-        self.session.ws_callbacks = Some(WebSocketCallbacks {
-            onopen,
-            onmessage,
-            onclose,
-            onerror,
-        });
         Ok(())
     }
 
@@ -110,9 +86,9 @@ impl TreemapApp {
                 .status_element
                 .set_text_content(Some("Connected. Waiting for scan..."));
         }
-        // The server keeps its view settings across reloads, but a reloaded page's toolbar starts
-        // from its defaults (or values the browser restored). Send them, before the viewport that
-        // triggers the first layout, so the treemap always matches what the toolbar shows.
+        // Each connection starts from the server's default view, but the toolbar may hold other
+        // values: ones the browser restored on a reload, or ones set before a reconnect. Send them,
+        // before the viewport that triggers the first layout, so the treemap matches the toolbar.
         self.handle_depth_change()?;
         self.handle_color_mode_change()?;
         self.send_filter_now()?;
@@ -180,7 +156,6 @@ impl TreemapApp {
         // "Scanning... Ns" right after we set the disconnected message, and the two fight forever.
         self.stop_scan_timer();
         self.session.ws = None;
-        self.session.ws_callbacks = None;
 
         // Give up after a bounded number of attempts so a permanently-gone server (it self-exits a
         // few seconds after the last client leaves) doesn't leave the tab reconnecting forever.
@@ -199,13 +174,8 @@ impl TreemapApp {
         self.chrome
             .status_element
             .set_text_content(Some(&format!("Disconnected. Reconnecting in {}s...", delay_ms / 1000)));
-        let callback = Closure::once_into_js(move || {
-            with_app(|app| {
-                let _ = app.borrow_mut().connect();
-            });
-        });
         self.window.set_timeout_with_callback_and_timeout_and_arguments_0(
-            callback.unchecked_ref::<Function>(),
+            self.callbacks.reconnect.as_ref().unchecked_ref(),
             delay_ms as i32,
         )?;
         Ok(())
