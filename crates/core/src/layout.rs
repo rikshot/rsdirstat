@@ -87,6 +87,18 @@ struct Rect {
     h: f64,
 }
 
+impl Rect {
+    /// The same rect with its axes swapped.
+    fn transposed(self) -> Rect {
+        Rect {
+            x: self.y,
+            y: self.x,
+            w: self.h,
+            h: self.w,
+        }
+    }
+}
+
 enum ItemKind<'a> {
     Dir(&'a DirNode),
     File(&'a FileEntry),
@@ -192,7 +204,7 @@ impl<'a> LayoutCtx<'a> {
         items.sort_unstable_by_key(|item| std::cmp::Reverse(item.size));
 
         let mut rects = Vec::with_capacity(items.len());
-        squarify(&items, |item| item.size as f64, content, &mut rects);
+        squarify(&items, content, &mut rects);
 
         // The zip relies on squarify emitting exactly one rect per item, in input order.
         debug_assert_eq!(rects.len(), items.len(), "squarify must emit one rect per item");
@@ -257,25 +269,23 @@ impl<'a> LayoutCtx<'a> {
 
 /// Squarified treemap: split `bounds` among `items` (sorted by descending size) and push exactly
 /// one rect per item, in input order, until the space or the remaining size runs out.
-fn squarify<T>(items: &[T], size: impl Fn(&T) -> f64, bounds: Rect, out: &mut Vec<Rect>) {
-    let Rect {
-        mut x,
-        mut y,
-        mut w,
-        mut h,
-    } = bounds;
-    let mut area_left: f64 = items.iter().map(&size).sum();
+fn squarify(items: &[LayoutItem], mut bounds: Rect, out: &mut Vec<Rect>) {
+    let size = |item: &LayoutItem| item.size as f64;
+    let mut area_left: f64 = items.iter().map(size).sum();
     let mut lo = 0;
     let hi = items.len();
-    while lo < hi && w > 0.0 && h > 0.0 && area_left > 0.0 {
+    while lo < hi && bounds.w > 0.0 && bounds.h > 0.0 && area_left > 0.0 {
         if hi - lo == 1 {
-            out.push(Rect { x, y, w, h });
+            out.push(bounds);
             return;
         }
 
-        let vertical = w >= h;
-        let short_side = if vertical { h } else { w };
-        let scale = (w * h) / area_left;
+        // Each row runs along the short side: a column on the left of a wide space, or, the same
+        // with the axes swapped, a row along the top of a tall one.
+        let vertical = bounds.w >= bounds.h;
+        let mut space = if vertical { bounds } else { bounds.transposed() };
+        let short_side = space.h;
+        let scale = (bounds.w * bounds.h) / area_left;
 
         let mut row_area = 0.0_f64;
         let mut best_worst = f64::INFINITY;
@@ -315,47 +325,27 @@ fn squarify<T>(items: &[T], size: impl Fn(&T) -> f64, bounds: Rect, out: &mut Ve
         let row_frac = row_area / area_left;
 
         let row = &items[lo..split];
-        if vertical {
-            let row_w = w * row_frac;
-            let mut cy = y;
-            for (i, item) in row.iter().enumerate() {
-                // Last item fills the remainder; clamp so float drift can't yield a negative extent.
-                let ih = if i == row.len() - 1 {
-                    (y + h - cy).max(0.0)
-                } else {
-                    (size(item) / row_area) * h
-                };
-                out.push(Rect {
-                    x,
-                    y: cy,
-                    w: row_w,
-                    h: ih,
-                });
-                cy += ih;
-            }
-            x += row_w;
-            w -= row_w;
-        } else {
-            let row_h = h * row_frac;
-            let mut cx = x;
-            for (i, item) in row.iter().enumerate() {
-                // Last item fills the remainder; clamp so float drift can't yield a negative extent.
-                let iw = if i == row.len() - 1 {
-                    (x + w - cx).max(0.0)
-                } else {
-                    (size(item) / row_area) * w
-                };
-                out.push(Rect {
-                    x: cx,
-                    y,
-                    w: iw,
-                    h: row_h,
-                });
-                cx += iw;
-            }
-            y += row_h;
-            h -= row_h;
+        let row_w = space.w * row_frac;
+        let mut cy = space.y;
+        for (i, item) in row.iter().enumerate() {
+            // Last item fills the remainder; clamp so float drift can't yield a negative extent.
+            let ih = if i == row.len() - 1 {
+                (space.y + space.h - cy).max(0.0)
+            } else {
+                (size(item) / row_area) * space.h
+            };
+            let rect = Rect {
+                x: space.x,
+                y: cy,
+                w: row_w,
+                h: ih,
+            };
+            out.push(if vertical { rect } else { rect.transposed() });
+            cy += ih;
         }
+        space.x += row_w;
+        space.w -= row_w;
+        bounds = if vertical { space } else { space.transposed() };
         area_left -= row_area;
         lo = split;
     }

@@ -193,8 +193,7 @@ impl ClientMessage {
     }
 
     /// Canonicalize incoming values regardless of what a client sent: clamp the depth to its valid
-    /// range, lower-case the name filter for case-insensitive matching, and
-    /// take extensions without the dot (or `*.`) people often type before them.
+    /// range, and take extensions without the dot (or `*.`) people often type before them.
     fn normalize(&mut self) {
         match self {
             ClientMessage::Viewport { width, height } => {
@@ -209,7 +208,6 @@ impl ClientMessage {
                 }
             }
             ClientMessage::SetDepth { depth } => *depth = (*depth).clamp(1, MAX_DEPTH),
-            ClientMessage::FilterName { pattern } => *pattern = pattern.to_ascii_lowercase(),
             ClientMessage::FilterExt { extensions } => {
                 for extension in extensions.iter_mut() {
                     if extension.starts_with(['*', '.']) {
@@ -406,18 +404,6 @@ mod tests {
         let mut unknown = postcard::to_allocvec(&ClientMessage::ColorMode { mode: ColorMode::Age }).unwrap();
         *unknown.last_mut().unwrap() = 7;
         assert_eq!(ClientMessage::decode(&pack(unknown)), None);
-    }
-
-    #[test]
-    fn filter_name_is_lowercased() {
-        assert_eq!(
-            client_roundtrip(ClientMessage::FilterName {
-                pattern: "FooBar.TXT".into(),
-            }),
-            ClientMessage::FilterName {
-                pattern: "foobar.txt".into(),
-            }
-        );
     }
 
     #[test]

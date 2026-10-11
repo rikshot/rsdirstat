@@ -502,6 +502,11 @@ mod tests {
         assert!(f.matches_file("read.txt", 10));
         assert!(f.matches_file("unreadable.rs", 10));
         assert!(!f.matches_file("write.rs", 10));
+        let upper = FilterConfig {
+            name_pattern: "READ".into(),
+            ..Default::default()
+        };
+        assert!(upper.matches_file("readme.md", 10), "either side's case");
     }
 
     #[test]
