@@ -2,12 +2,15 @@ mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
 use common::{
     TestServer, assert_no_layout_after, create_test_dir, launch_browser, layout_seq, wait_for_layout_after,
     wait_for_scan_done,
 };
+use futures_util::future::LocalBoxFuture;
+use futures_util::{FutureExt, StreamExt};
 use playwright_rs::expect;
 use playwright_rs::protocol::{HoverOptions, Position, WaitForFunctionOptions, WaitForOptions};
 
@@ -377,26 +380,104 @@ async fn js_unit_tests(page: &playwright_rs::Page) {
     assert!(result.starts_with("PASS"), "JS unit tests failed: {result}");
 }
 
-/// Every case runs once per browser, as `e2e_<browser>::<name>` (CI selects them by the `e2e`
-/// prefix). A case runs against `create_test_dir()` unless it names another fixture with `in`.
-macro_rules! browser_tests {
-    (@fixture) => { create_test_dir() };
-    (@fixture $fixture:ident) => { $fixture() };
-    (@browser $module:ident, $browser:literal, $($name:ident => $case:ident $(in $fixture:ident)?),*) => {
-        mod $module {
-            use super::*;
-            $(
-                #[tokio::test]
-                async fn $name() {
-                    run_in($browser, stringify!($name), browser_tests!(@fixture $($fixture)?), super::$case).await;
-                }
-            )*
-        }
+/// A case of the cross-browser suite: `run` on the page of a finished scan of `fixture()`.
+struct Case {
+    name: &'static str,
+    fixture: fn() -> tempfile::TempDir,
+    run: for<'a> fn(&'a playwright_rs::Page) -> LocalBoxFuture<'a, ()>,
+}
+
+/// How many cases run at once in one browser.
+const CONCURRENT_CASES: usize = 4;
+
+/// Run every case in `browser_name`, or only those named in `RSDIRSTAT_E2E_CASES` (comma-separated).
+/// The browser is launched once: a launch per case was most of the suite's time, Firefox's above
+/// all. Each case gets its own server and a page in its own context, so cases share nothing but
+/// the browser process, and a failure is reported by case name, with its own trace.
+async fn run_cases(browser_name: &str) {
+    let cases: Vec<&Case> = match std::env::var("RSDIRSTAT_E2E_CASES") {
+        Err(_) => CASES.iter().collect(),
+        Ok(names) => names
+            .split(',')
+            .map(|name| {
+                CASES
+                    .iter()
+                    .find(|case| case.name == name)
+                    .unwrap_or_else(|| panic!("no case named {name:?}"))
+            })
+            .collect(),
     };
+    let (_pw, browser) = common::launch(browser_name).await;
+    let failed: Vec<&str> = futures_util::stream::iter(cases)
+        .map(|case| async { (case.name, run_case(&browser, browser_name, case).await) })
+        .buffer_unordered(CONCURRENT_CASES)
+        .filter_map(|(name, passed)| async move { (!passed).then_some(name) })
+        .collect()
+        .await;
+    let _ = browser.close().await;
+    assert!(failed.is_empty(), "failed in {browser_name}: {}", failed.join(", "));
+}
+
+/// Run one case; whether it passed. Its panic message is printed as usual.
+async fn run_case(browser: &playwright_rs::Browser, browser_name: &str, case: &Case) -> bool {
+    let fixture = case.fixture;
+    // Creating the files and starting the server block, so off this thread, which runs every case.
+    let (dir, server) = tokio::task::spawn_blocking(move || {
+        let dir = fixture();
+        let server = TestServer::start(dir.path());
+        (dir, server)
+    })
+    .await
+    .unwrap();
+    let page = common::new_page(browser, 1280, 720).await;
+    let label = common::trace_label(browser_name, case.name);
+    let passed = AssertUnwindSafe(common::with_trace_unit(&page, &label, async {
+        page.goto(&server.url, None).await.unwrap();
+        wait_for_scan_done(&page).await;
+        (case.run)(&page).await;
+    }))
+    .catch_unwind()
+    .await
+    .is_ok();
+    if !passed {
+        eprintln!("case {} failed in {browser_name}", case.name);
+    }
+    if let Ok(context) = page.context() {
+        let _ = context.close().await;
+    }
+    drop((server, dir));
+    passed
+}
+
+/// The cross-browser suite: one test per browser, `e2e_<browser>` (CI selects them by the `e2e`
+/// prefix), running every case listed here (see `run_cases`). A case runs against
+/// `create_test_dir()` unless it names another fixture with `in`.
+macro_rules! browser_tests {
+    (@fixture) => { create_test_dir };
+    (@fixture $fixture:ident) => { $fixture };
     ($($name:ident => $case:ident $(in $fixture:ident)?),* $(,)?) => {
-        browser_tests!(@browser e2e_chromium, "chromium", $($name => $case $(in $fixture)?),*);
-        browser_tests!(@browser e2e_firefox, "firefox", $($name => $case $(in $fixture)?),*);
-        browser_tests!(@browser e2e_webkit, "webkit", $($name => $case $(in $fixture)?),*);
+        const CASES: &[Case] = &[$(
+            Case {
+                name: stringify!($name),
+                fixture: browser_tests!(@fixture $($fixture)?),
+                run: |page| Box::pin($case(page)),
+            },
+        )*];
+
+        #[tokio::test]
+        async fn e2e_chromium() {
+            run_cases("chromium").await;
+        }
+
+        #[tokio::test]
+        async fn e2e_firefox() {
+            run_cases("firefox").await;
+        }
+
+        #[tokio::test]
+        async fn e2e_webkit() {
+            run_cases("webkit").await;
+        }
     };
 }
 

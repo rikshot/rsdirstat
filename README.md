@@ -159,6 +159,10 @@ playwright-rs install chromium firefox webkit   # add --with-deps on Linux
 cargo nextest run   # the browser tests build the frontend first if it's missing or stale
 ```
 
+The cross-browser cases run as one test per browser (`e2e_chromium`, `e2e_firefox`, `e2e_webkit`),
+each launching its browser once. To run only some cases, name them:
+`RSDIRSTAT_E2E_CASES=navigate,reload cargo nextest run -E 'test(e2e_firefox)'`.
+
 The visual tests compare screenshots against baselines in `crates/rsdirstat/tests/snapshots/`. CI
 uses the committed set for its OS (`linux/`, `macos/`, `windows/`), recorded on CI's own runners,
 and fails if one is missing. Your machine renders text differently from those runners, so local

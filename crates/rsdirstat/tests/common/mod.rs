@@ -208,6 +208,13 @@ pub async fn launch_browser_sized(
     width: u32,
     height: u32,
 ) -> (playwright_rs::Playwright, playwright_rs::Browser, playwright_rs::Page) {
+    let (pw, browser) = launch(browser_name).await;
+    let page = new_page(&browser, width, height).await;
+    (pw, browser, page)
+}
+
+/// Launch `browser_name` ("chromium", "firefox" or "webkit"), with no page open.
+pub async fn launch(browser_name: &str) -> (playwright_rs::Playwright, playwright_rs::Browser) {
     let pw = playwright_rs::Playwright::launch().await.unwrap();
     let browser = match browser_name {
         "chromium" => pw.chromium().launch().await.unwrap(),
@@ -215,11 +222,11 @@ pub async fn launch_browser_sized(
         "webkit" => pw.webkit().launch().await.unwrap(),
         _ => panic!("unknown browser: {browser_name}"),
     };
-    let page = new_page(&browser, width, height).await;
-    (pw, browser, page)
+    (pw, browser)
 }
 
-/// A new page (a tab) in `browser`, with a `width` × `height` viewport.
+/// A new page in `browser`, with a `width` × `height` viewport, in a context of its own (a fresh
+/// profile: no cookies or storage shared with any other page).
 pub async fn new_page(browser: &playwright_rs::Browser, width: u32, height: u32) -> playwright_rs::Page {
     let page = browser.new_page().await.unwrap();
     page.set_viewport_size(playwright_rs::Viewport { width, height })
