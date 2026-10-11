@@ -103,6 +103,9 @@ pub struct DirTree {
     pub root_id: Option<u64>,
     pub scan_path: String,
     pub mtime_range: (i64, i64),
+    /// How many scans have started on this tree (each `ScanStart` applied replaces its contents),
+    /// so a change means it holds a different scan.
+    pub scans: u64,
     hue_cache: HashMap<Box<str>, u16>,
 }
 
@@ -119,6 +122,7 @@ impl DirTree {
             root_id: None,
             scan_path: String::new(),
             mtime_range: (i64::MAX, 0),
+            scans: 0,
             hue_cache: HashMap::new(),
         }
     }
@@ -137,6 +141,7 @@ impl DirTree {
             ScanEvent::ScanStart { path } => {
                 self.clear();
                 self.scan_path = path;
+                self.scans += 1;
             }
             ScanEvent::Dir {
                 id,
@@ -511,6 +516,16 @@ mod tests {
         assert_eq!(tree.nodes[&2].direct_size, 7);
         assert_eq!(tree.nodes[&1].size, 22, "a subdirectory's size reaches its parent");
         assert_eq!(tree.mtime_range, (1, 5));
+    }
+
+    #[test]
+    fn each_scan_start_counts_a_scan() {
+        let mut tree = DirTree::new();
+        assert_eq!(tree.scans, 0);
+        for scans in 1..=2 {
+            tree.apply(ScanEvent::ScanStart { path: "root".into() });
+            assert_eq!(tree.scans, scans);
+        }
     }
 
     #[test]

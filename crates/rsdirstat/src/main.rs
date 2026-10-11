@@ -17,7 +17,7 @@ use clap::Parser;
 use parking_lot::{Mutex, RwLock};
 use rust_embed::RustEmbed;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 use tower_http::compression::CompressionLayer;
 
 use rsdirstat_core::layout::{self, LayoutConfig};
@@ -57,8 +57,9 @@ struct Args {
 
 /// One tab's view of the tree. Every tab has its own, so zooming or filtering in one leaves the
 /// others as they were.
-#[derive(Clone, PartialEq)]
 struct ViewConfig {
+    /// Which scan's tree the tab shows (`DirTree::scans`).
+    scan: u64,
     viewport: (f64, f64),
     view_root: Option<u64>,
     max_depth: u8,
@@ -69,6 +70,7 @@ struct ViewConfig {
 impl Default for ViewConfig {
     fn default() -> Self {
         Self {
+            scan: 0,
             viewport: (0.0, 0.0),
             view_root: None,
             max_depth: wire::DEFAULT_DEPTH,
@@ -104,26 +106,18 @@ enum ScanPhase {
 struct ScanState {
     tree: RwLock<DirTree>,
     phase: Mutex<ScanPhase>,
-    /// The canonical path being (or last) scanned.
+    /// The path being (or last) scanned.
     root: Mutex<PathBuf>,
     cross_filesystems: bool,
 }
 
-/// A message every tab must see, in order: `ScanStart` or `PickerMode`. Encoded once, as `Bytes`,
-/// so every tab shares the buffer.
-#[derive(Clone)]
-struct TabEvent {
-    message: Bytes,
-    /// A new scan started, so each tab's view goes back to the scan root.
-    new_scan: bool,
-}
-
 struct AppState {
     scan: ScanState,
-    events: broadcast::Sender<TabEvent>,
-    /// Bumped whenever the tree changes. Every tab watches it and lays out its own view again; a
+    /// Signalled to send every tab to the volume picker.
+    picker: watch::Sender<()>,
+    /// Signalled whenever the tree changes. Every tab watches it and lays out its own view again; a
     /// tab that falls behind skips straight to the newest tree instead of a queue of stale layouts.
-    tree_version: watch::Sender<u64>,
+    tree_changes: watch::Sender<()>,
     /// Open WebSocket connections (see `Connection`); the server exits after a grace period once the
     /// last one closes.
     connections: AtomicU64,
@@ -134,26 +128,7 @@ struct AppState {
 
 impl AppState {
     fn tree_changed(&self) {
-        self.tree_version.send_modify(|version| *version += 1);
-    }
-
-    fn send_event(&self, message: wire::ServerMessage) {
-        let new_scan = matches!(message, wire::ServerMessage::ScanStart { .. });
-        let _ = self.events.send(TabEvent {
-            message: message.encode().into(),
-            new_scan,
-        });
-    }
-
-    /// Send every tab to the volume picker and wait for a path, unless a scan is running.
-    fn await_path(&self) {
-        let mut phase = self.scan.phase.lock();
-        if matches!(*phase, ScanPhase::Running { .. }) {
-            return;
-        }
-        *phase = ScanPhase::AwaitingPath;
-        drop(phase);
-        self.send_event(wire::ServerMessage::PickerMode);
+        self.tree_changes.send_replace(());
     }
 }
 
@@ -198,9 +173,8 @@ async fn run_server(args: Args) -> Result<()> {
             root: Mutex::new(scan_root),
             cross_filesystems,
         },
-        // Events are rare (one per scan or picker switch), so a small buffer never lags.
-        events: broadcast::channel(16).0,
-        tree_version: watch::channel(0).0,
+        picker: watch::channel(()).0,
+        tree_changes: watch::channel(()).0,
         connections: AtomicU64::new(0),
         connects: AtomicU64::new(0),
         shutdown: watch::channel(false).0,
@@ -218,6 +192,8 @@ async fn run_server(args: Args) -> Result<()> {
         .route("/ws", get(ws_handler))
         .route("/start", get(start_handler))
         .route("/volumes", get(volumes_handler))
+        // The API only, not the frontend bundle the fallback serves.
+        .route_layer(axum::middleware::from_fn(require_own_page))
         .with_state(Arc::clone(&state))
         .fallback(static_handler)
         .layer(CompressionLayer::new())
@@ -250,22 +226,35 @@ async fn run_server(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// A tab's layout of the tree for `view`, encoded. `None` while there is nothing to show: waiting
-/// for a path or for Start (the tree may still hold an earlier scan, and a layout would bring its
-/// treemap back over the picker), before the tab's first viewport, or before a scan's root arrives.
-fn layout_for(state: &AppState, view: &ViewConfig) -> Option<Bytes> {
+/// What brings a tab up to date with the tree, encoded: a `ScanStart` if a new scan replaced the
+/// tree it last showed (which also takes its view back to the root), then a layout of its view.
+/// No layout while there is nothing to show: waiting for a path or for Start (the tree may still
+/// hold an earlier scan, and a layout would bring its treemap back over the picker), before the
+/// tab's first viewport, or before a scan's root arrives.
+fn update_tab(state: &AppState, view: &mut ViewConfig) -> (Option<Bytes>, Option<Bytes>) {
     let scan_done = match *state.scan.phase.lock() {
         ScanPhase::Running { .. } => false,
         ScanPhase::Done => true,
-        ScanPhase::AwaitingPath | ScanPhase::AwaitingStart => return None,
+        ScanPhase::AwaitingPath | ScanPhase::AwaitingStart => return (None, None),
     };
-    let (vw, vh) = view.viewport;
-    if vw <= 0.0 || vh <= 0.0 {
-        return None;
-    }
 
     let tree = state.scan.tree.read();
-    let root_id = tree.root_id?;
+    // Checked under the lock the layout is computed under, so a page always hears of a new scan
+    // before it gets a layout of it (`ScanStart` clears the page).
+    let scan_start = (view.scan != tree.scans).then(|| {
+        view.scan = tree.scans;
+        view.view_root = None;
+        Bytes::from(
+            wire::ServerMessage::ScanStart {
+                path: tree.scan_path.clone(),
+            }
+            .encode(),
+        )
+    });
+    let (vw, vh) = view.viewport;
+    let Some(root_id) = tree.root_id.filter(|_| vw > 0.0 && vh > 0.0) else {
+        return (scan_start, None);
+    };
     let view_root = view
         .view_root
         .filter(|id| tree.nodes.contains_key(id))
@@ -289,7 +278,7 @@ fn layout_for(state: &AppState, view: &ViewConfig) -> Option<Bytes> {
         breadcrumb,
         rects,
     };
-    Some(wire::ServerMessage::Layout(payload).encode().into())
+    (scan_start, Some(wire::ServerMessage::Layout(payload).encode().into()))
 }
 
 async fn shutdown_signal(state: Arc<AppState>) {
@@ -368,46 +357,35 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
     // Reused across iterations so the per-batch drain doesn't reallocate each wakeup.
     let mut events = Vec::new();
     let mut started = false;
-    let mut done = false;
-    while !done && let Ok(event) = rx.recv() {
-        events.clear();
+    while let Ok(event) = rx.recv() {
         events.push(event);
         events.extend(rx.try_iter());
 
         let mut tree = state.scan.tree.write();
         for event in events.drain(..) {
-            match &event {
-                ScanEvent::ScanStart { path } => {
-                    started = true;
-                    state.send_event(wire::ServerMessage::ScanStart { path: path.clone() });
-                }
-                ScanEvent::ScanDone => done = true,
-                _ => {}
-            }
+            started |= matches!(event, ScanEvent::ScanStart { .. });
+            let done = matches!(event, ScanEvent::ScanDone);
             tree.apply(event);
-            // `ScanDone` is the last event to apply: a cancelled or stalled scan can leave a
-            // worker that is still inside a directory, and what it sends afterwards would change
-            // a result already shown as finished. End the phase under the tree lock, so no tab
-            // lays out the final tree still marked as running.
             if done {
+                // Under the tree lock, so no tab lays out the final tree still marked as running.
                 end_phase(ScanPhase::Done);
-                break;
+                drop(tree);
+                state.tree_changed();
+                return;
             }
         }
         drop(tree);
         state.tree_changed();
     }
 
-    if done {
-        return;
-    }
+    // The scanner stopped without `ScanDone`.
     if started {
         state.scan.tree.write().apply(ScanEvent::ScanDone);
         if end_phase(ScanPhase::Done) {
             state.tree_changed();
         }
     } else if end_phase(ScanPhase::AwaitingPath) {
-        state.send_event(wire::ServerMessage::PickerMode);
+        state.picker.send_replace(());
     }
 }
 
@@ -439,19 +417,9 @@ async fn static_handler(uri: Uri) -> Response {
     }
 }
 
-async fn start_handler(
-    headers: HeaderMap,
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-) -> Response {
-    if !api_request_allowed(&headers) {
-        return forbidden();
-    }
+async fn start_handler(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> &'static str {
     start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart));
-    "ok".into_response()
-}
-
-fn forbidden() -> Response {
-    (StatusCode::FORBIDDEN, "request refused: not from this app's own page").into_response()
+    "ok"
 }
 
 /// Refuse a request addressed to any host but this machine. The server binds to loopback, but DNS
@@ -471,16 +439,19 @@ async fn require_loopback_host(request: axum::extract::Request, next: axum::midd
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    headers: HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-) -> axum::response::Response {
-    // Reject cross-origin upgrades. Binding to loopback stops remote hosts, but the server has no
-    // auth and exposes the filesystem, so a malicious page in the user's own browser could
-    // otherwise connect to ws://127.0.0.1 and drive the protocol (cross-origin WS / DNS rebinding).
-    if !api_request_allowed(&headers) {
-        return forbidden();
-    }
+) -> Response {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
+}
+
+/// Refuse an API request from another site's page. Binding to loopback stops remote hosts, but the
+/// server has no auth and exposes the filesystem, so a malicious page in the user's own browser
+/// could otherwise drive it: connect to ws://127.0.0.1, or start a scan.
+async fn require_own_page(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if !api_request_allowed(request.headers()) {
+        return (StatusCode::FORBIDDEN, "request refused: not from this app's own page").into_response();
+    }
+    next.run(request).await
 }
 
 /// Whether a request to an API endpoint (`/ws`, `/start`, `/volumes`) comes from this app's own
@@ -564,23 +535,23 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     // Held to the end of the handler, including the early returns when a send fails.
     let _connection = Connection::open(&state);
 
-    let mut events = state.events.subscribe();
-    let mut tree_changes = state.tree_version.subscribe();
+    let mut picker = state.picker.subscribe();
+    let mut tree_changes = state.tree_changes.subscribe();
     let mut shutdown_rx = state.shutdown.subscribe();
+    let picker_mode = || Message::Binary(wire::ServerMessage::PickerMode.encode().into());
 
     // A new tab starts on the picker while the server waits for a path. Otherwise its first layout
     // follows the viewport it sends on connecting.
     let awaiting_path = matches!(*state.scan.phase.lock(), ScanPhase::AwaitingPath);
-    if awaiting_path
-        && socket
-            .send(Message::Binary(wire::ServerMessage::PickerMode.encode().into()))
-            .await
-            .is_err()
-    {
+    if awaiting_path && socket.send(picker_mode()).await.is_err() {
         return;
     }
 
-    let mut view = ViewConfig::default();
+    // A tab that joins during or after a scan is shown it without being told it started.
+    let mut view = ViewConfig {
+        scan: state.scan.tree.read().scans,
+        ..ViewConfig::default()
+    };
     // Whether the tree or the view changed since the last layout sent.
     let mut stale = false;
     let mut last_layout = tokio::time::Instant::now();
@@ -593,6 +564,14 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
             tokio::time::Instant::now()
         };
         tokio::select! {
+            // In order, so a trip to the picker reaches the page before any later scan's layouts.
+            biased;
+            _ = shutdown_rx.changed() => break,
+            changed = picker.changed() => {
+                if changed.is_err() || socket.send(picker_mode()).await.is_err() {
+                    break;
+                }
+            }
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Binary(data))) => {
@@ -602,19 +581,8 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
                     _ => break,
                 }
             }
-            event = events.recv() => {
-                match event {
-                    Ok(event) => {
-                        if !forward_event(&mut socket, &mut view, event).await {
-                            break;
-                        }
-                        stale = true;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            changed = tree_changes.changed() => {
+            // A stale tab's next layout covers every change until then, so it stops listening.
+            changed = tree_changes.changed(), if !stale => {
                 if changed.is_err() {
                     break;
                 }
@@ -623,43 +591,17 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
             () = tokio::time::sleep_until(layout_due), if stale => {
                 stale = false;
                 last_layout = tokio::time::Instant::now();
-                let Some(layout) = layout_for(&state, &view) else { continue };
-                // Events and layouts travel separately, but an event sent before this layout was
-                // computed must reach the page first: a new scan's `ScanStart` clears the page,
-                // so arriving after a layout of the new tree it would wipe it. Send those first,
-                // and if one started a new scan, lay out again instead of sending a layout that
-                // may predate it.
-                let mut new_scan = false;
-                loop {
-                    match events.try_recv() {
-                        Ok(event) => {
-                            new_scan |= event.new_scan;
-                            if !forward_event(&mut socket, &mut view, event).await {
-                                return;
-                            }
-                        }
-                        Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-                        Err(_) => break,
+                // Before laying out, so a change made meanwhile makes the tab stale again.
+                tree_changes.mark_unchanged();
+                let (scan_start, layout) = update_tab(&state, &mut view);
+                for message in [scan_start, layout].into_iter().flatten() {
+                    if socket.send(Message::Binary(message)).await.is_err() {
+                        return;
                     }
                 }
-                if new_scan {
-                    stale = true;
-                } else if socket.send(Message::Binary(layout)).await.is_err() {
-                    break;
-                }
             }
-            _ = shutdown_rx.changed() => break,
         }
     }
-}
-
-/// Send `event` to the page, and reset the tab's view to the scan root if it starts a new scan.
-/// Returns false once the socket is closed.
-async fn forward_event(socket: &mut WebSocket, view: &mut ViewConfig, event: TabEvent) -> bool {
-    if event.new_scan {
-        view.view_root = None;
-    }
-    socket.send(Message::Binary(event.message)).await.is_ok()
 }
 
 /// Reveal directory `dir_id`, or the file `name` inside it, in the platform file manager.
@@ -691,12 +633,12 @@ fn reveal_in_file_manager(path: &std::path::Path) {
     }
 }
 
-/// Apply `change` to `view`, returning whether it changed anything. A page sends its toolbar's
-/// values whenever one of them is edited, so most messages leave the view as it was.
-fn change_view(view: &mut ViewConfig, change: impl FnOnce(&mut ViewConfig)) -> bool {
-    let before = view.clone();
-    change(view);
-    *view != before
+/// Set `slot` to `value`, returning whether that changed it. A page sends its toolbar's values
+/// whenever one of them is edited, so most messages leave the view as it was.
+fn set<T: PartialEq>(slot: &mut T, value: T) -> bool {
+    let changed = *slot != value;
+    *slot = value;
+    changed
 }
 
 /// Act on one message from a tab. View changes apply to that tab's `view` only; returns whether it
@@ -706,58 +648,48 @@ fn handle_client_message(state: &Arc<AppState>, view: &mut ViewConfig, data: &[u
         return false;
     };
     match msg {
-        ClientMessage::Viewport { width, height } => {
-            return change_view(view, |v| v.viewport = (f64::from(width), f64::from(height)));
-        }
-        ClientMessage::Navigate { id } => return change_view(view, |v| v.view_root = Some(id)),
-        ClientMessage::SetDepth { depth } => return change_view(view, |v| v.max_depth = depth),
-        ClientMessage::ColorMode { mode } => return change_view(view, |v| v.color_mode = mode),
-        ClientMessage::FilterExt { extensions } => return change_view(view, |v| v.filter.extensions = extensions),
+        ClientMessage::Viewport { width, height } => set(&mut view.viewport, (f64::from(width), f64::from(height))),
+        ClientMessage::Navigate { id } => set(&mut view.view_root, Some(id)),
+        ClientMessage::SetDepth { depth } => set(&mut view.max_depth, depth),
+        ClientMessage::ColorMode { mode } => set(&mut view.color_mode, mode),
+        ClientMessage::FilterExt { extensions } => set(&mut view.filter.extensions, extensions),
         ClientMessage::FilterSize { min, max } => {
-            return change_view(view, |v| {
-                v.filter.min_size = min;
-                v.filter.max_size = max;
-            });
+            set(&mut view.filter.min_size, min) | set(&mut view.filter.max_size, max)
         }
-        ClientMessage::FilterName { pattern } => return change_view(view, |v| v.filter.name_pattern = pattern),
-        ClientMessage::ClearFilter => return change_view(view, |v| v.filter = FilterConfig::default()),
-        ClientMessage::RevealDir { id } => reveal(state, id, None),
+        ClientMessage::FilterName { pattern } => set(&mut view.filter.name_pattern, pattern),
+        ClientMessage::ClearFilter => set(&mut view.filter, FilterConfig::default()),
+        ClientMessage::RevealDir { id } => {
+            reveal(state, id, None);
+            false
+        }
         ClientMessage::RevealFile { dir_id, name } => {
             // `name` is attacker-controllable over the WS; only join a single, non-traversing
             // component so it can't escape the resolved directory with `..` or an absolute path.
             if is_safe_component(&name) {
                 reveal(state, dir_id, Some(&name));
             }
+            false
         }
-        ClientMessage::Rescan => start_scan(state, None, |phase| matches!(phase, ScanPhase::Done)),
+        ClientMessage::Rescan => {
+            start_scan(state, None, |phase| matches!(phase, ScanPhase::Done));
+            false
+        }
         ClientMessage::ScanPath { path } => {
-            // Only from the picker, or once the current scan is done (never mid-scan).
-            let allowed = |phase: &ScanPhase| matches!(phase, ScanPhase::AwaitingPath | ScanPhase::Done);
-            if !allowed(&state.scan.phase.lock()) {
-                return false;
-            }
-            // Canonicalize once, here, and don't start a scan that can't succeed: the page has
-            // already left the picker, so send it back there.
-            match std::fs::canonicalize(&path) {
-                Ok(root) => start_scan(state, Some(root), allowed),
-                Err(e) => {
-                    eprintln!("Can't scan {path}: {e}");
-                    state.await_path();
-                }
-            }
+            // Only from the picker, or once the current scan is done (never mid-scan). A path that
+            // can't be scanned sends the page back to the picker (see `relay_scan`).
+            start_scan(state, Some(path.into()), |phase| {
+                matches!(phase, ScanPhase::AwaitingPath | ScanPhase::Done)
+            });
+            false
         }
     }
-    false
 }
 
-async fn volumes_handler(headers: HeaderMap) -> Response {
-    if !api_request_allowed(&headers) {
-        return forbidden();
-    }
+async fn volumes_handler() -> Json<Vec<wire::VolumeInfo>> {
     let volumes = tokio::task::spawn_blocking(scanner::volumes::list_volumes)
         .await
         .unwrap_or_default();
-    Json(volumes).into_response()
+    Json(volumes)
 }
 
 #[cfg(test)]
