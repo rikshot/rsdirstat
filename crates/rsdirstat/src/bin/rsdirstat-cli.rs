@@ -3,13 +3,14 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
 use humansize::{BINARY, format_size};
-use rsdirstat_core::scan::{ScanEvent, ScannedFile};
+use rsdirstat_core::scan::{ScanEvent, ScanOptions, ScannedFile};
 use rsdirstat_core::tree::DirTree;
 
 #[cfg(target_os = "linux")]
@@ -37,14 +38,22 @@ struct Args {
     /// Cross filesystem boundaries
     #[arg(long)]
     all: bool,
+
+    /// Scan with this many threads, any number [default: one per CPU; on macOS 4]
+    #[arg(long)]
+    threads: Option<NonZeroUsize>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let (path, all) = (args.path.clone(), args.all);
-    let handle = std::thread::spawn(move || scanner::scan::scan(&path, all, tx, Arc::default()));
+    let path = args.path.clone();
+    let options = ScanOptions {
+        cross_filesystems: args.all,
+        threads: args.threads,
+    };
+    let handle = std::thread::spawn(move || scanner::scan::scan(&path, options, tx, Arc::default()));
 
     let mut tree = DirTree::new();
     // With `--files`, the largest files so far as (size, directory, name), the smallest on top to

@@ -2,6 +2,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::future::IntoFuture;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +23,7 @@ use tokio::sync::watch;
 use tower_http::compression::CompressionLayer;
 
 use rsdirstat_core::layout::{self, FilteredSizes, LayoutConfig};
-use rsdirstat_core::scan::ScanEvent;
+use rsdirstat_core::scan::{ScanEvent, ScanOptions};
 use rsdirstat_core::tree::{DirTree, FilterConfig};
 use rsdirstat_protocol::{self as wire, ClientMessage};
 
@@ -42,6 +43,10 @@ struct Args {
     /// Cross filesystem boundaries
     #[arg(long)]
     all: bool,
+
+    /// Scan with this many threads, any number [default: one per CPU; on macOS 4]
+    #[arg(long)]
+    threads: Option<NonZeroUsize>,
 
     /// Port for the GUI server (0 = random)
     #[arg(long, default_value_t = 0)]
@@ -118,7 +123,7 @@ struct ScanState {
     phase: Mutex<ScanPhase>,
     /// The path being (or last) scanned.
     root: Mutex<PathBuf>,
-    cross_filesystems: bool,
+    options: ScanOptions,
 }
 
 struct AppState {
@@ -135,13 +140,13 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(phase: ScanPhase, root: PathBuf, cross_filesystems: bool) -> Self {
+    fn new(phase: ScanPhase, root: PathBuf, options: ScanOptions) -> Self {
         Self {
             scan: ScanState {
                 tree: RwLock::new(DirTree::new()),
                 phase: Mutex::new(phase),
                 root: Mutex::new(root),
-                cross_filesystems,
+                options,
             },
             picker: watch::channel(()).0,
             tree_changes: watch::channel(()).0,
@@ -176,6 +181,7 @@ async fn run_server(args: Args) -> Result<()> {
     let Args {
         path,
         all: cross_filesystems,
+        threads,
         port,
         no_open,
         wait,
@@ -191,7 +197,11 @@ async fn run_server(args: Args) -> Result<()> {
         }
     };
 
-    let state = Arc::new(AppState::new(phase, scan_root, cross_filesystems));
+    let options = ScanOptions {
+        cross_filesystems,
+        threads,
+    };
+    let state = Arc::new(AppState::new(phase, scan_root, options));
 
     if !wait {
         start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart));
@@ -367,10 +377,10 @@ fn start_scan(state: &Arc<AppState>, root: Option<PathBuf>, allowed: impl FnOnce
     let relay_cancel = Arc::clone(&cancel);
     tokio::task::spawn_blocking(move || relay_scan(&relay_state, &rx, &relay_cancel));
 
-    let cross_filesystems = state.scan.cross_filesystems;
+    let options = state.scan.options;
     tokio::task::spawn_blocking(move || {
         // On failure the scanner drops `tx` without sending anything; the relay takes it from there.
-        if let Err(e) = scanner::scan::scan(&path, cross_filesystems, tx, cancel) {
+        if let Err(e) = scanner::scan::scan(&path, options, tx, cancel) {
             eprintln!("Scan error: {e:#}");
         }
     });
@@ -776,7 +786,7 @@ mod tests {
             cancel: Arc::clone(&cancel),
             started: Instant::now() - ran_for,
         };
-        let state = AppState::new(running, PathBuf::from("/root"), false);
+        let state = AppState::new(running, PathBuf::from("/root"), ScanOptions::default());
         let (tx, rx) = std::sync::mpsc::channel();
         let file = ScannedFile {
             name: "a".into(),

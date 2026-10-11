@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::ffi::CStr;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::Path;
@@ -7,9 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, UnixDir, cpu_count, node_id, open_dir, run_scan};
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOptions, UnixDir, cpu_count, node_id, open_dir, run_scan};
 
-/// The most worker threads a scan uses. More only queue up in the kernel, which serializes much of
+/// The most worker threads a scan uses by default. More only queue up in the kernel, which serializes much of
 /// `openat` and `getattrlistbulk` on a volume: on a 10-core Mac with warm caches, /System/Library
 /// scans in 1.7 s with 3–4 threads and in 5.6 s with 10, which also burn 47 s of kernel CPU.
 const MAX_THREADS: usize = 4;
@@ -53,7 +54,7 @@ static SCAN_ATTRS: libc::attrlist = libc::attrlist {
 /// mid-scan).
 pub fn scan(
     root: &Path,
-    cross_filesystems: bool,
+    options: ScanOptions,
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -63,9 +64,11 @@ pub fn scan(
     let id = node_id(meta.dev(), meta.ino());
     let root_dev = meta.dev() as i32;
     let root = UnixDir::Root(Arc::new(fd));
-    let threads = cpu_count().min(MAX_THREADS);
+    let threads = options
+        .threads
+        .map_or_else(|| cpu_count().min(MAX_THREADS), NonZeroUsize::get);
     run_scan(&path, root, id, tx, cancel, threads, move |dir, buffer, sink| {
-        read_dir(dir, buffer, sink, root_dev, cross_filesystems)
+        read_dir(dir, buffer, sink, root_dev, options.cross_filesystems)
     });
     Ok(())
 }

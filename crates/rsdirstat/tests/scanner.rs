@@ -15,7 +15,8 @@ use rsdirstat_windows as scanner;
 fn scan_to_tree(root: &Path) -> DirTree {
     let (tx, rx) = mpsc::channel();
     let root = root.to_path_buf();
-    let handle = std::thread::spawn(move || scanner::scan::scan(&root, false, tx, Default::default()).unwrap());
+    let handle =
+        std::thread::spawn(move || scanner::scan::scan(&root, Default::default(), tx, Default::default()).unwrap());
 
     let mut tree = DirTree::new();
     // `ScanDone` is the last event, and applying it recomputes the sizes.

@@ -1,4 +1,5 @@
 use std::ffi::{OsStr, c_void};
+use std::num::NonZeroUsize;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
@@ -6,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, cpu_count, node_id, run_scan};
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOptions, cpu_count, node_id, run_scan};
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE, MAX_PATH};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -96,7 +97,7 @@ fn get_volume_and_id(handle: &OwnedHandle) -> Option<(u32, u64)> {
 /// mid-scan).
 pub fn scan(
     root: &Path,
-    cross_filesystems: bool,
+    options: ScanOptions,
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -109,8 +110,9 @@ pub fn scan(
         handle,
         volume: volume_serial,
     };
-    run_scan(&path, root, id, tx, cancel, cpu_count(), move |dir, buffer, sink| {
-        read_dir(dir, buffer, sink, volume_serial, cross_filesystems)
+    let threads = options.threads.map_or_else(cpu_count, NonZeroUsize::get);
+    run_scan(&path, root, id, tx, cancel, threads, move |dir, buffer, sink| {
+        read_dir(dir, buffer, sink, volume_serial, options.cross_filesystems)
     });
     Ok(())
 }

@@ -3,6 +3,7 @@
 //! one directory ([`run_scan`]'s `read_dir`), reporting each entry to a [`DirSink`].
 
 use std::borrow::Cow;
+use std::num::NonZeroUsize;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -189,6 +190,15 @@ fn root_name(path: &Path) -> String {
 /// How many CPUs this machine has, the most worker threads a scan can keep busy.
 pub fn cpu_count() -> usize {
     thread::available_parallelism().map_or(4, |n| n.get())
+}
+
+/// What the user chose about a scan.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScanOptions {
+    /// Descend into other filesystems mounted inside the scanned tree.
+    pub cross_filesystems: bool,
+    /// How many worker threads to scan with, instead of the platform's default.
+    pub threads: Option<NonZeroUsize>,
 }
 
 /// Size of each worker's buffer for directory reads.

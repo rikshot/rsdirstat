@@ -1,11 +1,12 @@
 use std::ffi::CStr;
+use std::num::NonZeroUsize;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, UnixDir, cpu_count, node_id, open_dir, run_scan};
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOptions, UnixDir, cpu_count, node_id, open_dir, run_scan};
 
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
@@ -115,7 +116,7 @@ fn statx_fd(fd: i32, mask: u32) -> Option<Statx> {
 /// mid-scan).
 pub fn scan(
     root: &Path,
-    cross_filesystems: bool,
+    options: ScanOptions,
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -130,8 +131,8 @@ pub fn scan(
         dir_id(&sx),
         tx,
         cancel,
-        cpu_count(),
-        move |dir, buffer, sink| read_dir(dir, buffer, sink, root_filesystem, cross_filesystems),
+        options.threads.map_or_else(cpu_count, NonZeroUsize::get),
+        move |dir, buffer, sink| read_dir(dir, buffer, sink, root_filesystem, options.cross_filesystems),
     );
     Ok(())
 }

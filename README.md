@@ -71,6 +71,7 @@ embedded — a single self-contained binary, no extra files needed) and **`rsdir
 rsdirstat                 # no path: pick a volume in the browser, then scan
 rsdirstat [path]          # scan a path, opens the treemap in your browser
 rsdirstat --all [path]    # cross filesystem boundaries
+rsdirstat --threads 16 [path]  # scan with 16 threads (default: one per CPU; on macOS 4)
 rsdirstat --port 8080 [path]   # fixed port (default: random)
 rsdirstat --no-open [path]     # don't auto-open the browser
 ```
@@ -116,6 +117,7 @@ rsdirstat-cli [path]          # top 10 directories by size
 rsdirstat-cli --files [path]  # top 10 files by size
 rsdirstat-cli --top 20 [path] # show more results
 rsdirstat-cli --all [path]    # cross filesystem boundaries
+rsdirstat-cli --threads 16 [path] # scan with 16 threads (default: one per CPU; on macOS 4)
 ```
 
 ## Building

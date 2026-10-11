@@ -35,7 +35,8 @@ fn a_tree_wider_than_the_fd_limit_is_scanned_in_full() {
 
     let (tx, rx) = mpsc::channel();
     let root = dir.path().to_path_buf();
-    let handle = std::thread::spawn(move || scanner::scan::scan(&root, false, tx, Default::default()).unwrap());
+    let handle =
+        std::thread::spawn(move || scanner::scan::scan(&root, Default::default(), tx, Default::default()).unwrap());
     let mut tree = DirTree::new();
     for event in rx {
         tree.apply(event);
