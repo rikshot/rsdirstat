@@ -21,18 +21,18 @@ jobs:
     # the crate's Trusted Publishing settings) to require a human approval per release.
     environment: release
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           target: wasm32-unknown-unknown
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: trunk
       # `rsdirstat` embeds the frontend from `dist/` (rust-embed) and `include`s it in
       # the package tarball, so the release bundle must exist before packaging.
       - run: trunk build --release
       # Exchange the OIDC token for a 30-minute crates.io token.
-      - uses: rust-lang/crates-io-auth-action@v1
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
       # `--workspace` publishes every non-`publish=false` member in dependency order
       # (protocol → core → {linux,macos,windows} → rsdirstat), skipping the wasm crate.

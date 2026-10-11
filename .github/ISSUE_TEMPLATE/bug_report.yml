@@ -1,0 +1,71 @@
+name: Bug report
+description: rsdirstat does something wrong
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce
+      description: The command you ran (with its options, such as `--all`), what you scanned (a local disk, a network share, an external drive, ...), and what you did in the browser.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `rsdirstat --version`.
+      placeholder: rsdirstat 0.1.3
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: macOS 15.5, Ubuntu 24.04, Windows 11 24H2, ...
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installed with
+      options:
+        - Homebrew
+        - Installer script (shell or PowerShell)
+        - cargo binstall
+        - cargo install
+        - Release archive
+        - Built from source
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which part
+      options:
+        - GUI (rsdirstat, in the browser)
+        - CLI (rsdirstat-cli)
+  - type: input
+    id: browser
+    attributes:
+      label: Browser
+      description: For the GUI.
+      placeholder: Firefox 140, Chrome 138, Safari 18, ...
+  - type: textarea
+    id: output
+    attributes:
+      label: Terminal output
+      description: Anything rsdirstat printed, such as "Scan stalled" or "Can't open".
+      render: text
