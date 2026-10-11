@@ -2,7 +2,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestServer, create_test_dir, launch_browser, layout_seq, wait_for_layout_after, wait_for_scan_done};
+use common::{
+    TestServer, assert_no_layout_after, create_test_dir, launch_browser, layout_seq, wait_for_layout_after,
+    wait_for_scan_done,
+};
 use playwright_rs::expect;
 use playwright_rs::protocol::{HoverOptions, Position, WaitForFunctionOptions, WaitForOptions};
 
@@ -38,6 +41,29 @@ async fn run_picker<F: AsyncFn(&playwright_rs::Page)>(f: F) {
     let _ = browser.close().await;
 }
 
+async fn crumbs(page: &playwright_rs::Page) -> String {
+    page.locator("#crumbs")
+        .text_content()
+        .await
+        .unwrap()
+        .unwrap_or_default()
+}
+
+/// Wait options for an element that should appear.
+fn visible() -> WaitForOptions {
+    WaitForOptions::builder().timeout(10_000.0).build()
+}
+
+/// Make the page smaller, which sends the server its new viewport.
+async fn resize(page: &playwright_rs::Page) {
+    page.set_viewport_size(playwright_rs::Viewport {
+        width: 1000,
+        height: 700,
+    })
+    .await
+    .unwrap();
+}
+
 async fn page_title(page: &playwright_rs::Page) {
     assert_eq!(page.title().await.unwrap(), "rsdirstat");
 }
@@ -49,8 +75,7 @@ async fn status_bar_shows_scan_results(page: &playwright_rs::Page) {
 }
 
 async fn breadcrumb_shows_root(page: &playwright_rs::Page) {
-    let text = page.locator("#crumbs").text_content().await.unwrap().unwrap();
-    assert!(!text.is_empty(), "breadcrumb should not be empty");
+    assert!(!crumbs(page).await.is_empty(), "breadcrumb should not be empty");
 }
 
 async fn toolbar_elements_visible(page: &playwright_rs::Page) {
@@ -204,10 +229,9 @@ async fn hover_canvas_at(page: &playwright_rs::Page, x: f64, y: f64) {
     page.locator("#treemap").hover(Some(at)).await.unwrap();
 }
 
-/// The server keeps one view across reloads, so a reloaded page must send its toolbar's values
-/// (defaults, or whatever the browser restored) or the treemap and the toolbar disagree.
-/// Regression: after a reload the toolbar showed an empty name filter while the server kept
-/// filtering by the old one.
+/// A reloaded page must send its toolbar's values (defaults, or whatever the browser restored), or
+/// the treemap and the toolbar can disagree. Regression: after a reload the toolbar showed an empty
+/// name filter while the server kept filtering by the old one.
 async fn reload_keeps_treemap_in_sync_with_toolbar(page: &playwright_rs::Page) {
     let before = layout_seq(page).await;
     page.locator("#filter-name")
@@ -232,15 +256,14 @@ async fn reload_keeps_treemap_in_sync_with_toolbar(page: &playwright_rs::Page) {
 }
 
 async fn click_navigates_into_directory(page: &playwright_rs::Page) {
-    let crumbs = page.locator("#crumbs");
-    let initial_text = crumbs.text_content().await.unwrap().unwrap();
+    let initial_text = crumbs(page).await;
     let initial_parts: Vec<&str> = initial_text.split('/').collect();
 
     let before = layout_seq(page).await;
     page.locator("#treemap").click(None).await.unwrap();
     wait_for_layout_after(page, before).await;
 
-    let after_text = crumbs.text_content().await.unwrap().unwrap();
+    let after_text = crumbs(page).await;
     let after_parts: Vec<&str> = after_text.split('/').collect();
 
     assert!(
@@ -254,14 +277,13 @@ async fn breadcrumb_click_navigates_back(page: &playwright_rs::Page) {
     page.locator("#treemap").click(None).await.unwrap();
     wait_for_layout_after(page, before).await;
 
-    let crumbs = page.locator("#crumbs");
-    let deep_text = crumbs.text_content().await.unwrap().unwrap();
+    let deep_text = crumbs(page).await;
 
     let before = layout_seq(page).await;
     page.locator("#crumbs span:first-child").click(None).await.unwrap();
     wait_for_layout_after(page, before).await;
 
-    let back_text = crumbs.text_content().await.unwrap().unwrap();
+    let back_text = crumbs(page).await;
     assert!(
         back_text.len() <= deep_text.len(),
         "breadcrumb back: deep={deep_text}, back={back_text}"
@@ -406,48 +428,47 @@ async fn e2e_picker_click_starts_scan() {
     run_picker(picker_volume_click_starts_scan).await;
 }
 
-/// A scan whose root can't be opened (here: a volume that vanished between listing and clicking)
-/// must not wedge the server: the tab is sent back to the volume picker, a reloaded tab starts
-/// there too, and picking a real volume from it starts a scan.
+/// Pick a volume that vanished between the picker listing it and the click: one whose root can't be
+/// opened.
+async fn pick_vanished_volume(page: &playwright_rs::Page) {
+    page.locator(".volume-card").first().wait_for(visible()).await.unwrap();
+    page.evaluate_expression(
+        "document.querySelector('.picker-grid').insertAdjacentHTML('afterbegin', \
+         '<div class=\"volume-card\" id=\"gone\" data-mount=\"/nonexistent/rsdirstat-e2e\">gone</div>')",
+    )
+    .await
+    .unwrap();
+    page.locator("#gone").click(None).await.unwrap();
+}
+
+/// A scan whose root can't be opened must not wedge the server: the tab is sent back to the volume
+/// picker, a reloaded tab starts there too, and picking a real volume from it starts a scan.
+async fn unopenable_root_falls_back_to_picker(page: &playwright_rs::Page) {
+    let picker = page.locator("#picker");
+    pick_vanished_volume(page).await;
+    picker
+        .wait_for(visible())
+        .await
+        .expect("the failed scan should send the tab back to the volume picker");
+
+    page.reload(None).await.unwrap();
+    picker
+        .wait_for(visible())
+        .await
+        .expect("a new tab should start on the volume picker");
+
+    page.locator(".volume-card").first().click(None).await.unwrap();
+    page.wait_for_function(
+        "() => /Scanning|dirs/.test(document.querySelector('#status')?.textContent ?? '')",
+        WaitForFunctionOptions::default().timeout(10_000.0),
+    )
+    .await
+    .expect("picking a volume should start a scan");
+}
+
 #[tokio::test]
 async fn e2e_unopenable_root_falls_back_to_picker() {
-    let server = TestServer::start_picker();
-    let (_pw, browser, page) = launch_browser("chromium").await;
-    let label = common::trace_label("chromium", "unopenable_root_falls_back_to_picker");
-    common::with_trace_unit(&page, &label, async {
-        let picker = page.locator("#picker");
-        let visible = || WaitForOptions::builder().timeout(10_000.0).build();
-
-        page.goto(&format!("{}/?picker", server.url), None).await.unwrap();
-        page.locator(".volume-card").first().wait_for(visible()).await.unwrap();
-        page.evaluate_expression(
-            "document.querySelector('.picker-grid').insertAdjacentHTML('afterbegin', \
-             '<div class=\"volume-card\" id=\"gone\" data-mount=\"/nonexistent/rsdirstat-e2e\">gone</div>')",
-        )
-        .await
-        .unwrap();
-        page.locator("#gone").click(None).await.unwrap();
-        picker
-            .wait_for(visible())
-            .await
-            .expect("the failed scan should send the tab back to the volume picker");
-
-        page.reload(None).await.unwrap();
-        picker
-            .wait_for(visible())
-            .await
-            .expect("a new tab should start on the volume picker");
-
-        page.locator(".volume-card").first().click(None).await.unwrap();
-        page.wait_for_function(
-            "() => /Scanning|dirs/.test(document.querySelector('#status')?.textContent ?? '')",
-            WaitForFunctionOptions::default().timeout(10_000.0),
-        )
-        .await
-        .expect("picking a volume should start a scan");
-    })
-    .await;
-    let _ = browser.close().await;
+    run_picker(unopenable_root_falls_back_to_picker).await;
 }
 
 /// "Change" opens the picker in the page only; the server still has the finished scan and answers a
@@ -455,28 +476,20 @@ async fn e2e_unopenable_root_falls_back_to_picker() {
 /// picker.
 #[tokio::test]
 async fn e2e_layouts_stay_behind_the_picker() {
-    let dir = create_test_dir();
-    let server = TestServer::start(dir.path());
-    let (_pw, browser, page) = launch_browser("chromium").await;
-    let label = common::trace_label("chromium", "layouts_stay_behind_the_picker");
-    common::with_trace_unit(&page, &label, async {
-        page.goto(&server.url, None).await.unwrap();
-        wait_for_scan_done(&page).await;
-
-        page.locator("#change").click(None).await.unwrap();
-        let before = layout_seq(&page).await;
-        page.set_viewport_size(playwright_rs::Viewport {
-            width: 1000,
-            height: 700,
-        })
-        .await
-        .unwrap();
-        wait_for_layout_after(&page, before).await;
-        assert!(page.locator("#picker").is_visible().await.unwrap());
-        assert!(!page.locator("#treemap-view").is_visible().await.unwrap());
-    })
+    run_in(
+        "chromium",
+        "layouts_stay_behind_the_picker",
+        create_test_dir(),
+        async |page: &playwright_rs::Page| {
+            page.locator("#change").click(None).await.unwrap();
+            let before = layout_seq(page).await;
+            resize(page).await;
+            wait_for_layout_after(page, before).await;
+            assert!(page.locator("#picker").is_visible().await.unwrap());
+            assert!(!page.locator("#treemap-view").is_visible().await.unwrap());
+        },
+    )
     .await;
-    let _ = browser.close().await;
 }
 
 /// After a finished scan, picking a path that can't be scanned sends the tabs back to the picker,
@@ -484,49 +497,23 @@ async fn e2e_layouts_stay_behind_the_picker() {
 /// a resize) once made it send that stale layout, which brought the treemap back.
 #[tokio::test]
 async fn e2e_failed_rescan_keeps_the_picker() {
-    let dir = create_test_dir();
-    let server = TestServer::start(dir.path());
-    let (_pw, browser, page) = launch_browser("chromium").await;
-    let label = common::trace_label("chromium", "failed_rescan_keeps_the_picker");
-    common::with_trace_unit(&page, &label, async {
-        let visible = || WaitForOptions::builder().timeout(10_000.0).build();
-        page.goto(&server.url, None).await.unwrap();
-        wait_for_scan_done(&page).await;
+    run_in(
+        "chromium",
+        "failed_rescan_keeps_the_picker",
+        create_test_dir(),
+        async |page: &playwright_rs::Page| {
+            page.locator("#change").click(None).await.unwrap();
+            pick_vanished_volume(page).await;
+            page.locator("#picker").wait_for(visible()).await.unwrap();
 
-        page.locator("#change").click(None).await.unwrap();
-        page.locator(".volume-card").first().wait_for(visible()).await.unwrap();
-        page.evaluate_expression(
-            "document.querySelector('.picker-grid').insertAdjacentHTML('afterbegin', \
-             '<div class=\"volume-card\" id=\"gone\" data-mount=\"/nonexistent/rsdirstat-e2e\">gone</div>')",
-        )
-        .await
-        .unwrap();
-        page.locator("#gone").click(None).await.unwrap();
-        page.locator("#picker").wait_for(visible()).await.unwrap();
-
-        page.reload(None).await.unwrap();
-        page.locator(".volume-card").first().wait_for(visible()).await.unwrap();
-        page.set_viewport_size(playwright_rs::Viewport {
-            width: 1000,
-            height: 700,
-        })
-        .await
-        .unwrap();
-        // The page sends its new viewport on resize; give a stale layout time to arrive.
-        let stale = page
-            .wait_for_function(
-                "() => document.querySelector('#treemap')?.dataset.layoutSeq !== undefined",
-                WaitForFunctionOptions::default().timeout(1_000.0),
-            )
-            .await;
-        assert!(
-            stale.is_err(),
-            "a reloaded tab got a layout while the server waits for a path"
-        );
-        assert!(!page.locator("#treemap-view").is_visible().await.unwrap());
-    })
+            page.reload(None).await.unwrap();
+            page.locator(".volume-card").first().wait_for(visible()).await.unwrap();
+            resize(page).await;
+            assert_no_layout_after(page, 0, "a reloaded tab got a layout while the server waits for a path").await;
+            assert!(!page.locator("#treemap-view").is_visible().await.unwrap());
+        },
+    )
     .await;
-    let _ = browser.close().await;
 }
 
 /// `--wait` (for profiling) holds the scan until the page's Start button is clicked, so that button
@@ -541,7 +528,7 @@ async fn e2e_wait_mode_start_button_starts_scan() {
         page.goto(&format!("{}/?wait", server.url), None).await.unwrap();
         let start = page.locator("#status button");
         start
-            .wait_for(WaitForOptions::builder().timeout(10_000.0).build())
+            .wait_for(visible())
             .await
             .expect("the Start button should be visible");
         start.click(None).await.unwrap();
@@ -636,14 +623,6 @@ fn e2e_cross_site_api_requests_are_refused() {
     }
 }
 
-async fn crumbs(page: &playwright_rs::Page) -> String {
-    page.locator("#crumbs")
-        .text_content()
-        .await
-        .unwrap()
-        .unwrap_or_default()
-}
-
 /// Each tab has its own view: zooming into a folder or filtering in one tab leaves another tab
 /// where it was.
 #[tokio::test]
@@ -651,14 +630,7 @@ async fn e2e_tabs_have_independent_views() {
     let dir = create_test_dir();
     let server = TestServer::start(dir.path());
     let (_pw, browser, first) = launch_browser("chromium").await;
-    let second = browser.new_page().await.unwrap();
-    second
-        .set_viewport_size(playwright_rs::Viewport {
-            width: 1280,
-            height: 720,
-        })
-        .await
-        .unwrap();
+    let second = common::new_page(&browser, 1280, 720).await;
     let label = common::trace_label("chromium", "tabs_have_independent_views");
     common::with_trace_unit(&first, &label, async {
         for page in [&first, &second] {
@@ -676,17 +648,12 @@ async fn e2e_tabs_have_independent_views() {
         wait_for_layout_after(&first, before).await;
         assert_ne!(crumbs(&first).await, second_crumbs, "the first tab zoomed in");
 
-        // Give the second tab time to receive a layout it shouldn't get.
-        let stray = second
-            .wait_for_function(
-                &format!(
-                    "() => Number(document.querySelector('#treemap').dataset.layoutSeq) > {}",
-                    layout_seq(&second).await
-                ),
-                WaitForFunctionOptions::default().timeout(1_000.0),
-            )
-            .await;
-        assert!(stray.is_err(), "the second tab got a layout for the first tab's view");
+        assert_no_layout_after(
+            &second,
+            layout_seq(&second).await,
+            "the second tab got a layout for the first tab's view",
+        )
+        .await;
         assert_eq!(crumbs(&second).await, second_crumbs);
         assert_eq!(
             second.locator("#treemap").screenshot(None).await.unwrap(),

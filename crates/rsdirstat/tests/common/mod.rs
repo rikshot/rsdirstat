@@ -176,11 +176,17 @@ pub async fn launch_browser_sized(
         "webkit" => pw.webkit().launch().await.unwrap(),
         _ => panic!("unknown browser: {browser_name}"),
     };
+    let page = new_page(&browser, width, height).await;
+    (pw, browser, page)
+}
+
+/// A new page (a tab) in `browser`, with a `width` × `height` viewport.
+pub async fn new_page(browser: &playwright_rs::Browser, width: u32, height: u32) -> playwright_rs::Page {
     let page = browser.new_page().await.unwrap();
     page.set_viewport_size(playwright_rs::Viewport { width, height })
         .await
         .unwrap();
-    (pw, browser, page)
+    page
 }
 
 /// Wait for the scan to finish and its last layout to be drawn, so callers can assert on or
@@ -215,6 +221,16 @@ pub async fn wait_for_layout_after(page: &playwright_rs::Page, after: u64) {
     page.wait_for_function(&settled, WaitForFunctionOptions::default().timeout(10_000.0))
         .await
         .unwrap_or_else(|e| panic!("no settled layout after #{after} within 10 seconds: {e}"));
+}
+
+/// Assert that the page gets no layout newer than `after` within a second: long enough for one sent
+/// in response to whatever the caller just did to arrive.
+pub async fn assert_no_layout_after(page: &playwright_rs::Page, after: u64, message: &str) {
+    let newer = format!("() => Number(document.querySelector('#treemap')?.dataset.layoutSeq ?? 0) > {after}");
+    let arrived = page
+        .wait_for_function(&newer, WaitForFunctionOptions::default().timeout(1_000.0))
+        .await;
+    assert!(arrived.is_err(), "{message}");
 }
 
 /// Directory where Playwright failure traces are written. Only tests that fail
