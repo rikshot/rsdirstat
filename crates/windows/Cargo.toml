@@ -13,7 +13,7 @@ categories = ["filesystem", "os::windows-apis"]
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
 
-[dependencies]
+[target.'cfg(windows)'.dependencies]
 rsdirstat-core.workspace = true
 anyhow.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security"] }

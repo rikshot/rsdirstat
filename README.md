@@ -139,7 +139,7 @@ For frontend development, debug builds read the bundle from `crates/rsdirstat/di
 instead of embedding it, so run `trunk watch` (rebuilds on change) alongside
 `cargo run -p rsdirstat` and just refresh the browser.
 
-Only the native platform scanner is compiled: each scanner crate builds only for its own OS.
+Only the native platform scanner is compiled in: each scanner crate is empty on any other OS.
 Release binaries are built natively on each platform by the release workflow. Cross-compiling
 needs a C cross-compiler for the target as well as the Rust target, because `mimalloc` and
 `zstd` are C libraries.

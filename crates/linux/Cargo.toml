@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Linux filesystem scanner for rsdirstat (getdents64 + statx)"
 categories = ["filesystem", "os::linux-apis"]
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 rsdirstat-core.workspace = true
 anyhow.workspace = true
 libc.workspace = true

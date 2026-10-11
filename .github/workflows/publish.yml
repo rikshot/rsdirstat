@@ -36,10 +36,9 @@ jobs:
         id: auth
       # `--workspace` publishes every non-`publish=false` member in dependency order
       # (protocol → core → {linux,macos,windows} → rsdirstat), skipping the wasm crate.
-      # `--no-verify`: the macOS/Windows scanner crates can't compile on this Linux
-      # runner (native platform APIs), so skip the per-crate verify build — CI already
-      # built and tested every crate on its native OS at this commit.
+      # Each is verified by building its packaged tarball first (the scanner crates of
+      # other OSes build empty here), so a broken package fails before any upload.
       # `--allow-dirty`: `dist/` is git-ignored (a build artifact) but must ship.
-      - run: cargo publish --workspace --no-verify --allow-dirty
+      - run: cargo publish --workspace --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

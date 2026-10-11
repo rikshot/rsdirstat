@@ -13,7 +13,7 @@ categories = ["filesystem", "os::macos-apis"]
 [package.metadata.docs.rs]
 default-target = "x86_64-apple-darwin"
 
-[dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 rsdirstat-core.workspace = true
 anyhow.workspace = true
 libc.workspace = true
