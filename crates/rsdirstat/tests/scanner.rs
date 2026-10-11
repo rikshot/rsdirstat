@@ -3,7 +3,6 @@ use std::fs;
 use std::path::Path;
 use std::sync::mpsc;
 
-use rsdirstat_core::scan::ScanOutcome;
 use rsdirstat_core::tree::{DirTree, FileEntry};
 
 #[cfg(target_os = "linux")]
@@ -24,7 +23,8 @@ fn scan_to_tree(root: &Path) -> DirTree {
         tree.apply(event);
     }
 
-    assert_eq!(handle.join().unwrap(), ScanOutcome::Complete);
+    handle.join().unwrap();
+    assert!(tree.complete, "the scan must read everything");
     tree
 }
 
@@ -177,6 +177,28 @@ fn scanner_reports_positive_mtime() {
     }
 }
 
+/// Linux names are bytes, not necessarily UTF-8: a file named in Latin-1 still counts (under a lossy
+/// name), and so does everything under a directory named that way.
+#[cfg(target_os = "linux")]
+#[test]
+fn scanner_counts_names_that_are_not_utf8() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &[u8]| dir.path().join(OsStr::from_bytes(name));
+    fs::write(path(b"caf\xe9.bin"), vec![0u8; 100]).unwrap();
+    fs::create_dir(path(b"donn\xe9es")).unwrap();
+    fs::write(path(b"donn\xe9es").join("inside.bin"), vec![0u8; 20]).unwrap();
+
+    let tree = scan_to_tree(dir.path());
+
+    assert_eq!(tree.nodes[&tree.root_id.unwrap()].size, 120);
+    let names = file_names(&tree);
+    assert!(names.contains(&"caf\u{FFFD}.bin"), "{names:?}");
+    assert!(names.contains(&"inside.bin"), "{names:?}");
+}
+
 #[test]
 fn scanner_unicode_filenames() {
     let dir = tempfile::tempdir().unwrap();
@@ -200,9 +222,31 @@ fn scanner_unicode_filenames() {
     );
 }
 
-// Hardlink dedup is implemented on Unix (cheap via statx/getattrlistbulk link counts); the Windows
-// scanner does not dedup (link count would require a per-file open), so this is Unix-only.
+/// A directory that can't be opened is left out, along with everything in it, while the rest of the
+/// tree is scanned.
 #[cfg(unix)]
+#[test]
+fn scanner_leaves_out_unreadable_directories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root can open any directory");
+        return;
+    }
+    let dir = create_test_dir();
+    let locked = dir.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::write(locked.join("secret.bin"), vec![0u8; 100]).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let tree = scan_to_tree(dir.path());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let dir_names: Vec<&str> = tree.nodes.values().map(|node| &*node.name).collect();
+    assert!(!dir_names.contains(&"locked"), "{dir_names:?}");
+    assert!(dir_names.contains(&"nested"), "the rest is scanned: {dir_names:?}");
+}
+
 #[test]
 fn scanner_dedups_hardlinks() {
     let dir = tempfile::tempdir().unwrap();

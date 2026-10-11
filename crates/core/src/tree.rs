@@ -3,7 +3,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 
 use crate::color::{hash_name, hue_for_extension};
-use crate::scan::{ScanEvent, ScannedFile};
+use crate::scan::{ScanEvent, ScanOutcome, ScannedFile};
 
 pub struct FileEntry {
     pub name: Box<str>,
@@ -106,6 +106,9 @@ pub struct DirTree {
     /// How many scans have started on this tree (each `ScanStart` applied replaces its contents),
     /// so a change means it holds a different scan.
     pub scans: u64,
+    /// Whether the scan read everything: set by a `ScanDone` for a complete scan, so false while it
+    /// runs, and after one that stopped early (a stall) or never reported how it ended.
+    pub complete: bool,
     hue_cache: HashMap<Box<str>, u16>,
 }
 
@@ -123,6 +126,7 @@ impl DirTree {
             scan_path: String::new(),
             mtime_range: (i64::MAX, 0),
             scans: 0,
+            complete: false,
             hue_cache: HashMap::new(),
         }
     }
@@ -132,6 +136,7 @@ impl DirTree {
         self.root_id = None;
         self.scan_path.clear();
         self.mtime_range = (i64::MAX, 0);
+        self.complete = false;
         self.hue_cache.clear();
     }
 
@@ -154,7 +159,10 @@ impl DirTree {
                 self.insert_files(id, files);
                 self.insert_dir(id, parent, name, size, mtime);
             }
-            ScanEvent::ScanDone => self.recompute_sizes(),
+            ScanEvent::ScanDone { outcome } => {
+                self.recompute_sizes();
+                self.complete = outcome == ScanOutcome::Complete;
+            }
         }
     }
 
@@ -525,6 +533,21 @@ mod tests {
         for scans in 1..=2 {
             tree.apply(ScanEvent::ScanStart { path: "root".into() });
             assert_eq!(tree.scans, scans);
+        }
+    }
+
+    #[test]
+    fn only_a_complete_scan_leaves_the_tree_complete() {
+        let mut tree = DirTree::new();
+        for (outcome, complete) in [
+            (ScanOutcome::Complete, true),
+            (ScanOutcome::Stalled, false),
+            (ScanOutcome::Cancelled, false),
+        ] {
+            tree.apply(ScanEvent::ScanStart { path: "root".into() });
+            assert!(!tree.complete, "a running scan isn't complete");
+            tree.apply(ScanEvent::ScanDone { outcome });
+            assert_eq!(tree.complete, complete, "{outcome:?}");
         }
     }
 

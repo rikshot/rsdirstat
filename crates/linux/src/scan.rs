@@ -1,11 +1,11 @@
 use std::ffi::CStr;
-use std::os::unix::io::{AsRawFd, OwnedFd};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOutcome, node_id, open_dir, open_dir_at, run_scan};
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, UnixDir, node_id, open_dir, run_scan};
 
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
@@ -13,17 +13,38 @@ const DT_REG: u8 = 8;
 const STATX_TYPE: u32 = 0x0001;
 const STATX_MODE: u32 = 0x0002;
 const STATX_NLINK: u32 = 0x0004;
-const STATX_SIZE: u32 = 0x0200;
 const STATX_MTIME: u32 = 0x0040;
+const STATX_INO: u32 = 0x0100;
+const STATX_SIZE: u32 = 0x0200;
 const STATX_MNT_ID: u32 = 0x1000;
 /// What a file's entry needs: its size, its mtime, and its link count (for hardlink dedup).
 const FILE_STATX_MASK: u32 = STATX_SIZE | STATX_MTIME | STATX_NLINK;
+/// What a directory's entry needs: its identity (with the device, always reported) and its mount.
+const DIR_STATX_MASK: u32 = STATX_INO | STATX_MNT_ID;
 const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
 
 /// Combine the statx device major/minor into a single value for node identity. This need not match
 /// the kernel's `dev_t` encoding — only be consistent within a scan.
 fn makedev(major: u32, minor: u32) -> u64 {
     ((major as u64) << 32) | minor as u64
+}
+
+/// A directory's node id: its inode with its device. From the directory's own `statx` rather than
+/// the entry's `d_ino`, which for a mount point is the directory it covers, so a bind mount gets
+/// the same id as the directory it shows and is read only once.
+fn dir_id(sx: &Statx) -> u64 {
+    node_id(makedev(sx.stx_dev_major, sx.stx_dev_minor), sx.stx_ino)
+}
+
+/// Which mounted filesystem an entry is on, for staying on the root's: its mount id, or, on kernels
+/// before 5.8, which don't report one, its device (as `du -x` compares, so there a btrfs subvolume
+/// counts as another filesystem).
+fn filesystem(sx: &Statx) -> u64 {
+    if sx.stx_mask & STATX_MNT_ID != 0 {
+        sx.stx_mnt_id
+    } else {
+        makedev(sx.stx_dev_major, sx.stx_dev_minor)
+    }
 }
 
 #[repr(C)]
@@ -63,6 +84,8 @@ struct Statx {
     _spare3: [u64; 12],
 }
 
+/// `statx` the entry `name` of `dirfd`. A directory that is a mount point reports the mounted
+/// filesystem's root, without triggering an automount.
 fn statx_path(dirfd: i32, name: *const libc::c_char, mask: u32) -> Option<Statx> {
     let mut buf = Statx::default();
     let ret = unsafe {
@@ -70,7 +93,7 @@ fn statx_path(dirfd: i32, name: *const libc::c_char, mask: u32) -> Option<Statx>
             libc::SYS_statx,
             dirfd,
             name,
-            libc::AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC,
+            libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT | AT_STATX_DONT_SYNC,
             mask,
             &mut buf as *mut Statx,
         )
@@ -93,7 +116,7 @@ fn statx_fd(fd: i32, mask: u32) -> Option<Statx> {
     if ret == 0 { Some(buf) } else { None }
 }
 
-pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<ScanOutcome> {
+pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
     scan_cancellable(root, cross_filesystems, tx, Arc::default())
 }
 
@@ -103,27 +126,29 @@ pub fn scan_cancellable(
     cross_filesystems: bool,
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
-) -> Result<ScanOutcome> {
+) -> Result<()> {
     let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
     let fd = open_dir(&path).context("failed to open root directory")?;
-    let sx = statx_fd(fd.as_raw_fd(), STATX_MNT_ID).context("failed to statx root directory")?;
-    let id = node_id(makedev(sx.stx_dev_major, sx.stx_dev_minor), sx.stx_ino);
-    let root_mnt_id = sx.stx_mnt_id;
-    Ok(run_scan(&path, fd, id, tx, cancel, move |dir, buffer, sink| {
-        read_dir(dir, buffer, sink, root_mnt_id, cross_filesystems)
-    }))
+    let sx = statx_fd(fd.as_raw_fd(), DIR_STATX_MASK).context("failed to statx root directory")?;
+    let root_filesystem = filesystem(&sx);
+    let root = UnixDir::Root(Arc::new(fd));
+    run_scan(&path, root, dir_id(&sx), tx, cancel, move |dir, buffer, sink| {
+        read_dir(dir, buffer, sink, root_filesystem, cross_filesystems)
+    });
+    Ok(())
 }
 
 /// Read one directory with raw `getdents64`, then `statx` each file for its size and mtime, and
-/// each subdirectory for its device and mount.
+/// each subdirectory for its identity and mount. False if it can't be opened.
 fn read_dir(
-    dir: &DirJob<OwnedFd>,
+    dir: &DirJob<UnixDir>,
     buffer: &mut [u8],
-    sink: &mut DirSink<'_, OwnedFd>,
-    root_mnt_id: u64,
+    sink: &mut DirSink<'_, UnixDir>,
+    root_filesystem: u64,
     cross_filesystems: bool,
-) {
-    let dir_fd = dir.handle.as_raw_fd();
+) -> bool {
+    let Some(fd) = dir.open() else { return false };
+    let dir_fd = fd.as_raw_fd();
     loop {
         let nread = unsafe {
             libc::syscall(
@@ -168,19 +193,22 @@ fn read_dir(
             let Ok(name) = CStr::from_bytes_until_nul(&record[19..]) else {
                 continue;
             };
-            let name_str = match name.to_str() {
-                Ok(s) if s != "." && s != ".." => s,
-                _ => continue,
-            };
+            if matches!(name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            // Linux names are bytes, not necessarily UTF-8 (an old Latin-1 archive, say). Such an
+            // entry is still counted, under a lossy name for display; it's opened by its real one.
+            let display_name = name.to_string_lossy();
 
             // Some filesystems leave the type unknown (DT_UNKNOWN). Resolve it with a statx that
-            // also asks for everything a file needs, so a file costs one statx either way.
-            let (entry_type, file_stat) = if d_type == 0 {
-                let Some(sx) = statx_path(dir_fd, name.as_ptr(), STATX_TYPE | STATX_MODE | FILE_STATX_MASK) else {
+            // also asks for everything a file or directory needs, so either costs one statx.
+            let (entry_type, stat) = if d_type == 0 {
+                let mask = STATX_TYPE | STATX_MODE | FILE_STATX_MASK | DIR_STATX_MASK;
+                let Some(sx) = statx_path(dir_fd, name.as_ptr(), mask) else {
                     continue;
                 };
                 match sx.stx_mode as u32 & libc::S_IFMT {
-                    libc::S_IFDIR => (DT_DIR, None),
+                    libc::S_IFDIR => (DT_DIR, Some(sx)),
                     libc::S_IFREG => (DT_REG, Some(sx)),
                     _ => continue,
                 }
@@ -190,25 +218,23 @@ fn read_dir(
 
             match entry_type {
                 DT_DIR => {
-                    let Some(child) = open_dir_at(&dir.handle, name) else {
+                    // By name, so a mount point outside the root's filesystem is skipped without
+                    // being opened. The directory is opened only when a worker gets to it.
+                    let Some(sx) = stat.or_else(|| statx_path(dir_fd, name.as_ptr(), DIR_STATX_MASK)) else {
                         continue;
                     };
-                    // statx the child for its device (node identity) and mount id (the
-                    // filesystem-boundary check). stx_dev is always populated; stx_mnt_id needs
-                    // the mask.
-                    let sx = statx_fd(child.as_raw_fd(), STATX_MNT_ID);
-                    if !cross_filesystems && sx.as_ref().is_none_or(|s| s.stx_mnt_id != root_mnt_id) {
+                    if !cross_filesystems && filesystem(&sx) != root_filesystem {
                         continue;
                     }
-                    let child_dev = sx.as_ref().map_or(0, |s| makedev(s.stx_dev_major, s.stx_dev_minor));
-                    sink.dir(node_id(child_dev, d_ino), name_str, sink.child_path(name_str), child);
+                    let child = UnixDir::Child(Arc::clone(&fd), name.to_owned());
+                    sink.dir(dir_id(&sx), &display_name, sink.child_path(&display_name), child);
                 }
                 DT_REG => {
-                    if let Some(sx) = file_stat.or_else(|| statx_path(dir_fd, name.as_ptr(), FILE_STATX_MASK)) {
+                    if let Some(sx) = stat.or_else(|| statx_path(dir_fd, name.as_ptr(), FILE_STATX_MASK)) {
                         // Hardlink identity: the entry's inode (d_ino) with the file's device.
                         let hardlink =
                             (sx.stx_nlink > 1).then(|| node_id(makedev(sx.stx_dev_major, sx.stx_dev_minor), d_ino));
-                        sink.file(name_str, sx.stx_size, sx.stx_mtime.tv_sec, hardlink);
+                        sink.file(display_name, sx.stx_size, sx.stx_mtime.tv_sec, hardlink);
                     }
                 }
                 _ => {}
@@ -219,4 +245,5 @@ fn read_dir(
             break;
         }
     }
+    true
 }

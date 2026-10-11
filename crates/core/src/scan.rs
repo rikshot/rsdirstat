@@ -30,7 +30,9 @@ pub enum ScanEvent {
     },
     /// The last event: nothing follows it, even from a worker still stuck inside a directory after
     /// a cancelled or stalled scan.
-    ScanDone,
+    ScanDone {
+        outcome: ScanOutcome,
+    },
 }
 
 /// A file of non-zero size in a `ScanEvent::Dir`.
@@ -56,8 +58,9 @@ pub fn node_id(dev: u64, ino: u64) -> u64 {
 
 #[cfg(unix)]
 fn raise_fd_limit() {
-    // The scanner keeps every pending directory fd open at once, so the default soft limit
-    // (256 on macOS) is easily exhausted on large trees. Raise it to the hard limit.
+    // The scanner keeps a descriptor open for every directory with subdirectories still queued (see
+    // `UnixDir`), which can outgrow the default soft limit (256 on macOS) on a deep or wide tree.
+    // Raise it to the hard limit.
     unsafe {
         let mut rlim = libc::rlimit::default();
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
@@ -108,19 +111,47 @@ pub fn open_dir(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
     Ok(dir.into())
 }
 
-/// Open the subdirectory `name` of `parent`, or `None` if it can't be opened (it is then left out
-/// of the scan, like any unreadable directory).
+/// A directory in a Unix scan's queue. A subdirectory is opened only once a worker takes it, by
+/// name in its parent, which stays open until then. Opening each one as soon as it's found would
+/// hold a descriptor for every queued directory, which a wide tree can push past the process's
+/// limit; every directory that then failed to open would be left out without a word.
 #[cfg(unix)]
-pub fn open_dir_at(parent: &std::os::fd::OwnedFd, name: &std::ffi::CStr) -> Option<std::os::fd::OwnedFd> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+pub enum UnixDir {
+    /// The scan root, opened up front so that a root that can't be opened fails the scan.
+    Root(Arc<std::os::fd::OwnedFd>),
+    /// A subdirectory: its open parent, and its name there.
+    Child(Arc<std::os::fd::OwnedFd>, std::ffi::CString),
+}
+
+#[cfg(unix)]
+impl DirJob<UnixDir> {
+    /// Open the directory, or `None` if it can't be opened. Failures other than a lack of
+    /// permission, or the directory having gone, are reported.
+    pub fn open(&self) -> Option<Arc<std::os::fd::OwnedFd>> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let (parent, name) = match &self.handle {
+            UnixDir::Root(fd) => return Some(Arc::clone(fd)),
+            UnixDir::Child(parent, name) => (parent, name),
+        };
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            return Some(Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }));
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EACCES | libc::EPERM | libc::ENOENT | libc::ENOTDIR)
+        ) {
+            eprintln!("Can't open {}: {error}", self.path);
+        }
+        None
+    }
 }
 
 /// A path for showing to people: Windows paths are opened with the `\\?\` extended-length prefix,
@@ -144,17 +175,23 @@ const SEPARATOR: char = if cfg!(windows) { '\\' } else { '/' };
 /// Size of each worker's buffer for directory reads.
 const READ_BUFFER_SIZE: usize = 1024 * 1024;
 
-/// How long the scan may go without any progress before it is treated as stuck. Every directory
-/// read counts as progress, so only a syscall blocked this long on every busy worker (a dead
-/// network mount, typically) trips it, not a merely slow or huge directory.
+/// How long the scan may go without any progress before it is treated as stuck. Every read from the
+/// OS and every few entries count as progress, so only a syscall blocked this long on every busy
+/// worker (a dead network mount, typically) trips it, not a merely slow or huge directory.
 const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How many entries a worker reports between recordings of progress. A huge directory on slow
+/// storage takes a syscall per entry (a `statx`, or opening a subdirectory), so a read from the OS
+/// can return far more entries than the stall timeout has time for; counting entries keeps it
+/// showing progress. Batched so the workers don't contend on the shared counter for every one.
+const ENTRIES_PER_PROGRESS: u32 = 64;
 
 /// How often the waiting caller samples progress and the cancel flag.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// One directory waiting to be read.
 pub struct DirJob<H> {
-    /// The open directory (a file descriptor or handle); closed once it has been read.
+    /// The directory, open or ready to open (see `UnixDir`); dropped once it has been read.
     pub handle: H,
     pub name: String,
     id: u64,
@@ -163,7 +200,7 @@ pub struct DirJob<H> {
     path: String,
 }
 
-/// How a scan ended.
+/// How a scan ended, as `ScanDone` reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanOutcome {
     /// Every reachable directory was read.
@@ -177,26 +214,20 @@ pub enum ScanOutcome {
 
 /// Walk the tree under `root`, already opened as `handle` and identified as `id`, on one worker
 /// thread per CPU, sending `ScanStart`, then a `Dir` per directory carrying its files, then
-/// `ScanDone`.
+/// `ScanDone` with how the scan ended.
 ///
 /// `read_dir` reads one directory: it reports every entry to the [`DirSink`] and calls
-/// [`DirSink::checkpoint`] after each read from the OS, stopping when it returns false.
+/// [`DirSink::checkpoint`] after each read from the OS, stopping when it returns false. It returns
+/// false if the directory can't be opened, which leaves it out, like any unreadable directory.
 ///
 /// Returns once the walk finishes, the `cancel` flag is set (within [`POLL_INTERVAL`]), or the scan
 /// stalls. `ScanDone` is sent last, and `tx` is dropped on return, so the receiver's channel closes
 /// then. Workers are detached rather than joined so that one blocked in a syscall can't hold the
 /// scan open; whatever it finds afterwards is dropped.
-pub fn run_scan<H, F>(
-    root: &Path,
-    handle: H,
-    id: u64,
-    tx: Sender<ScanEvent>,
-    cancel: Arc<AtomicBool>,
-    read_dir: F,
-) -> ScanOutcome
+pub fn run_scan<H, F>(root: &Path, handle: H, id: u64, tx: Sender<ScanEvent>, cancel: Arc<AtomicBool>, read_dir: F)
 where
     H: Send + 'static,
-    F: Fn(&DirJob<H>, &mut [u8], &mut DirSink<'_, H>) + Send + Sync + 'static,
+    F: Fn(&DirJob<H>, &mut [u8], &mut DirSink<'_, H>) -> bool + Send + Sync + 'static,
 {
     #[cfg(unix)]
     raise_fd_limit();
@@ -245,9 +276,8 @@ where
     // Taken under the write lock, so no worker is still sending once `ScanDone` goes out, and none
     // can send after it.
     if let Some(tx) = shared.tx.write().unwrap().take() {
-        let _ = tx.send(ScanEvent::ScanDone);
+        let _ = tx.send(ScanEvent::ScanDone { outcome });
     }
-    outcome
 }
 
 struct Shared<H> {
@@ -263,7 +293,7 @@ struct Shared<H> {
 
 fn run_worker<H, F>(shared: &Shared<H>, read_dir: &F, active: &Mutex<String>)
 where
-    F: Fn(&DirJob<H>, &mut [u8], &mut DirSink<'_, H>),
+    F: Fn(&DirJob<H>, &mut [u8], &mut DirSink<'_, H>) -> bool,
 {
     let mut buffer = vec![0u8; READ_BUFFER_SIZE];
     while let Some(job) = shared.queue.take() {
@@ -275,8 +305,9 @@ where
             mtime: 0,
             files: Vec::new(),
             children: Vec::new(),
+            entries: 0,
         };
-        read_dir(&job, &mut buffer, &mut sink);
+        let opened = read_dir(&job, &mut buffer, &mut sink);
         let DirSink {
             mtime, files, children, ..
         } = sink;
@@ -291,7 +322,7 @@ where
         drop(handle);
         // One event per directory, carrying its files: a channel send and a tree lookup per file
         // would cost more than the files themselves.
-        if let Some(tx) = &*shared.tx.read().unwrap() {
+        if opened && let Some(tx) = &*shared.tx.read().unwrap() {
             let _ = tx.send(ScanEvent::Dir {
                 id,
                 parent: parent_id,
@@ -316,6 +347,8 @@ pub struct DirSink<'a, H> {
     mtime: i64,
     files: Vec<ScannedFile>,
     children: Vec<DirJob<H>>,
+    /// Entries reported so far, for recording progress every `ENTRIES_PER_PROGRESS`.
+    entries: u32,
 }
 
 impl<H> DirSink<'_, H> {
@@ -324,9 +357,10 @@ impl<H> DirSink<'_, H> {
         format!("{}{SEPARATOR}{name}", self.dir_path.trim_end_matches(SEPARATOR))
     }
 
-    /// A subdirectory to read, opened as `handle`. One already reached under another name is
-    /// skipped (and `handle` closed).
+    /// A subdirectory to read, through `handle`. One already reached under another name is skipped
+    /// (and `handle` dropped).
     pub fn dir(&mut self, id: u64, name: &str, path: String, handle: H) {
+        self.count_entry();
         if self.shared.visited_dirs.insert(id) {
             self.children.push(DirJob {
                 handle,
@@ -342,6 +376,7 @@ impl<H> DirSink<'_, H> {
     /// when it has other names (a link count above 1): it is then counted under the first name
     /// seen, as `du` does.
     pub fn file(&mut self, name: impl Into<String>, size: u64, mtime: i64, hardlink: Option<u64>) {
+        self.count_entry();
         if hardlink.is_some_and(|id| !self.shared.visited_files.insert(id)) {
             return;
         }
@@ -360,6 +395,13 @@ impl<H> DirSink<'_, H> {
     pub fn checkpoint(&self) -> bool {
         self.shared.queue.record_progress();
         !self.shared.queue.is_cancelled()
+    }
+
+    fn count_entry(&mut self) {
+        self.entries += 1;
+        if self.entries.is_multiple_of(ENTRIES_PER_PROGRESS) {
+            self.shared.queue.record_progress();
+        }
     }
 }
 
@@ -384,7 +426,8 @@ struct WorkQueue<T> {
     cancel: Arc<AtomicBool>,
     /// Set (under the lock) once the queue is cancelled.
     cancelled: AtomicBool,
-    /// Bumped on every directory read and finished item; the waiter watches it for stalls.
+    /// Bumped on every read from the OS, every few entries and every finished item; the waiter
+    /// watches it for stalls.
     progress: AtomicU64,
 }
 
@@ -750,7 +793,7 @@ mod tests {
 
     fn fake_read_dir(
         tree: Arc<Vec<FakeDir>>,
-    ) -> impl Fn(&DirJob<usize>, &mut [u8], &mut DirSink<'_, usize>) + Send + Sync + 'static {
+    ) -> impl Fn(&DirJob<usize>, &mut [u8], &mut DirSink<'_, usize>) -> bool + Send + Sync + 'static {
         move |job, _buffer, sink| {
             let dir = &tree[job.handle];
             for &(name, size, mtime, hardlink) in &dir.files {
@@ -761,7 +804,27 @@ mod tests {
                 sink.dir(child_dir.id, child_dir.name, sink.child_path(child_dir.name), child);
             }
             sink.checkpoint();
+            true
         }
+    }
+
+    /// The events of a scan of `tree` from its first directory, and how it ended.
+    fn scan_fake_tree(tree: &Arc<Vec<FakeDir>>) -> (Vec<ScanEvent>, ScanOutcome) {
+        let (tx, rx) = mpsc::channel();
+        let root = format!("/{}", tree[0].name);
+        run_scan(
+            Path::new(&root),
+            0,
+            tree[0].id,
+            tx,
+            Arc::default(),
+            fake_read_dir(Arc::clone(tree)),
+        );
+        let events: Vec<_> = rx.iter().collect();
+        let Some(&ScanEvent::ScanDone { outcome }) = events.last() else {
+            panic!("the last event must be ScanDone: {events:?}");
+        };
+        (events, outcome)
     }
 
     #[test]
@@ -787,21 +850,9 @@ mod tests {
                 dirs: vec![],
             },
         ]);
-        let (tx, rx) = mpsc::channel();
-        let root = format!("/{}", tree[0].name);
-        let outcome = run_scan(
-            Path::new(&root),
-            0,
-            tree[0].id,
-            tx,
-            Arc::default(),
-            fake_read_dir(Arc::clone(&tree)),
-        );
+        let (events, outcome) = scan_fake_tree(&tree);
         assert_eq!(outcome, ScanOutcome::Complete);
-
-        let events: Vec<_> = rx.iter().collect();
         assert!(matches!(&events[0], ScanEvent::ScanStart { path } if path == "root"));
-        assert!(matches!(events.last(), Some(ScanEvent::ScanDone)));
 
         let mut dirs: Vec<_> = events
             .iter()
@@ -858,14 +909,12 @@ mod tests {
                     sink.dir(id, "d", sink.child_path("d"), ());
                 }
                 sink.checkpoint();
+                true
             }
         };
         let (tx, rx) = mpsc::channel();
         let started = Instant::now();
-        assert_eq!(
-            run_scan(Path::new("/root"), (), 1, tx, cancel, read_dir),
-            ScanOutcome::Cancelled
-        );
+        run_scan(Path::new("/root"), (), 1, tx, cancel, read_dir);
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "took {:?}",
@@ -873,34 +922,65 @@ mod tests {
         );
         // The channel closes with `ScanDone`, even though workers may still be inside directories.
         let events: Vec<_> = rx.iter().collect();
-        assert!(matches!(events.last(), Some(ScanEvent::ScanDone)));
+        assert!(matches!(
+            events.last(),
+            Some(ScanEvent::ScanDone {
+                outcome: ScanOutcome::Cancelled
+            })
+        ));
         assert!(events.len() < 1000, "the walk must stop: {} events", events.len());
     }
 
-    #[test]
-    fn child_paths_join_with_one_separator() {
-        let shared = Shared {
+    fn shared() -> Shared<()> {
+        Shared {
             queue: queue(),
             tx: RwLock::new(None),
             visited_dirs: DashSet::new(),
             visited_files: DashSet::new(),
-        };
+        }
+    }
+
+    fn sink<'a>(shared: &'a Shared<()>, dir_path: &'a str) -> DirSink<'a, ()> {
+        DirSink {
+            shared,
+            dir_id: 1,
+            dir_path,
+            mtime: 0,
+            files: Vec::new(),
+            children: Vec::new(),
+            entries: 0,
+        }
+    }
+
+    #[test]
+    fn child_paths_join_with_one_separator() {
+        let shared = shared();
         let sep = SEPARATOR;
         for (dir, expected) in [
             (format!("{sep}"), format!("{sep}name")),
             (format!("{sep}a"), format!("{sep}a{sep}name")),
             (format!("C:{sep}"), format!("C:{sep}name")),
         ] {
-            let sink: DirSink<'_, ()> = DirSink {
-                shared: &shared,
-                dir_id: 1,
-                dir_path: &dir,
-                mtime: 0,
-                files: Vec::new(),
-                children: Vec::new(),
-            };
-            assert_eq!(sink.child_path("name"), expected);
+            assert_eq!(sink(&shared, &dir).child_path("name"), expected);
         }
+    }
+
+    /// One read from the OS can return tens of thousands of entries, each needing a syscall of its
+    /// own; on slow storage that takes longer than the stall timeout, so the entries themselves
+    /// must count as progress.
+    #[test]
+    fn reporting_entries_is_progress() {
+        let shared = shared();
+        let mut sink = sink(&shared, "/dir");
+        let progress = || shared.queue.progress.load(Ordering::Relaxed);
+        for index in 0..ENTRIES_PER_PROGRESS {
+            sink.file(format!("f{index}"), 1, 0, None);
+        }
+        assert_eq!(progress(), 1);
+        for index in 0..ENTRIES_PER_PROGRESS {
+            sink.dir(index.into(), "d", sink.child_path("d"), ());
+        }
+        assert_eq!(progress(), 2);
     }
 
     #[test]

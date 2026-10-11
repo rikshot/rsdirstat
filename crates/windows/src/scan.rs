@@ -6,12 +6,13 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOutcome, node_id, run_scan};
-use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE};
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, node_id, run_scan};
+use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE, MAX_PATH};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FileIdBothDirectoryInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING,
+    FILE_SHARE_WRITE, FileIdBothDirectoryInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetVolumeInformationByHandleW, OPEN_EXISTING,
 };
 
 // Reparse tags for cloud placeholders created by the Cloud Files API (OneDrive, and other providers
@@ -21,6 +22,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 // whole bindings module in for two integers.
 const IO_REPARSE_TAG_CLOUD: u32 = 0x9000_001A;
 const IO_REPARSE_TAG_CLOUD_MASK: u32 = 0x0000_F000;
+
+/// The reparse tag bit marking a name surrogate: an entry that stands for another file or directory
+/// (a symlink, a junction, a volume mount point), as the SDK's `IsReparseTagNameSurrogate` tests.
+const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
 
 // Convert Windows FILETIME (100ns since 1601-01-01) to Unix epoch seconds
 fn filetime_to_unix(ft: i64) -> i64 {
@@ -54,6 +59,28 @@ fn open_dir(path: &[u16]) -> Option<OwnedHandle> {
     Some(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
+/// Whether the files on `handle`'s volume can be told apart as hardlinks by the 64-bit file id that
+/// directory listings carry: only on NTFS, where every file has one, unique on its volume. ReFS ids
+/// are 128-bit, and FAT and some network shares have no real ids, so there two different files could
+/// share one, and deduplicating them would hide one.
+fn dedupes_hardlinks(handle: &OwnedHandle) -> bool {
+    let mut filesystem = [0u16; MAX_PATH as usize + 1];
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            handle.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            filesystem.as_mut_ptr(),
+            filesystem.len() as u32,
+        )
+    };
+    let len = filesystem.iter().position(|&c| c == 0).unwrap_or(filesystem.len());
+    ok != 0 && String::from_utf16_lossy(&filesystem[..len]) == "NTFS"
+}
+
 fn get_volume_and_id(handle: &OwnedHandle) -> Option<(u32, u64)> {
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &mut info) } == 0 {
@@ -63,7 +90,7 @@ fn get_volume_and_id(handle: &OwnedHandle) -> Option<(u32, u64)> {
     Some((info.dwVolumeSerialNumber, file_id))
 }
 
-pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<ScanOutcome> {
+pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
     scan_cancellable(root, cross_filesystems, tx, Arc::default())
 }
 
@@ -73,14 +100,29 @@ pub fn scan_cancellable(
     cross_filesystems: bool,
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
-) -> Result<ScanOutcome> {
+) -> Result<()> {
     let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
     let handle = open_dir(&wide_path(&path)).context("failed to open root directory")?;
     let (volume_serial, file_id) = get_volume_and_id(&handle).context("failed to get root directory info")?;
     let id = node_id(volume_serial as u64, file_id);
-    Ok(run_scan(&path, handle, id, tx, cancel, move |dir, buffer, sink| {
+    let root = WinDir {
+        dedupe_hardlinks: dedupes_hardlinks(&handle),
+        handle,
+        volume: volume_serial,
+    };
+    run_scan(&path, root, id, tx, cancel, move |dir, buffer, sink| {
         read_dir(dir, buffer, sink, volume_serial, cross_filesystems)
-    }))
+    });
+    Ok(())
+}
+
+/// An open directory, with what its files are told apart by.
+struct WinDir {
+    handle: OwnedHandle,
+    /// The serial number of its volume. File ids are unique only within a volume.
+    volume: u32,
+    /// See `dedupes_hardlinks`.
+    dedupe_hardlinks: bool,
 }
 
 /// What to do with one enumerated directory entry.
@@ -90,8 +132,8 @@ enum EntryKind {
     Directory,
     /// A file contributing `size` bytes — 0 for an online-only (dehydrated) cloud placeholder.
     File { size: u64 },
-    /// A symlink / junction / mount point (any non-cloud reparse point): neither counted nor
-    /// traversed, to avoid double-counting and traversal loops.
+    /// A symlink / junction / mount point (a name surrogate): neither counted nor traversed, to
+    /// avoid double-counting and traversal loops.
     Skip,
 }
 
@@ -103,10 +145,10 @@ fn is_cloud_reparse_tag(tag: u32) -> bool {
 
 /// Decide how to treat a directory entry from its attributes, reparse tag, and sizes.
 ///
-/// Cloud files (OneDrive et al.) are placeholders — reparse points — for both files *and* folders,
-/// so we can't just skip every reparse point or we'd hide all locally-present cloud content and
-/// whole cloud subtrees. Instead, inspect the tag: cloud placeholders back real data and are treated
-/// like ordinary files/dirs, while genuine redirections (symlink/junction/mount point) are skipped.
+/// Only reparse points that stand for another name (symlinks, junctions, mount points) are skipped.
+/// The others are the file or directory itself, with its data kept differently, and are counted like
+/// any other: cloud placeholders (OneDrive et al., files *and* folders), deduplicated files, files
+/// compressed by Windows (WOF, as Compact OS uses), and files tiered by Azure File Sync.
 ///
 /// `reparse_tag` is only meaningful when `FILE_ATTRIBUTE_REPARSE_POINT` is set — the directory
 /// enumeration overlays it onto the entry's `EaSize` field (per [MS-FSCC]).
@@ -114,10 +156,8 @@ fn classify(attrs: u32, reparse_tag: u32, end_of_file: i64, allocation_size: i64
     let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
     let is_reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
 
-    // Non-cloud reparse points (symlinks, junctions, mount points) redirect elsewhere — skip them to
-    // avoid double-counting and traversal loops. Cloud placeholders are also reparse points but back
-    // real content, so they fall through to normal directory/file handling below.
-    if is_reparse && !is_cloud_reparse_tag(reparse_tag) {
+    // Name surrogates redirect elsewhere — skip them to avoid double-counting and traversal loops.
+    if is_reparse && reparse_tag & REPARSE_TAG_NAME_SURROGATE != 0 {
         return EntryKind::Skip;
     }
 
@@ -125,14 +165,13 @@ fn classify(attrs: u32, reparse_tag: u32, end_of_file: i64, allocation_size: i64
         return EntryKind::Directory;
     }
 
-    // Reaching here with `is_reparse` set means a cloud placeholder file. An online-only
-    // (unmaterialized) placeholder occupies 0 bytes on disk — AllocationSize 0 — even though
-    // EndOfFile still reports its full "online" length; count it as 0. On-disk allocation is a
-    // provider- and hydration-policy-agnostic signal, unlike the assorted FILE_ATTRIBUTE_RECALL_ON_*
-    // flags different providers set. A materialized placeholder — and any ordinary file, including a
-    // sparse one — counts at its logical size, matching the rest of the tree and the macOS
-    // dataless-placeholder handling.
-    let unmaterialized_cloud = is_reparse && allocation_size == 0;
+    // An online-only (unmaterialized) cloud placeholder occupies 0 bytes on disk — AllocationSize 0
+    // — even though EndOfFile still reports its full "online" length; count it as 0. On-disk
+    // allocation is a provider- and hydration-policy-agnostic signal, unlike the assorted
+    // FILE_ATTRIBUTE_RECALL_ON_* flags different providers set. A materialized placeholder — and any
+    // other file, including a sparse, deduplicated, compressed or tiered one — counts at its logical
+    // size, matching the rest of the tree and the macOS dataless-placeholder handling.
+    let unmaterialized_cloud = is_reparse && is_cloud_reparse_tag(reparse_tag) && allocation_size == 0;
     EntryKind::File {
         size: if unmaterialized_cloud { 0 } else { end_of_file as u64 },
     }
@@ -141,16 +180,16 @@ fn classify(attrs: u32, reparse_tag: u32, end_of_file: i64, allocation_size: i64
 /// Read one directory with `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`, which returns
 /// entries with their sizes, times and attributes in batches.
 fn read_dir(
-    dir: &DirJob<OwnedHandle>,
+    dir: &DirJob<WinDir>,
     buffer: &mut [u8],
-    sink: &mut DirSink<'_, OwnedHandle>,
+    sink: &mut DirSink<'_, WinDir>,
     root_volume_serial: u32,
     cross_filesystems: bool,
-) {
+) -> bool {
     loop {
         let ok = unsafe {
             GetFileInformationByHandleEx(
-                dir.handle.as_raw_handle(),
+                dir.handle.handle.as_raw_handle(),
                 FileIdBothDirectoryInfo,
                 buffer.as_mut_ptr() as *mut c_void,
                 buffer.len() as u32,
@@ -201,16 +240,29 @@ fn read_dir(
                             let vid = get_volume_and_id(&child);
                             let same_volume = vid.is_some_and(|(vol, _)| vol == root_volume_serial);
                             if cross_filesystems || same_volume {
-                                let (vol, fid) = vid.unwrap_or((root_volume_serial, info.FileId as u64));
+                                let (vol, fid) = vid.unwrap_or((dir.handle.volume, info.FileId as u64));
+                                let child = WinDir {
+                                    dedupe_hardlinks: if vol == dir.handle.volume {
+                                        dir.handle.dedupe_hardlinks
+                                    } else {
+                                        dedupes_hardlinks(&child)
+                                    },
+                                    handle: child,
+                                    volume: vol,
+                                };
                                 sink.dir(node_id(vol as u64, fid), &name, path, child);
                             }
                         }
                     }
                     EntryKind::File { size } => {
-                        // Unlike Unix, hardlinks are not deduped here: the directory enumeration
-                        // carries no link count, and fetching one per file would require opening
-                        // every file. Hardlinks are rare on NTFS, so files are counted as enumerated.
-                        sink.file(name, size, filetime_to_unix(info.LastWriteTime), None);
+                        // The listing carries no link count, and getting one would mean opening
+                        // every file, so every file goes through the hardlink check. Hardlinks are
+                        // common on a system drive: most of WinSxS is linked into System32.
+                        let hardlink = dir
+                            .handle
+                            .dedupe_hardlinks
+                            .then(|| node_id(dir.handle.volume as u64, info.FileId as u64));
+                        sink.file(name, size, filetime_to_unix(info.LastWriteTime), hardlink);
                     }
                     EntryKind::Skip => {}
                 }
@@ -226,6 +278,7 @@ fn read_dir(
             break;
         }
     }
+    true
 }
 
 #[cfg(test)]
@@ -238,6 +291,10 @@ mod tests {
     const CLOUD_TAG_3: u32 = 0x9000_301A;
     const SYMLINK_TAG: u32 = 0xA000_000C; // IO_REPARSE_TAG_SYMLINK
     const MOUNT_POINT_TAG: u32 = 0xA000_0003; // IO_REPARSE_TAG_MOUNT_POINT (junction)
+    const LX_SYMLINK_TAG: u32 = 0xA000_001D; // IO_REPARSE_TAG_LX_SYMLINK (WSL)
+    const DEDUP_TAG: u32 = 0x8000_0013; // IO_REPARSE_TAG_DEDUP
+    const WOF_TAG: u32 = 0x8000_0017; // IO_REPARSE_TAG_WOF
+    const STORAGE_SYNC_TAG: u32 = 0x8000_001E; // IO_REPARSE_TAG_STORAGE_SYNC (Azure File Sync)
 
     #[test]
     fn regular_file_counts_logical_size() {
@@ -280,6 +337,20 @@ mod tests {
     fn symlink_and_junction_are_skipped() {
         assert_eq!(classify(REPARSE, SYMLINK_TAG, 0, 0), EntryKind::Skip);
         assert_eq!(classify(DIR | REPARSE, MOUNT_POINT_TAG, 0, 0), EntryKind::Skip);
+        assert_eq!(classify(REPARSE, LX_SYMLINK_TAG, 0, 0), EntryKind::Skip);
+    }
+
+    #[test]
+    fn reparse_points_holding_their_own_data_count_at_logical_size() {
+        // Their data lives elsewhere (a chunk store, a compressed stream, the cloud), so nothing is
+        // allocated to the file itself; they are still files, not redirections.
+        for tag in [DEDUP_TAG, WOF_TAG, STORAGE_SYNC_TAG] {
+            assert_eq!(
+                classify(REPARSE, tag, 1_000_000, 0),
+                EntryKind::File { size: 1_000_000 },
+                "{tag:#x}"
+            );
+        }
     }
 
     #[test]

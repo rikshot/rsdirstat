@@ -1,5 +1,6 @@
 use super::dom::{is_hidden, listen, set_hidden};
 use super::*;
+use crate::logic::scan_summary;
 
 impl TreemapApp {
     pub(super) fn send_message(&self, message: ClientMessage) -> Result<(), JsValue> {
@@ -206,17 +207,16 @@ impl TreemapApp {
         set_hidden(&self.chrome.change_button, !new_scan_done)?;
         if !new_scan_done {
             self.start_scan_timer()?;
-        } else if !self.view.scan_done {
-            self.stop_scan_timer();
-            let elapsed = (self.now() - self.session.scan_start_time) / 1000.0;
-            self.chrome.status_element.set_text_content(Some(&format!(
-                "{dir_count} dirs in {elapsed:.1}s — {}",
-                format_size(root_size)
-            )));
         } else {
-            self.chrome
-                .status_element
-                .set_text_content(Some(&format!("{dir_count} dirs — {}", format_size(root_size))));
+            // Timed only when this tab saw the scan finish.
+            let seconds = (!self.view.scan_done).then(|| (self.now() - self.session.scan_start_time) / 1000.0);
+            self.stop_scan_timer();
+            self.chrome.status_element.set_text_content(Some(&scan_summary(
+                dir_count,
+                seconds,
+                root_size,
+                payload.partial,
+            )));
         }
         self.view.scan_done = new_scan_done;
 

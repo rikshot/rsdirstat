@@ -1,12 +1,13 @@
+use std::borrow::Cow;
 use std::ffi::CStr;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::{AsRawFd, OwnedFd};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOutcome, node_id, open_dir, open_dir_at, run_scan};
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, UnixDir, node_id, open_dir, run_scan};
 
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
@@ -37,7 +38,7 @@ static SCAN_ATTRS: libc::attrlist = libc::attrlist {
     forkattr: 0,
 };
 
-pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<ScanOutcome> {
+pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
     scan_cancellable(root, cross_filesystems, tx, Arc::default())
 }
 
@@ -47,30 +48,33 @@ pub fn scan_cancellable(
     cross_filesystems: bool,
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
-) -> Result<ScanOutcome> {
+) -> Result<()> {
     let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
     let meta = std::fs::metadata(&path).context("failed to stat root path")?;
     let fd = open_dir(&path).context("failed to open root directory")?;
     let id = node_id(meta.dev(), meta.ino());
     let root_dev = meta.dev() as i32;
-    Ok(run_scan(&path, fd, id, tx, cancel, move |dir, buffer, sink| {
+    let root = UnixDir::Root(Arc::new(fd));
+    run_scan(&path, root, id, tx, cancel, move |dir, buffer, sink| {
         read_dir(dir, buffer, sink, root_dev, cross_filesystems)
-    }))
+    });
+    Ok(())
 }
 
 /// Read one directory with `getattrlistbulk`, which returns entries and their attributes in
-/// batches, so files need no further syscalls.
+/// batches, so files need no further syscalls. False if it can't be opened.
 fn read_dir(
-    dir: &DirJob<OwnedFd>,
+    dir: &DirJob<UnixDir>,
     buffer: &mut [u8],
-    sink: &mut DirSink<'_, OwnedFd>,
+    sink: &mut DirSink<'_, UnixDir>,
     root_dev: i32,
     cross_filesystems: bool,
-) {
+) -> bool {
+    let Some(fd) = dir.open() else { return false };
     loop {
         let count = unsafe {
             libc::getattrlistbulk(
-                dir.handle.as_raw_fd(),
+                fd.as_raw_fd(),
                 &SCAN_ATTRS as *const libc::attrlist as *mut libc::c_void,
                 buffer.as_mut_ptr() as *mut libc::c_void,
                 buffer.len(),
@@ -103,16 +107,14 @@ fn read_dir(
 
             let entry = &buffer[offset..offset + entry_length];
             if let Some(parsed) = parse_entry(entry)
-                && parsed.name != "."
-                && parsed.name != ".."
+                && !matches!(parsed.c_name.to_bytes(), b"." | b"..")
                 && (cross_filesystems || parsed.dev_id == root_dev)
             {
                 let id = || node_id(parsed.dev_id as u32 as u64, parsed.file_id);
                 match parsed.obj_type {
                     VDIR => {
-                        if let Some(child) = open_dir_at(&dir.handle, parsed.c_name) {
-                            sink.dir(id(), parsed.name, sink.child_path(parsed.name), child);
-                        }
+                        let child = UnixDir::Child(Arc::clone(&fd), parsed.c_name.to_owned());
+                        sink.dir(id(), &parsed.name, sink.child_path(&parsed.name), child);
                     }
                     VREG => {
                         // Unmaterialized cloud placeholders occupy 0 bytes on disk; count them as
@@ -131,11 +133,13 @@ fn read_dir(
             break;
         }
     }
+    true
 }
 
 struct ParsedEntry<'a> {
-    name: &'a str,
-    /// `name` as the NUL-terminated string in the buffer, for opening the entry.
+    /// The name for display: lossy if it isn't UTF-8, which a network filesystem may pass through.
+    name: Cow<'a, str>,
+    /// The name as the NUL-terminated string in the buffer, for opening the entry.
     c_name: &'a CStr,
     dev_id: i32,
     obj_type: u32,
@@ -166,7 +170,6 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
     let returned_file = u32::from_ne_bytes(entry[pos + 12..pos + 16].try_into().ok()?);
     pos += 20;
 
-    let mut name = "";
     let mut c_name = c"";
     let mut dev_id = 0i32;
     let mut obj_type = 0u32;
@@ -197,7 +200,6 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
             return None;
         }
         c_name = CStr::from_bytes_until_nul(&entry[name_start..]).ok()?;
-        name = c_name.to_str().ok()?;
     });
     field!(returned_common & libc::ATTR_CMN_DEVID != 0, 4, {
         dev_id = i32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
@@ -227,7 +229,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
     });
 
     Some(ParsedEntry {
-        name,
+        name: c_name.to_string_lossy(),
         c_name,
         dev_id,
         obj_type,

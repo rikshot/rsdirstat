@@ -83,6 +83,9 @@ pub struct LayoutPayload {
     pub root_size: u64,
     pub dir_count: u32,
     pub scan_done: bool,
+    /// The scan stopped before reading everything (it stalled on a stuck directory), so the tree is
+    /// missing whatever it hadn't reached. Only once `scan_done`.
+    pub partial: bool,
     pub breadcrumb: Vec<BreadcrumbEntry>,
     pub rects: Vec<LayoutRect>,
 }
@@ -420,6 +423,7 @@ mod tests {
             root_size: 10_000,
             dir_count: 3,
             scan_done: true,
+            partial: true,
             breadcrumb: vec![BreadcrumbEntry {
                 id: 7,
                 name: "root".into(),
@@ -435,6 +439,7 @@ mod tests {
             root_size: 5_000_000,
             dir_count: 1000,
             scan_done: false,
+            partial: false,
             breadcrumb: vec![BreadcrumbEntry {
                 id: 0,
                 name: String::new(),

@@ -71,6 +71,9 @@ fn main() -> Result<()> {
     }
 
     handle.join().map_err(|_| anyhow::anyhow!("scan thread panicked"))??;
+    if !tree.complete {
+        eprintln!("The scan stopped early, so these results are incomplete.");
+    }
 
     if args.files {
         top_n(&mut files, args.top, |&(_, _, size)| size);

@@ -127,6 +127,22 @@ struct AppState {
 }
 
 impl AppState {
+    fn new(phase: ScanPhase, root: PathBuf, cross_filesystems: bool) -> Self {
+        Self {
+            scan: ScanState {
+                tree: RwLock::new(DirTree::new()),
+                phase: Mutex::new(phase),
+                root: Mutex::new(root),
+                cross_filesystems,
+            },
+            picker: watch::channel(()).0,
+            tree_changes: watch::channel(()).0,
+            connections: AtomicU64::new(0),
+            connects: AtomicU64::new(0),
+            shutdown: watch::channel(false).0,
+        }
+    }
+
     fn tree_changed(&self) {
         self.tree_changes.send_replace(());
     }
@@ -166,19 +182,7 @@ async fn run_server(args: Args) -> Result<()> {
         }
     };
 
-    let state = Arc::new(AppState {
-        scan: ScanState {
-            tree: RwLock::new(DirTree::new()),
-            phase: Mutex::new(phase),
-            root: Mutex::new(scan_root),
-            cross_filesystems,
-        },
-        picker: watch::channel(()).0,
-        tree_changes: watch::channel(()).0,
-        connections: AtomicU64::new(0),
-        connects: AtomicU64::new(0),
-        shutdown: watch::channel(false).0,
-    });
+    let state = Arc::new(AppState::new(phase, scan_root, cross_filesystems));
 
     if !wait {
         start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart));
@@ -269,12 +273,14 @@ fn update_tab(state: &AppState, view: &mut ViewConfig) -> (Option<Bytes>, Option
     let breadcrumb = tree.breadcrumb(view_root);
     let root_size = tree.nodes.get(&view_root).map_or(0, |node| node.size);
     let dir_count = tree.nodes.len() as u32;
+    let partial = scan_done && !tree.complete;
     drop(tree);
 
     let payload = wire::LayoutPayload {
         root_size,
         dir_count,
         scan_done,
+        partial,
         breadcrumb,
         rects,
     };
@@ -370,7 +376,7 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
         let mut tree = state.scan.tree.write();
         for event in events.drain(..) {
             started |= matches!(event, ScanEvent::ScanStart { .. });
-            let done = matches!(event, ScanEvent::ScanDone);
+            let done = matches!(event, ScanEvent::ScanDone { .. });
             tree.apply(event);
             if done {
                 // Under the tree lock, so no tab lays out the final tree still marked as running.
@@ -384,9 +390,9 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
         state.tree_changed();
     }
 
-    // The scanner stopped without `ScanDone`.
+    // The scanner stopped without `ScanDone`, so the tree isn't marked complete: the page says so.
     if started {
-        state.scan.tree.write().apply(ScanEvent::ScanDone);
+        state.scan.tree.write().recompute_sizes();
         if end_phase(ScanPhase::Done) {
             state.tree_changed();
         }
@@ -701,6 +707,59 @@ async fn volumes_handler() -> Json<Vec<wire::VolumeInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsdirstat_core::scan::{ScanOutcome, ScannedFile};
+
+    /// A finished scan's layouts tell the page whether it read everything: not when it stalled, nor
+    /// when the scanner stopped without saying how it ended.
+    #[test]
+    fn layouts_say_whether_the_scan_read_everything() {
+        for (ending, partial) in [
+            (Some(ScanOutcome::Complete), false),
+            (Some(ScanOutcome::Stalled), true),
+            (None, true),
+        ] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let running = ScanPhase::Running {
+                cancel: Arc::clone(&cancel),
+            };
+            let state = AppState::new(running, PathBuf::from("/root"), false);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let file = ScannedFile {
+                name: "a".into(),
+                size: 10,
+                mtime: 0,
+            };
+            for event in [
+                ScanEvent::ScanStart { path: "root".into() },
+                ScanEvent::Dir {
+                    id: 1,
+                    parent: 0,
+                    name: "root".into(),
+                    mtime: 0,
+                    files: vec![file],
+                },
+            ]
+            .into_iter()
+            .chain(ending.map(|outcome| ScanEvent::ScanDone { outcome }))
+            {
+                tx.send(event).unwrap();
+            }
+            drop(tx);
+            relay_scan(&state, &rx, &cancel);
+
+            let mut view = ViewConfig {
+                viewport: (800.0, 600.0),
+                ..ViewConfig::default()
+            };
+            let (_, layout) = update_tab(&state, &mut view);
+            let Some(wire::ServerMessage::Layout(layout)) = wire::ServerMessage::decode(&layout.unwrap()) else {
+                panic!("expected a layout");
+            };
+            assert!(layout.scan_done, "{ending:?}");
+            assert_eq!(layout.partial, partial, "{ending:?}");
+            assert_eq!(layout.root_size, 10, "{ending:?}");
+        }
+    }
 
     /// A page names a file to reveal, and the server joins that name onto a scanned directory, so a
     /// name that could climb out of it (`..`, a path, an absolute path) must be refused.
