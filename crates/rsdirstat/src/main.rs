@@ -655,7 +655,24 @@ fn reveal(state: &AppState, dir_id: u64, name: Option<&str>) {
         if let Some(name) = name {
             path.push(name);
         }
-        reveal_in_file_manager(&path);
+        reveal_in_file_manager(&without_verbatim_prefix(&path));
+    }
+}
+
+/// `path` without the `\\?\` prefix of the verbatim paths `canonicalize` gives on Windows, which
+/// Explorer doesn't take (`explorer /select,` opens a default folder instead): `\\?\C:\x` is
+/// `C:\x`, and `\\?\UNC\server\share\x` is `\\server\share\x`. Any other path is returned as it is.
+fn without_verbatim_prefix(path: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
+    let Some(rest) = path.to_str().and_then(|path| path.strip_prefix(r"\\?\")) else {
+        return path.into();
+    };
+    if let Some(unc) = rest.strip_prefix(r"UNC\") {
+        return PathBuf::from(format!(r"\\{unc}")).into();
+    }
+    match rest.as_bytes() {
+        [drive, b':', ..] if drive.is_ascii_alphabetic() => PathBuf::from(rest).into(),
+        // `\\?\Volume{GUID}\`, say: no plainer form.
+        _ => path.into(),
     }
 }
 
@@ -826,6 +843,25 @@ mod tests {
         shutdown.send_replace(true);
         let served = tokio::time::timeout(Duration::from_secs(5), serving).await;
         assert!(matches!(served, Ok(Ok(Ok(())))), "{served:?}");
+    }
+
+    #[test]
+    fn revealed_paths_lose_the_verbatim_prefix() {
+        let plain = |path: &str| {
+            without_verbatim_prefix(std::path::Path::new(path))
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(plain(r"\\?\C:\Users\me\x.txt"), r"C:\Users\me\x.txt");
+        assert_eq!(plain(r"\\?\UNC\server\share\x.txt"), r"\\server\share\x.txt");
+        for unchanged in [
+            r"C:\Users\me\x.txt",
+            r"\\?\Volume{0b1c2d3e-0000-0000-0000-100000000000}\x.txt",
+            "/home/me/x.txt",
+        ] {
+            assert_eq!(plain(unchanged), unchanged);
+        }
     }
 
     /// A page names a file to reveal, and the server joins that name onto a scanned directory, so a
