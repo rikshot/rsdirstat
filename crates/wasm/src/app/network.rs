@@ -1,4 +1,4 @@
-use super::dom::{listen, set_hidden, with_app};
+use super::dom::{is_hidden, listen, set_hidden, with_app};
 use super::*;
 
 impl TreemapApp {
@@ -171,7 +171,12 @@ impl TreemapApp {
                 self.surface.canvas.set_attribute("data-scan-done", "false")?;
             }
             Some(ServerMessage::Layout(payload)) => {
-                set_hidden(&self.chrome.treemap_view, false)?;
+                // The first layout reveals the treemap, but one that arrives while the picker is up
+                // (after "Change", the server still has the finished scan) must stay behind it.
+                // Picking a path hides the picker and shows the treemap.
+                if is_hidden(&self.chrome.picker_element) {
+                    set_hidden(&self.chrome.treemap_view, false)?;
+                }
                 self.handle_layout(payload)?;
             }
             None => {}

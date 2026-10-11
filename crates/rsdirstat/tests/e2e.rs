@@ -450,6 +450,35 @@ async fn e2e_unopenable_root_falls_back_to_picker() {
     let _ = browser.close().await;
 }
 
+/// "Change" opens the picker in the page only; the server still has the finished scan and answers a
+/// view change (here a resize) with its layout, which must not bring the treemap back over the
+/// picker.
+#[tokio::test]
+async fn e2e_layouts_stay_behind_the_picker() {
+    let dir = create_test_dir();
+    let server = TestServer::start(dir.path());
+    let (_pw, browser, page) = launch_browser("chromium").await;
+    let label = common::trace_label("chromium", "layouts_stay_behind_the_picker");
+    common::with_trace_unit(&page, &label, async {
+        page.goto(&server.url, None).await.unwrap();
+        wait_for_scan_done(&page).await;
+
+        page.locator("#change").click(None).await.unwrap();
+        let before = layout_seq(&page).await;
+        page.set_viewport_size(playwright_rs::Viewport {
+            width: 1000,
+            height: 700,
+        })
+        .await
+        .unwrap();
+        wait_for_layout_after(&page, before).await;
+        assert!(page.locator("#picker").is_visible().await.unwrap());
+        assert!(!page.locator("#treemap-view").is_visible().await.unwrap());
+    })
+    .await;
+    let _ = browser.close().await;
+}
+
 /// After a finished scan, picking a path that can't be scanned sends the tabs back to the picker,
 /// and they must stay there: the server still holds the old scan's tree, and any view change (here
 /// a resize) once made it send that stale layout, which brought the treemap back.

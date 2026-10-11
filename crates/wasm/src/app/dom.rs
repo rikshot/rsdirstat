@@ -40,6 +40,10 @@ pub(super) fn set_hidden(element: &Element, hidden: bool) -> Result<(), JsValue>
     element.class_list().toggle_with_force("hidden", hidden).map(|_| ())
 }
 
+pub(super) fn is_hidden(element: &Element) -> bool {
+    element.class_list().contains("hidden")
+}
+
 /// Attach a page-lifetime listener that forwards each event to `handler` on the app. The closure
 /// is deliberately leaked: these listeners live as long as the page does.
 pub(super) fn listen<E: FromWasmAbi + 'static>(
