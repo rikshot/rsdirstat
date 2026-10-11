@@ -33,6 +33,7 @@ jobs:
 
   lint:
     needs: fmt
+    name: lint (${{ matrix.os }})
     strategy:
       # The default members leave out the scanner crates, which only compile on their own OS, so
       # each runner adds its own: otherwise their unit tests are never linted, built or run.
@@ -54,6 +55,7 @@ jobs:
 
   test:
     needs: lint
+    name: test (${{ matrix.os }})
     strategy:
       matrix: *with-native-scanner
     runs-on: ${{ matrix.os }}
@@ -137,8 +139,8 @@ jobs:
       - run: trunk build
       # Run under instrumentation: the e2e/visual tests drive the server binary as a
       # subprocess, so this captures server/main.rs coverage that the unit `test` job can't.
-      # The server flushes coverage on SIGTERM (graceful shutdown); Windows hard-kills it,
-      # so only the unix runners contribute server coverage — merged in by Codecov.
+      # The tests stop the server cleanly (SIGTERM, or Ctrl+Break on Windows), so it writes its
+      # coverage on every OS; Codecov merges the uploads.
       - run: cargo llvm-cov nextest --locked --profile ci -E 'test(/^visual/) or test(/^e2e/)' --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v7
         with:
