@@ -63,11 +63,11 @@ fn open_dir(path: &[u16]) -> Option<OwnedHandle> {
     Some(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
-/// Whether the files on `handle`'s volume can be told apart as hardlinks by the 64-bit file id that
-/// directory listings carry: only on NTFS, where every file has one, unique on its volume. ReFS ids
-/// are 128-bit, and FAT and some network shares have no real ids, so there two different files could
-/// share one, and deduplicating them would hide one.
-fn dedupes_hardlinks(handle: &OwnedHandle) -> bool {
+/// Whether the 64-bit file ids that directory listings carry identify the files on `handle`'s
+/// volume: only on NTFS, where every file has one, unique on its volume. ReFS ids are 128-bit, and
+/// FAT and some network shares have no real ids, so there two different files could share one, and
+/// deduplicating hardlinks by them would hide one.
+fn has_unique_file_ids(handle: &OwnedHandle) -> bool {
     let mut filesystem = [0u16; MAX_PATH as usize + 1];
     let ok = unsafe {
         GetVolumeInformationByHandleW(
@@ -106,7 +106,7 @@ pub fn scan(
     let (volume_serial, file_id) = get_volume_and_id(&handle).context("failed to get root directory info")?;
     let id = node_id(volume_serial as u64, file_id);
     let root = WinDir {
-        dedupe_hardlinks: dedupes_hardlinks(&handle),
+        unique_file_ids: has_unique_file_ids(&handle),
         handle,
         volume: volume_serial,
     };
@@ -122,8 +122,8 @@ struct WinDir {
     handle: OwnedHandle,
     /// The serial number of its volume. File ids are unique only within a volume.
     volume: u32,
-    /// See `dedupes_hardlinks`.
-    dedupe_hardlinks: bool,
+    /// See `has_unique_file_ids`.
+    unique_file_ids: bool,
 }
 
 /// What to do with one enumerated directory entry.
@@ -178,6 +178,12 @@ fn classify(attrs: u32, reparse_tag: u32, end_of_file: i64, allocation_size: i64
     }
 }
 
+/// How much of the worker's buffer each listing call is given. The file system filters on a Windows
+/// volume (Defender, compression, bind links, ...) handle every call, and a large buffer costs them:
+/// C:\Windows scans about 10% faster with 64 KiB than with 1 MiB on one thread, 6% on 16. Smaller
+/// gains nothing.
+const LISTING_BUFFER_SIZE: usize = 64 * 1024;
+
 /// Read one directory with `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`, which returns
 /// entries with their sizes, times and attributes in batches.
 fn read_dir(
@@ -187,6 +193,8 @@ fn read_dir(
     root_volume_serial: u32,
     cross_filesystems: bool,
 ) -> bool {
+    let len = LISTING_BUFFER_SIZE.min(buffer.len());
+    let buffer = &mut buffer[..len];
     loop {
         let ok = unsafe {
             GetFileInformationByHandleEx(
@@ -235,18 +243,26 @@ fn read_dir(
                     EntryKind::Directory => {
                         let path = sink.child_path(&name);
                         if let Some(child) = open_dir(&wide(&path)) {
-                            // Authoritative volume serial + file id for node identity; needed for
-                            // every dir (not just the cross-fs check) so the same file id on two
-                            // volumes can't collide.
-                            let vid = get_volume_and_id(&child);
+                            // The volume serial and file id, for node identity (so the same file id
+                            // on two volumes can't collide) and the cross-filesystem check. Only a
+                            // reparse point can lead to another volume (mount points and junctions
+                            // are skipped above; DFS links are another kind), so a plain directory
+                            // is on its parent's, and where listed ids are unique the listing's is
+                            // its own. Asking for them is ~7% of a scan, so only the others are.
+                            let plain = info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
+                            let vid = if plain && dir.handle.unique_file_ids {
+                                Some((dir.handle.volume, info.FileId as u64))
+                            } else {
+                                get_volume_and_id(&child)
+                            };
                             let same_volume = vid.is_some_and(|(vol, _)| vol == root_volume_serial);
                             if cross_filesystems || same_volume {
                                 let (vol, fid) = vid.unwrap_or((dir.handle.volume, info.FileId as u64));
                                 let child = WinDir {
-                                    dedupe_hardlinks: if vol == dir.handle.volume {
-                                        dir.handle.dedupe_hardlinks
+                                    unique_file_ids: if vol == dir.handle.volume {
+                                        dir.handle.unique_file_ids
                                     } else {
-                                        dedupes_hardlinks(&child)
+                                        has_unique_file_ids(&child)
                                     },
                                     handle: child,
                                     volume: vol,
@@ -261,7 +277,7 @@ fn read_dir(
                         // common on a system drive: most of WinSxS is linked into System32.
                         let hardlink = dir
                             .handle
-                            .dedupe_hardlinks
+                            .unique_file_ids
                             .then(|| node_id(dir.handle.volume as u64, info.FileId as u64));
                         sink.file(name, size, filetime_to_unix(info.LastWriteTime), hardlink);
                     }
