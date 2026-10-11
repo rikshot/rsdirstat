@@ -567,3 +567,71 @@ fn e2e_sigterm_mid_scan_exits_promptly() {
         "server took {took:?} to exit after SIGTERM mid-scan"
     );
 }
+
+/// Send a raw GET with the given extra headers and return the status code. `host` overrides the
+/// `Host` header.
+fn http_status(server: &TestServer, path: &str, host: Option<&str>, headers: &[(&str, &str)]) -> u16 {
+    use std::io::{Read, Write};
+    let authority = server.url.trim_start_matches("http://");
+    let port = authority.rsplit_once(':').unwrap().1;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+    let mut request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+        host.unwrap_or(authority)
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    response.split(' ').nth(1).unwrap_or("0").parse().unwrap()
+}
+
+/// A DNS-rebinding page sees this server as same-origin under the attacker's hostname; only its
+/// `Host` header gives it away, so every request must name this machine.
+#[test]
+fn e2e_requests_for_another_host_are_refused() {
+    let server = TestServer::start_picker();
+    assert_eq!(http_status(&server, "/volumes", None, &[]), 200);
+    assert_eq!(http_status(&server, "/volumes", Some("127.0.0.1:1"), &[]), 200);
+    for host in [
+        "attacker.example",
+        "attacker.example:8080",
+        "127.0.0.1.attacker.example",
+    ] {
+        assert_eq!(http_status(&server, "/volumes", Some(host), &[]), 403, "Host: {host}");
+        assert_eq!(http_status(&server, "/", Some(host), &[]), 403, "Host: {host}");
+    }
+}
+
+/// The API endpoints are only for the app's own page. A page on another site can make a browser
+/// send them a request (an `<img src=…/start>` carries no `Origin`), but the browser labels it
+/// cross-site.
+#[test]
+fn e2e_cross_site_api_requests_are_refused() {
+    let server = TestServer::start_picker();
+    for site in ["same-origin", "none"] {
+        assert_eq!(
+            http_status(&server, "/volumes", None, &[("Sec-Fetch-Site", site)]),
+            200,
+            "{site}"
+        );
+    }
+    for path in ["/start", "/volumes"] {
+        for site in ["cross-site", "same-site"] {
+            assert_eq!(
+                http_status(&server, path, None, &[("Sec-Fetch-Site", site)]),
+                403,
+                "{path} {site}"
+            );
+        }
+        let origin = [("Origin", "http://attacker.example")];
+        assert_eq!(
+            http_status(&server, path, None, &origin),
+            403,
+            "{path} from another origin"
+        );
+    }
+}

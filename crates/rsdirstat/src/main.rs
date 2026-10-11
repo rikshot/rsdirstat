@@ -222,7 +222,8 @@ async fn run_server(args: Args) -> Result<()> {
         .route("/volumes", get(volumes_handler))
         .with_state(Arc::clone(&state))
         .fallback(static_handler)
-        .layer(CompressionLayer::new());
+        .layer(CompressionLayer::new())
+        .layer(axum::middleware::from_fn(require_loopback_host));
 
     // Bind loopback only: the UI is always pointed at localhost, and the server exposes full
     // directory listings plus arbitrary-path scans with no auth — there's no reason to accept
@@ -472,9 +473,34 @@ async fn static_handler(uri: Uri) -> Response {
     }
 }
 
-async fn start_handler(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> &'static str {
+async fn start_handler(
+    headers: HeaderMap,
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Response {
+    if !api_request_allowed(&headers) {
+        return forbidden();
+    }
     start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart));
-    "ok"
+    "ok".into_response()
+}
+
+fn forbidden() -> Response {
+    (StatusCode::FORBIDDEN, "request refused: not from this app's own page").into_response()
+}
+
+/// Refuse a request addressed to any host but this machine. The server binds to loopback, but DNS
+/// rebinding can point an attacker's hostname at 127.0.0.1: the browser then treats the attacker's
+/// page as same-origin with this server (no `Origin` on a same-origin GET), and only the `Host`
+/// header still carries the attacker's name. Requests without one (not from a browser) pass.
+async fn require_loopback_host(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let allowed = request
+        .headers()
+        .get(header::HOST)
+        .is_none_or(|host| host.to_str().is_ok_and(authority_is_loopback));
+    if !allowed {
+        return (StatusCode::FORBIDDEN, "request refused: unexpected Host").into_response();
+    }
+    next.run(request).await
 }
 
 async fn ws_handler(
@@ -485,25 +511,34 @@ async fn ws_handler(
     // Reject cross-origin upgrades. Binding to loopback stops remote hosts, but the server has no
     // auth and exposes the filesystem, so a malicious page in the user's own browser could
     // otherwise connect to ws://127.0.0.1 and drive the protocol (cross-origin WS / DNS rebinding).
-    if !origin_allowed(&headers) {
-        return (StatusCode::FORBIDDEN, "cross-origin WebSocket rejected").into_response();
+    if !api_request_allowed(&headers) {
+        return forbidden();
     }
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
-/// Allow an upgrade with no `Origin` (non-browser clients never send one) or a loopback `Origin`.
-/// Browsers always send `Origin` on a WS handshake, so this rejects the cross-origin browser case
-/// without affecting local tooling.
-fn origin_allowed(headers: &HeaderMap) -> bool {
-    match headers.get(header::ORIGIN) {
-        None => true,
-        Some(origin) => origin.to_str().map(origin_is_loopback).unwrap_or(false),
-    }
+/// Whether a request to an API endpoint (`/ws`, `/start`, `/volumes`) comes from this app's own
+/// page, a URL the user typed, or a non-browser client. Browsers label every request with
+/// `Sec-Fetch-Site`, so a page on another site can't reach these even where CORS wouldn't stop it
+/// (an `<img src=…/start>` carries no `Origin`); an `Origin`, when sent, must be loopback too.
+fn api_request_allowed(headers: &HeaderMap) -> bool {
+    let origin_ok = headers
+        .get(header::ORIGIN)
+        .is_none_or(|origin| origin.to_str().is_ok_and(origin_is_loopback));
+    let site_ok = headers
+        .get("sec-fetch-site")
+        .is_none_or(|site| matches!(site.as_bytes(), b"same-origin" | b"none"));
+    origin_ok && site_ok
 }
 
 fn origin_is_loopback(origin: &str) -> bool {
     let rest = origin.split_once("://").map_or(origin, |(_, r)| r);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority_is_loopback(rest.split(['/', '?', '#']).next().unwrap_or(""))
+}
+
+/// Whether `authority` (`host[:port]`, as in a `Host` header or an origin) names this machine:
+/// `localhost` or a loopback IP.
+fn authority_is_loopback(authority: &str) -> bool {
     let host = if let Some(after) = authority.strip_prefix('[') {
         after.split(']').next().unwrap_or("") // IPv6 literal: [host]:port
     } else {
@@ -716,12 +751,14 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
     }
 }
 
-async fn volumes_handler() -> Json<Vec<wire::VolumeInfo>> {
-    Json(
-        tokio::task::spawn_blocking(scanner::volumes::list_volumes)
-            .await
-            .unwrap_or_default(),
-    )
+async fn volumes_handler(headers: HeaderMap) -> Response {
+    if !api_request_allowed(&headers) {
+        return forbidden();
+    }
+    let volumes = tokio::task::spawn_blocking(scanner::volumes::list_volumes)
+        .await
+        .unwrap_or_default();
+    Json(volumes).into_response()
 }
 
 #[cfg(test)]
@@ -740,6 +777,45 @@ mod tests {
         ] {
             assert!(origin_is_loopback(origin), "{origin} should be allowed");
         }
+    }
+
+    #[test]
+    fn host_headers_must_name_this_machine() {
+        for host in ["localhost:8080", "LOCALHOST", "127.0.0.1:3000", "[::1]:8080"] {
+            assert!(authority_is_loopback(host), "{host} should be allowed");
+        }
+        for host in [
+            "attacker.example",
+            "127.0.0.1.attacker.example:80",
+            "[::2]:80",
+            "0.0.0.0:80",
+            "",
+        ] {
+            assert!(!authority_is_loopback(host), "{host} should be refused");
+        }
+    }
+
+    #[test]
+    fn api_requests_must_come_from_this_app() {
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut headers = HeaderMap::new();
+            for &(name, value) in pairs {
+                headers.insert(name, value.parse().unwrap());
+            }
+            headers
+        };
+        assert!(
+            api_request_allowed(&headers(&[])),
+            "non-browser clients send neither header"
+        );
+        assert!(api_request_allowed(&headers(&[
+            ("sec-fetch-site", "same-origin"),
+            ("origin", "http://localhost:8080"),
+        ])));
+        assert!(api_request_allowed(&headers(&[("sec-fetch-site", "none")])));
+        assert!(!api_request_allowed(&headers(&[("sec-fetch-site", "cross-site")])));
+        assert!(!api_request_allowed(&headers(&[("sec-fetch-site", "same-site")])));
+        assert!(!api_request_allowed(&headers(&[("origin", "http://attacker.example")])));
     }
 
     #[test]
