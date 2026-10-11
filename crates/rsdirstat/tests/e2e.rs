@@ -204,6 +204,33 @@ async fn hover_canvas_at(page: &playwright_rs::Page, x: f64, y: f64) {
     page.locator("#treemap").hover(Some(at)).await.unwrap();
 }
 
+/// The server keeps one view across reloads, so a reloaded page must send its toolbar's values
+/// (defaults, or whatever the browser restored) or the treemap and the toolbar disagree.
+/// Regression: after a reload the toolbar showed an empty name filter while the server kept
+/// filtering by the old one.
+async fn reload_keeps_treemap_in_sync_with_toolbar(page: &playwright_rs::Page) {
+    let before = layout_seq(page).await;
+    page.locator("#filter-name")
+        .fill("matches-nothing", None)
+        .await
+        .unwrap();
+    wait_for_layout_after(page, before).await;
+
+    page.reload(None).await.unwrap();
+    wait_for_scan_done(page).await;
+
+    // With the filter gone, the bottom-left of the canvas is `src/main.rs` again; with it still
+    // applied, there is nothing there to hover.
+    let filter = page.locator("#filter-name").input_value(None).await.unwrap();
+    hover_canvas_at(page, 20.0, canvas_height(page).await - 5.0).await;
+    let path_text = expect(page.locator("#path-text"));
+    if filter.is_empty() {
+        path_text.to_have_text_regex(r"/src/main\.rs$").await.unwrap();
+    } else {
+        path_text.to_have_text("").await.unwrap();
+    }
+}
+
 async fn click_navigates_into_directory(page: &playwright_rs::Page) {
     let crumbs = page.locator("#crumbs");
     let initial_text = crumbs.text_content().await.unwrap().unwrap();
@@ -364,6 +391,7 @@ browser_tests! {
     breadcrumb_back => breadcrumb_click_navigates_back,
     click_leaf_dir => click_navigates_into_directory in leaf_dir,
     rescan => rescan_button_works,
+    reload => reload_keeps_treemap_in_sync_with_toolbar,
     // In-browser unit checks of the actual wasm exports.
     js_unit_tests => js_unit_tests,
 }

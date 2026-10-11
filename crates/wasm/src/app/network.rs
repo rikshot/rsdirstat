@@ -119,6 +119,12 @@ impl TreemapApp {
                 .status_element
                 .set_text_content(Some("Connected. Waiting for scan..."));
         }
+        // The server keeps its view settings across reloads, but a reloaded page's toolbar starts
+        // from its defaults (or values the browser restored). Send them, before the viewport that
+        // triggers the first layout, so the treemap always matches what the toolbar shows.
+        self.handle_depth_change()?;
+        self.handle_color_mode_change()?;
+        self.send_filter_now()?;
         self.send_viewport()
     }
 
