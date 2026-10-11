@@ -155,10 +155,19 @@ impl AppState {
     }
 }
 
+/// How long shutdown waits for blocking tasks before exiting anyway (see `main`).
+const BLOCKING_TASK_GRACE: Duration = Duration::from_secs(2);
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_server(args))
+    let result = rt.block_on(run_server(args));
+    // Dropping the runtime would wait for every blocking task, and one can be stuck in a syscall on
+    // a dead network mount (a scan of it, or `statvfs` for /volumes) for as long as the mount takes
+    // to time out, if it ever does. A healthy scan stops within ~200ms of being cancelled, so give
+    // the tasks a moment, then exit regardless.
+    rt.shutdown_timeout(BLOCKING_TASK_GRACE);
+    result
 }
 
 async fn run_server(args: Args) -> Result<()> {
