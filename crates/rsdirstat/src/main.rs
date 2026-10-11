@@ -91,19 +91,29 @@ struct ScanState {
     cross_filesystems: bool,
 }
 
-/// Encoded messages are `Bytes` so the snapshot and every receiver share one buffer.
+/// How messages reach the open tabs. Encoded messages are `Bytes`, so every tab shares one buffer.
 struct LayoutBroadcast {
-    tx: broadcast::Sender<Bytes>,
-    last: Mutex<Option<Bytes>>,
+    /// The newest layout. A layout is "latest state", not a stream: a new tab gets it at once, and a
+    /// slow tab skips straight to it instead of working through a queue of stale ~1 MB layouts.
+    latest: watch::Sender<Option<Bytes>>,
+    /// Messages every tab must see, in order: `ScanStart` and `PickerMode`.
+    events: broadcast::Sender<Bytes>,
+    /// Wakes the layout loop.
     notify: Notify,
+}
+
+impl LayoutBroadcast {
+    fn send_event(&self, message: wire::ServerMessage) {
+        let _ = self.events.send(message.encode().into());
+    }
 }
 
 struct AppState {
     scan: ScanState,
     view: Mutex<ViewConfig>,
     layout: LayoutBroadcast,
-    /// Open WebSocket connections (see `Connection`); the layout loop idles at zero and the server
-    /// exits after a grace period once the last one closes.
+    /// Open WebSocket connections (see `Connection`); the server exits after a grace period once the
+    /// last one closes.
     connections: AtomicU64,
     /// Connections ever opened. A shutdown timer only fires if this hasn't moved since it was armed.
     connects: AtomicU64,
@@ -126,7 +136,7 @@ impl AppState {
         }
         *phase = ScanPhase::AwaitingPath;
         drop(phase);
-        let _ = self.layout.tx.send(wire::ServerMessage::PickerMode.encode().into());
+        self.layout.send_event(wire::ServerMessage::PickerMode);
     }
 
     /// Mutate the view config under its lock, then trigger a relayout if anything changed.
@@ -158,7 +168,6 @@ async fn run_server(args: Args) -> Result<()> {
         no_open,
         wait,
     } = args;
-    let (layout_tx, _) = broadcast::channel::<Bytes>(64);
     let picker_mode = path.is_none();
     // Canonicalize once, here at the boundary, and fail fast: a mistyped path is an error on the
     // command line, not a browser tab that opens on the volume picker.
@@ -186,8 +195,9 @@ async fn run_server(args: Args) -> Result<()> {
             filter: FilterConfig::default(),
         }),
         layout: LayoutBroadcast {
-            tx: layout_tx,
-            last: Mutex::new(None),
+            latest: watch::channel(None).0,
+            // Events are rare (one per scan or picker switch), so a small buffer never lags.
+            events: broadcast::channel(16).0,
             notify: Notify::new(),
         },
         connections: AtomicU64::new(0),
@@ -253,7 +263,7 @@ async fn layout_loop(state: Arc<AppState>) {
         }
 
         let current_version = state.scan.version.load(Ordering::Acquire);
-        if current_version == last_version || state.connections.load(Ordering::Relaxed) == 0 {
+        if current_version == last_version || state.layout.latest.receiver_count() == 0 {
             continue;
         }
         // No layouts while waiting for a path or for Start: the tree may still hold an earlier
@@ -304,8 +314,7 @@ async fn layout_loop(state: Arc<AppState>) {
             })
             .encode(),
         );
-        *state.layout.last.lock() = Some(message.clone());
-        let _ = state.layout.tx.send(message);
+        state.layout.latest.send_replace(Some(message));
 
         last_version = current_version;
         last_compute = Instant::now();
@@ -400,10 +409,9 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
                 ScanEvent::ScanStart { path } => {
                     started = true;
                     state.view.lock().view_root = None;
-                    let _ = state
+                    state
                         .layout
-                        .tx
-                        .send(wire::ServerMessage::ScanStart { path: path.clone() }.encode().into());
+                        .send_event(wire::ServerMessage::ScanStart { path: path.clone() });
                 }
                 ScanEvent::ScanDone => done = true,
                 _ => {}
@@ -431,7 +439,7 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
             state.invalidate_layout();
         }
     } else if end_phase(ScanPhase::AwaitingPath) {
-        let _ = state.layout.tx.send(wire::ServerMessage::PickerMode.encode().into());
+        state.layout.send_event(wire::ServerMessage::PickerMode);
     }
 }
 
@@ -554,24 +562,22 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     // Held to the end of the handler, including the early returns when a send fails.
     let _connection = Connection::open(&state);
 
-    // Subscribe before reading the snapshot: a layout produced between the snapshot read and the
-    // subscribe would otherwise be lost to this client (absent from the snapshot, broadcast before
-    // we were listening) — and if it were the final one, the client would be stuck on a stale view.
-    // A layout that lands in the overlap is merely delivered twice, which the client tolerates.
-    let mut layout_rx = state.layout.tx.subscribe();
+    let mut events = state.layout.events.subscribe();
+    let mut layouts = state.layout.latest.subscribe();
     let mut shutdown_rx = state.shutdown.subscribe();
 
     // A new client starts on the picker while the server waits for a path, else on the latest
     // layout (a reload while a previous scan's result is still current).
     let awaiting_path = matches!(*state.scan.phase.lock(), ScanPhase::AwaitingPath);
-    let initial = if awaiting_path {
-        Some(wire::ServerMessage::PickerMode.encode().into())
+    let sent = if awaiting_path {
+        socket
+            .send(Message::Binary(wire::ServerMessage::PickerMode.encode().into()))
+            .await
+            .is_ok()
     } else {
-        state.layout.last.lock().clone()
+        send_latest_layout(&mut socket, &mut events, &mut layouts).await
     };
-    if let Some(message) = initial
-        && socket.send(Message::Binary(message)).await.is_err()
-    {
+    if !sent {
         return;
     }
 
@@ -586,19 +592,53 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
                     _ => break,
                 }
             }
-            result = layout_rx.recv() => {
-                match result {
+            event = events.recv() => {
+                match event {
                     Ok(message) => {
                         if socket.send(Message::Binary(message)).await.is_err() {
                             break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(_) => break,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            changed = layouts.changed() => {
+                if changed.is_err() || !send_latest_layout(&mut socket, &mut events, &mut layouts).await {
+                    break;
                 }
             }
             _ = shutdown_rx.changed() => break,
         }
+    }
+}
+
+/// Send the newest layout, if there is one, after any events still queued for this tab. Events and
+/// layouts travel on separate channels, but an event sent before a layout was computed must arrive
+/// first: a new scan's `ScanStart` clears the page, so arriving after that scan's first layout it
+/// would wipe it, and a small scan may have no later layout to redraw it. The relay sends
+/// `ScanStart` before it touches the tree, so it is always in the queue by the time a layout of the
+/// new tree can be seen. Returns false once the socket is closed.
+async fn send_latest_layout(
+    socket: &mut WebSocket,
+    events: &mut broadcast::Receiver<Bytes>,
+    layouts: &mut watch::Receiver<Option<Bytes>>,
+) -> bool {
+    loop {
+        match events.try_recv() {
+            Ok(message) => {
+                if socket.send(Message::Binary(message)).await.is_err() {
+                    return false;
+                }
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(_) => break,
+        }
+    }
+    let layout = layouts.borrow_and_update().clone();
+    match layout {
+        Some(layout) => socket.send(Message::Binary(layout)).await.is_ok(),
+        None => true,
     }
 }
 
