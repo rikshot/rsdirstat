@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::color::{hash_name, hue_for_extension};
 use crate::scan::{ScanEvent, ScanOutcome, ScannedFile};
@@ -105,7 +105,8 @@ pub use rsdirstat_protocol::BreadcrumbEntry;
 pub struct DirTree {
     pub nodes: NodeMap<DirNode>,
     pub root_id: Option<u64>,
-    pub scan_path: String,
+    /// The scan root as people see it (from `ScanStart`); `full_path` joins names onto it.
+    pub root_path: PathBuf,
     pub mtime_range: (i64, i64),
     /// How many scans have started on this tree (each `ScanStart` applied replaces its contents),
     /// so a change means it holds a different scan.
@@ -129,7 +130,7 @@ impl DirTree {
         Self {
             nodes: NodeMap::default(),
             root_id: None,
-            scan_path: String::new(),
+            root_path: PathBuf::new(),
             mtime_range: (i64::MAX, 0),
             scans: 0,
             changes: 0,
@@ -138,23 +139,17 @@ impl DirTree {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.nodes.clear();
-        self.root_id = None;
-        self.scan_path.clear();
-        self.mtime_range = (i64::MAX, 0);
-        self.complete = false;
-        self.hue_cache.clear();
-    }
-
     /// Fold one scanner event into the tree; `ScanDone` finalizes the recursive sizes.
     pub fn apply(&mut self, event: ScanEvent) {
         self.changes += 1;
         match event {
-            ScanEvent::ScanStart { path } => {
-                self.clear();
-                self.scan_path = path;
-                self.scans += 1;
+            ScanEvent::ScanStart { root } => {
+                *self = Self {
+                    root_path: root,
+                    scans: self.scans + 1,
+                    changes: self.changes,
+                    ..Self::new()
+                };
             }
             ScanEvent::Dir {
                 id,
@@ -163,7 +158,7 @@ impl DirTree {
                 mtime,
                 files,
             } => {
-                let size = files.iter().fold(0u64, |total, file| total.saturating_add(file.size));
+                let size = ScannedFile::total(&files);
                 self.insert_files(id, files);
                 self.insert_dir(id, parent, name, size, mtime);
             }
@@ -329,12 +324,10 @@ impl DirTree {
         // the server calls this on every layout.
         for _ in 0..=self.nodes.len() {
             let Some(node) = self.nodes.get(&current) else { break };
-            let name = if node.name.is_empty() {
-                self.scan_path.clone()
-            } else {
-                node.name.to_string()
-            };
-            path.push(BreadcrumbEntry { id: current, name });
+            path.push(BreadcrumbEntry {
+                id: current,
+                name: node.name.to_string(),
+            });
             if current == root_id || node.parent == 0 {
                 break;
             }
@@ -344,7 +337,8 @@ impl DirTree {
         path
     }
 
-    pub fn full_path(&self, node_id: u64, root_path: &Path) -> Option<PathBuf> {
+    /// Where directory `node_id` is: its names joined onto `root_path`.
+    pub fn full_path(&self, node_id: u64) -> Option<PathBuf> {
         let root_id = self.root_id?;
         let mut parts: Vec<&str> = Vec::new();
         let mut current = node_id;
@@ -360,7 +354,7 @@ impl DirTree {
             }
             current = node.parent;
         }
-        let mut path = root_path.to_path_buf();
+        let mut path = self.root_path.clone();
         path.extend(parts.iter().rev());
         Some(path)
     }
@@ -369,7 +363,6 @@ impl DirTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     /// Build sample tree:
     ///   root (id=1, size=0)
@@ -518,7 +511,7 @@ mod tests {
             mtime,
         };
         let mut tree = DirTree::new();
-        tree.apply(ScanEvent::ScanStart { path: "root".into() });
+        tree.apply(ScanEvent::ScanStart { root: "/root".into() });
         tree.apply(ScanEvent::Dir {
             id: 1,
             parent: 0,
@@ -545,7 +538,7 @@ mod tests {
         let mut tree = DirTree::new();
         assert_eq!(tree.scans, 0);
         for scans in 1..=2 {
-            tree.apply(ScanEvent::ScanStart { path: "root".into() });
+            tree.apply(ScanEvent::ScanStart { root: "/root".into() });
             assert_eq!(tree.scans, scans);
         }
     }
@@ -558,7 +551,7 @@ mod tests {
             (ScanOutcome::Stalled, false),
             (ScanOutcome::Cancelled, false),
         ] {
-            tree.apply(ScanEvent::ScanStart { path: "root".into() });
+            tree.apply(ScanEvent::ScanStart { root: "/root".into() });
             assert!(!tree.complete, "a running scan isn't complete");
             tree.apply(ScanEvent::ScanDone { outcome });
             assert_eq!(tree.complete, complete, "{outcome:?}");
@@ -570,7 +563,7 @@ mod tests {
         let tree = DirTree::new();
         assert!(tree.nodes.is_empty());
         assert!(tree.root_id.is_none());
-        assert!(tree.scan_path.is_empty());
+        assert_eq!(tree.root_path, PathBuf::new());
         assert_eq!(tree.mtime_range, (i64::MAX, 0));
     }
 
@@ -718,37 +711,40 @@ mod tests {
         assert!(pos(3) < pos(1));
     }
 
+    /// `sample_tree`, scanned from `/home/user`.
+    fn tree_at_home() -> DirTree {
+        DirTree {
+            root_path: "/home/user".into(),
+            ..sample_tree()
+        }
+    }
+
     #[test]
     fn full_path_root_returns_root_path() {
-        let tree = sample_tree();
-        let p = tree.full_path(1, Path::new("/home/user")).unwrap();
-        assert_eq!(p, PathBuf::from("/home/user"));
+        assert_eq!(tree_at_home().full_path(1).unwrap(), PathBuf::from("/home/user"));
     }
 
     #[test]
     fn full_path_single_level() {
-        let tree = sample_tree();
-        let p = tree.full_path(2, Path::new("/home/user")).unwrap();
-        assert_eq!(p, PathBuf::from("/home/user/dir_a"));
+        assert_eq!(tree_at_home().full_path(2).unwrap(), PathBuf::from("/home/user/dir_a"));
     }
 
     #[test]
     fn full_path_multi_level() {
-        let tree = sample_tree();
-        let p = tree.full_path(4, Path::new("/home/user")).unwrap();
-        assert_eq!(p, PathBuf::from("/home/user/dir_a/dir_c"));
+        assert_eq!(
+            tree_at_home().full_path(4).unwrap(),
+            PathBuf::from("/home/user/dir_a/dir_c")
+        );
     }
 
     #[test]
     fn full_path_no_root_returns_none() {
-        let tree = DirTree::new();
-        assert!(tree.full_path(1, Path::new("/tmp")).is_none());
+        assert!(DirTree::new().full_path(1).is_none());
     }
 
     #[test]
     fn full_path_missing_node_returns_none() {
-        let tree = sample_tree();
-        assert!(tree.full_path(999, Path::new("/tmp")).is_none());
+        assert!(tree_at_home().full_path(999).is_none());
     }
 
     #[test]
@@ -772,23 +768,16 @@ mod tests {
     }
 
     #[test]
-    fn breadcrumb_root_uses_scan_path_when_name_empty() {
-        let mut tree = DirTree::new();
-        tree.insert_dir(1, 0, "", 0, 100);
-        tree.scan_path = "/mnt/data".into();
-        let crumbs = tree.breadcrumb(1);
-        assert_eq!(crumbs[0].name, "/mnt/data");
-    }
-
-    #[test]
-    fn clear_resets_everything() {
-        let mut tree = sample_tree();
-        tree.scan_path = "/some/path".into();
-        tree.clear();
+    fn a_new_scan_starts_from_an_empty_tree() {
+        let mut tree = tree_at_home();
+        tree.apply(ScanEvent::ScanStart {
+            root: "/mnt/data".into(),
+        });
         assert!(tree.nodes.is_empty());
         assert!(tree.root_id.is_none());
-        assert!(tree.scan_path.is_empty());
+        assert_eq!(tree.root_path, PathBuf::from("/mnt/data"));
         assert_eq!(tree.mtime_range, (i64::MAX, 0));
+        assert_eq!((tree.scans, tree.changes), (1, 1), "only the counters carry over");
     }
 
     #[test]

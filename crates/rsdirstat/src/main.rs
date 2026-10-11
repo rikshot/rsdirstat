@@ -286,12 +286,7 @@ fn update_tab(state: &AppState, view: &mut ViewConfig) -> (Option<Bytes>, Option
     let scan_start = (view.scan != tree.scans).then(|| {
         view.scan = tree.scans;
         view.view_root = None;
-        Bytes::from(
-            wire::ServerMessage::ScanStart {
-                path: tree.scan_path.clone(),
-            }
-            .encode(),
-        )
+        Bytes::from(wire::ServerMessage::ScanStart.encode())
     });
     let (vw, vh) = view.viewport;
     let Some(root_id) = tree.root_id.filter(|_| vw > 0.0 && vh > 0.0) else {
@@ -400,7 +395,7 @@ fn start_scan(state: &Arc<AppState>, root: Option<PathBuf>, allowed: impl FnOnce
     let cross_filesystems = state.scan.cross_filesystems;
     tokio::task::spawn_blocking(move || {
         // On failure the scanner drops `tx` without sending anything; the relay takes it from there.
-        if let Err(e) = scanner::scan::scan_cancellable(&path, cross_filesystems, tx, cancel) {
+        if let Err(e) = scanner::scan::scan(&path, cross_filesystems, tx, cancel) {
             eprintln!("Scan error: {e:#}");
         }
     });
@@ -695,31 +690,13 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
 
 /// Reveal directory `dir_id`, or the file `name` inside it, in the platform file manager.
 fn reveal(state: &AppState, dir_id: u64, name: Option<&str>) {
-    let root = state.scan.root.lock().clone();
-    let dir = state.scan.tree.read().full_path(dir_id, &root);
-    if let Some(mut path) = dir {
-        if let Some(name) = name {
-            path.push(name);
-        }
-        reveal_in_file_manager(&without_verbatim_prefix(&path));
-    }
-}
-
-/// `path` without the `\\?\` prefix of the verbatim paths `canonicalize` gives on Windows, which
-/// Explorer doesn't take (`explorer /select,` opens a default folder instead): `\\?\C:\x` is
-/// `C:\x`, and `\\?\UNC\server\share\x` is `\\server\share\x`. Any other path is returned as it is.
-fn without_verbatim_prefix(path: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
-    let Some(rest) = path.to_str().and_then(|path| path.strip_prefix(r"\\?\")) else {
-        return path.into();
+    let Some(mut path) = state.scan.tree.read().full_path(dir_id) else {
+        return;
     };
-    if let Some(unc) = rest.strip_prefix(r"UNC\") {
-        return PathBuf::from(format!(r"\\{unc}")).into();
+    if let Some(name) = name {
+        path.push(name);
     }
-    match rest.as_bytes() {
-        [drive, b':', ..] if drive.is_ascii_alphabetic() => PathBuf::from(rest).into(),
-        // `\\?\Volume{GUID}\`, say: no plainer form.
-        _ => path.into(),
-    }
+    reveal_in_file_manager(&path);
 }
 
 fn reveal_in_file_manager(path: &std::path::Path) {
@@ -827,7 +804,7 @@ mod tests {
             mtime: 0,
         };
         for event in [
-            ScanEvent::ScanStart { path: "root".into() },
+            ScanEvent::ScanStart { root: "/root".into() },
             ScanEvent::Dir {
                 id: 1,
                 parent: 0,
@@ -936,25 +913,6 @@ mod tests {
         shutdown.send_replace(true);
         let served = tokio::time::timeout(Duration::from_secs(5), serving).await;
         assert!(matches!(served, Ok(Ok(Ok(())))), "{served:?}");
-    }
-
-    #[test]
-    fn revealed_paths_lose_the_verbatim_prefix() {
-        let plain = |path: &str| {
-            without_verbatim_prefix(std::path::Path::new(path))
-                .to_str()
-                .unwrap()
-                .to_owned()
-        };
-        assert_eq!(plain(r"\\?\C:\Users\me\x.txt"), r"C:\Users\me\x.txt");
-        assert_eq!(plain(r"\\?\UNC\server\share\x.txt"), r"\\server\share\x.txt");
-        for unchanged in [
-            r"C:\Users\me\x.txt",
-            r"\\?\Volume{0b1c2d3e-0000-0000-0000-100000000000}\x.txt",
-            "/home/me/x.txt",
-        ] {
-            assert_eq!(plain(unchanged), unchanged);
-        }
     }
 
     /// A page names a file to reveal, and the server joins that name onto a scanned directory, so a

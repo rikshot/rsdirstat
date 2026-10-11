@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, UnixDir, node_id, open_dir, run_scan};
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, UnixDir, cpu_count, node_id, open_dir, run_scan};
 
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
@@ -84,16 +84,15 @@ struct Statx {
     _spare3: [u64; 12],
 }
 
-/// `statx` the entry `name` of `dirfd`. A directory that is a mount point reports the mounted
-/// filesystem's root, without triggering an automount.
-fn statx_path(dirfd: i32, name: *const libc::c_char, mask: u32) -> Option<Statx> {
+/// `statx` the entry `name` of `dirfd`, from cached attributes where the filesystem keeps them.
+fn statx(dirfd: i32, name: &CStr, flags: libc::c_int, mask: u32) -> Option<Statx> {
     let mut buf = Statx::default();
     let ret = unsafe {
         libc::syscall(
             libc::SYS_statx,
             dirfd,
-            name,
-            libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT | AT_STATX_DONT_SYNC,
+            name.as_ptr(),
+            flags | AT_STATX_DONT_SYNC,
             mask,
             &mut buf as *mut Statx,
         )
@@ -101,27 +100,20 @@ fn statx_path(dirfd: i32, name: *const libc::c_char, mask: u32) -> Option<Statx>
     if ret == 0 { Some(buf) } else { None }
 }
 
+/// `statx` the entry `name` of `dirfd`. A directory that is a mount point reports the mounted
+/// filesystem's root, without triggering an automount.
+fn statx_path(dirfd: i32, name: &CStr, mask: u32) -> Option<Statx> {
+    statx(dirfd, name, libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT, mask)
+}
+
+/// `statx` the open file `fd`.
 fn statx_fd(fd: i32, mask: u32) -> Option<Statx> {
-    let mut buf = Statx::default();
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_statx,
-            fd,
-            c"".as_ptr(),
-            libc::AT_EMPTY_PATH | AT_STATX_DONT_SYNC,
-            mask,
-            &mut buf as *mut Statx,
-        )
-    };
-    if ret == 0 { Some(buf) } else { None }
+    statx(fd, c"", libc::AT_EMPTY_PATH, mask)
 }
 
-pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
-    scan_cancellable(root, cross_filesystems, tx, Arc::default())
-}
-
-/// Scan, aborting promptly if `cancel` is set (the server sets it when it shuts down mid-scan).
-pub fn scan_cancellable(
+/// Scan `root`, stopping promptly once `cancel` is set (the server sets it when it shuts down
+/// mid-scan).
+pub fn scan(
     root: &Path,
     cross_filesystems: bool,
     tx: std::sync::mpsc::Sender<ScanEvent>,
@@ -132,9 +124,15 @@ pub fn scan_cancellable(
     let sx = statx_fd(fd.as_raw_fd(), DIR_STATX_MASK).context("failed to statx root directory")?;
     let root_filesystem = filesystem(&sx);
     let root = UnixDir::Root(Arc::new(fd));
-    run_scan(&path, root, dir_id(&sx), tx, cancel, move |dir, buffer, sink| {
-        read_dir(dir, buffer, sink, root_filesystem, cross_filesystems)
-    });
+    run_scan(
+        &path,
+        root,
+        dir_id(&sx),
+        tx,
+        cancel,
+        cpu_count(),
+        move |dir, buffer, sink| read_dir(dir, buffer, sink, root_filesystem, cross_filesystems),
+    );
     Ok(())
 }
 
@@ -204,7 +202,7 @@ fn read_dir(
             // also asks for everything a file or directory needs, so either costs one statx.
             let (entry_type, stat) = if d_type == 0 {
                 let mask = STATX_TYPE | STATX_MODE | FILE_STATX_MASK | DIR_STATX_MASK;
-                let Some(sx) = statx_path(dir_fd, name.as_ptr(), mask) else {
+                let Some(sx) = statx_path(dir_fd, name, mask) else {
                     continue;
                 };
                 match sx.stx_mode as u32 & libc::S_IFMT {
@@ -220,7 +218,7 @@ fn read_dir(
                 DT_DIR => {
                     // By name, so a mount point outside the root's filesystem is skipped without
                     // being opened. The directory is opened only when a worker gets to it.
-                    let Some(sx) = stat.or_else(|| statx_path(dir_fd, name.as_ptr(), DIR_STATX_MASK)) else {
+                    let Some(sx) = stat.or_else(|| statx_path(dir_fd, name, DIR_STATX_MASK)) else {
                         continue;
                     };
                     if !cross_filesystems && filesystem(&sx) != root_filesystem {
@@ -230,7 +228,7 @@ fn read_dir(
                     sink.dir(dir_id(&sx), &display_name, sink.child_path(&display_name), child);
                 }
                 DT_REG => {
-                    if let Some(sx) = stat.or_else(|| statx_path(dir_fd, name.as_ptr(), FILE_STATX_MASK)) {
+                    if let Some(sx) = stat.or_else(|| statx_path(dir_fd, name, FILE_STATX_MASK)) {
                         // Hardlink identity: the entry's inode (d_ino) with the file's device.
                         let hardlink =
                             (sx.stx_nlink > 1).then(|| node_id(makedev(sx.stx_dev_major, sx.stx_dev_minor), d_ino));

@@ -3,16 +3,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
 };
 
-use crate::scan::wide_str;
+use crate::scan::{from_wide, wide};
 
 const DRIVE_REMOVABLE: u32 = 2;
 const DRIVE_FIXED: u32 = 3;
-
-/// Decode a fixed-size, NUL-terminated UTF-16 buffer up to its first NUL.
-fn utf16_to_string(buf: &[u16]) -> String {
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    String::from_utf16_lossy(&buf[..len])
-}
 
 pub fn list_volumes() -> Vec<VolumeInfo> {
     let mut volumes = Vec::new();
@@ -24,7 +18,7 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
         }
 
         let mount = format!("{}:\\", (b'A' + i as u8) as char);
-        let root = wide_str(&mount);
+        let root = wide(&mount);
 
         let drive_type = unsafe { GetDriveTypeW(root.as_ptr()) };
         if drive_type != DRIVE_FIXED && drive_type != DRIVE_REMOVABLE {
@@ -53,7 +47,7 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
         } != 0;
 
         let (vol_name, fs_type) = if has_info {
-            (utf16_to_string(&name_buf), utf16_to_string(&fs_buf))
+            (from_wide(&name_buf), from_wide(&fs_buf))
         } else {
             (String::new(), String::new())
         };

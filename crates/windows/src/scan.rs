@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::ffi::{OsStr, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, node_id, run_scan};
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, cpu_count, node_id, run_scan};
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE, MAX_PATH};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -33,12 +33,15 @@ fn filetime_to_unix(ft: i64) -> i64 {
     (ft / 10_000_000) - EPOCH_DIFF
 }
 
-fn wide_path(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+/// `s` as a NUL-terminated UTF-16 string, for the Windows API.
+pub(crate) fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
+    s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
 }
 
-pub(crate) fn wide_str(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
+/// A fixed-size, NUL-terminated UTF-16 buffer up to its first NUL.
+pub(crate) fn from_wide(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
 }
 
 fn open_dir(path: &[u16]) -> Option<OwnedHandle> {
@@ -77,8 +80,7 @@ fn dedupes_hardlinks(handle: &OwnedHandle) -> bool {
             filesystem.len() as u32,
         )
     };
-    let len = filesystem.iter().position(|&c| c == 0).unwrap_or(filesystem.len());
-    ok != 0 && String::from_utf16_lossy(&filesystem[..len]) == "NTFS"
+    ok != 0 && from_wide(&filesystem) == "NTFS"
 }
 
 fn get_volume_and_id(handle: &OwnedHandle) -> Option<(u32, u64)> {
@@ -90,19 +92,16 @@ fn get_volume_and_id(handle: &OwnedHandle) -> Option<(u32, u64)> {
     Some((info.dwVolumeSerialNumber, file_id))
 }
 
-pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
-    scan_cancellable(root, cross_filesystems, tx, Arc::default())
-}
-
-/// Scan, aborting promptly if `cancel` is set (the server sets it when it shuts down mid-scan).
-pub fn scan_cancellable(
+/// Scan `root`, stopping promptly once `cancel` is set (the server sets it when it shuts down
+/// mid-scan).
+pub fn scan(
     root: &Path,
     cross_filesystems: bool,
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
-    let handle = open_dir(&wide_path(&path)).context("failed to open root directory")?;
+    let handle = open_dir(&wide(&path)).context("failed to open root directory")?;
     let (volume_serial, file_id) = get_volume_and_id(&handle).context("failed to get root directory info")?;
     let id = node_id(volume_serial as u64, file_id);
     let root = WinDir {
@@ -110,7 +109,7 @@ pub fn scan_cancellable(
         handle,
         volume: volume_serial,
     };
-    run_scan(&path, root, id, tx, cancel, move |dir, buffer, sink| {
+    run_scan(&path, root, id, tx, cancel, cpu_count(), move |dir, buffer, sink| {
         read_dir(dir, buffer, sink, volume_serial, cross_filesystems)
     });
     Ok(())
@@ -233,7 +232,7 @@ fn read_dir(
                 match classify(info.FileAttributes, info.EaSize, info.EndOfFile, info.AllocationSize) {
                     EntryKind::Directory => {
                         let path = sink.child_path(&name);
-                        if let Some(child) = open_dir(&wide_str(&path)) {
+                        if let Some(child) = open_dir(&wide(&path)) {
                             // Authoritative volume serial + file id for node identity; needed for
                             // every dir (not just the cross-fs check) so the same file id on two
                             // volumes can't collide.

@@ -2,7 +2,8 @@
 //! directory's bookkeeping. A platform crate supplies only how to open the root and how to read
 //! one directory ([`run_scan`]'s `read_dir`), reporting each entry to a [`DirSink`].
 
-use std::path::Path;
+use std::borrow::Cow;
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -15,9 +16,9 @@ use dashmap::DashSet;
 /// nothing here goes over the wire.
 #[derive(Clone, Debug)]
 pub enum ScanEvent {
-    ScanStart {
-        path: String,
-    },
+    /// The first event, with the scan root as people see it: canonical, and on Windows without the
+    /// `\\?\` prefix (see `plain_path`). The tree joins its directories' names onto it.
+    ScanStart { root: PathBuf },
     /// A directory with its files, sent once it has been read: after its parent, before its
     /// subdirectories. Its own size is the total of `files`. `mtime` is the newest of all its
     /// files', including the empty ones, which `files` leaves out.
@@ -30,9 +31,7 @@ pub enum ScanEvent {
     },
     /// The last event: nothing follows it, even from a worker still stuck inside a directory after
     /// a cancelled or stalled scan.
-    ScanDone {
-        outcome: ScanOutcome,
-    },
+    ScanDone { outcome: ScanOutcome },
 }
 
 /// A file of non-zero size in a `ScanEvent::Dir`.
@@ -41,6 +40,13 @@ pub struct ScannedFile {
     pub name: String,
     pub size: u64,
     pub mtime: i64,
+}
+
+impl ScannedFile {
+    /// The total size of `files`: their directory's own size.
+    pub fn total(files: &[ScannedFile]) -> u64 {
+        files.iter().fold(0u64, |total, file| total.saturating_add(file.size))
+    }
 }
 
 /// Combine a `(device, inode)` pair into a stable node id. Inodes are only unique within a single
@@ -154,23 +160,36 @@ impl DirJob<UnixDir> {
     }
 }
 
-/// A path for showing to people: Windows paths are opened with the `\\?\` extended-length prefix,
-/// which is noise in messages.
-fn display_path(path: &str) -> &str {
-    path.strip_prefix(r"\\?\").unwrap_or(path)
+/// `path` as people see it, and as Explorer takes it: without the `\\?\` prefix of the verbatim
+/// paths `canonicalize` gives on Windows, which scans keep for opening paths over `MAX_PATH`.
+/// `\\?\C:\x` is `C:\x`, and `\\?\UNC\server\share\x` is `\\server\share\x`; a path with no plainer
+/// form (`\\?\Volume{GUID}\`) is left as it is.
+fn plain_path(path: &Path) -> Cow<'_, Path> {
+    let Some(rest) = path.to_str().and_then(|path| path.strip_prefix(r"\\?\")) else {
+        return path.into();
+    };
+    if let Some(unc) = rest.strip_prefix(r"UNC\") {
+        return PathBuf::from(format!(r"\\{unc}")).into();
+    }
+    match rest.as_bytes() {
+        [drive, b':', ..] if drive.is_ascii_alphabetic() => PathBuf::from(rest).into(),
+        _ => path.into(),
+    }
 }
 
 /// The scan root's name as shown in the breadcrumb: its last component, or the whole path for a
 /// filesystem root (`/`, `C:\`).
 fn root_name(path: &Path) -> String {
     path.file_name().map_or_else(
-        || display_path(&path.display().to_string()).to_owned(),
+        || plain_path(path).display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
 }
 
-/// Separator for building child paths, which on Windows are used to open the children.
-const SEPARATOR: char = if cfg!(windows) { '\\' } else { '/' };
+/// How many CPUs this machine has, the most worker threads a scan can keep busy.
+pub fn cpu_count() -> usize {
+    thread::available_parallelism().map_or(4, |n| n.get())
+}
 
 /// Size of each worker's buffer for directory reads.
 const READ_BUFFER_SIZE: usize = 1024 * 1024;
@@ -212,8 +231,8 @@ pub enum ScanOutcome {
     Stalled,
 }
 
-/// Walk the tree under `root`, already opened as `handle` and identified as `id`, on one worker
-/// thread per CPU, sending `ScanStart`, then a `Dir` per directory carrying its files, then
+/// Walk the tree under `root`, already opened as `handle` and identified as `id`, on `threads`
+/// worker threads, sending `ScanStart`, then a `Dir` per directory carrying its files, then
 /// `ScanDone` with how the scan ended.
 ///
 /// `read_dir` reads one directory: it reports every entry to the [`DirSink`] and calls
@@ -224,14 +243,24 @@ pub enum ScanOutcome {
 /// stalls. `ScanDone` is sent last, and `tx` is dropped on return, so the receiver's channel closes
 /// then. Workers are detached rather than joined so that one blocked in a syscall can't hold the
 /// scan open; whatever it finds afterwards is dropped.
-pub fn run_scan<H, F>(root: &Path, handle: H, id: u64, tx: Sender<ScanEvent>, cancel: Arc<AtomicBool>, read_dir: F)
-where
+pub fn run_scan<H, F>(
+    root: &Path,
+    handle: H,
+    id: u64,
+    tx: Sender<ScanEvent>,
+    cancel: Arc<AtomicBool>,
+    threads: usize,
+    read_dir: F,
+) where
     H: Send + 'static,
     F: Fn(&DirJob<H>, &mut [u8], &mut DirSink<'_, H>) -> bool + Send + Sync + 'static,
 {
     #[cfg(unix)]
     raise_fd_limit();
 
+    let _ = tx.send(ScanEvent::ScanStart {
+        root: plain_path(root).into_owned(),
+    });
     let root = DirJob {
         handle,
         name: root_name(root),
@@ -242,10 +271,6 @@ where
         // (260), silently dropping deep subtrees.
         path: root.display().to_string(),
     };
-    let _ = tx.send(ScanEvent::ScanStart {
-        path: root.name.clone(),
-    });
-
     let shared = Arc::new(Shared {
         queue: WorkQueue::new(cancel),
         tx: RwLock::new(Some(tx)),
@@ -254,7 +279,7 @@ where
     });
     shared.queue.push(vec![root]);
 
-    let threads = thread::available_parallelism().map_or(4, |n| n.get());
+    let threads = threads.max(1);
     let active: Arc<[Mutex<String>]> = (0..threads).map(|_| Mutex::default()).collect();
     let read_dir = Arc::new(read_dir);
     for worker_index in 0..threads {
@@ -269,7 +294,7 @@ where
         for path in active.iter() {
             let path = path.lock().unwrap();
             if !path.is_empty() {
-                eprintln!("  {}", display_path(&path));
+                eprintln!("  {}", plain_path(Path::new(&*path)).display());
             }
         }
     });
@@ -278,6 +303,10 @@ where
     if let Some(tx) = shared.tx.write().unwrap().take() {
         let _ = tx.send(ScanEvent::ScanDone { outcome });
     }
+    // A worker still stuck in a syscall after a stall keeps `shared` alive until it returns; let it
+    // hold on to no more than it needs.
+    shared.visited_dirs.clear();
+    shared.visited_files.clear();
 }
 
 struct Shared<H> {
@@ -354,7 +383,10 @@ pub struct DirSink<'a, H> {
 impl<H> DirSink<'_, H> {
     /// The full path of the entry `name` in this directory.
     pub fn child_path(&self, name: &str) -> String {
-        format!("{}{SEPARATOR}{name}", self.dir_path.trim_end_matches(SEPARATOR))
+        format!(
+            "{}{MAIN_SEPARATOR}{name}",
+            self.dir_path.trim_end_matches(MAIN_SEPARATOR)
+        )
     }
 
     /// A subdirectory to read, through `handle`. One already reached under another name is skipped
@@ -818,6 +850,7 @@ mod tests {
             tree[0].id,
             tx,
             Arc::default(),
+            4,
             fake_read_dir(Arc::clone(tree)),
         );
         let events: Vec<_> = rx.iter().collect();
@@ -852,7 +885,7 @@ mod tests {
         ]);
         let (events, outcome) = scan_fake_tree(&tree);
         assert_eq!(outcome, ScanOutcome::Complete);
-        assert!(matches!(&events[0], ScanEvent::ScanStart { path } if path == "root"));
+        assert!(matches!(&events[0], ScanEvent::ScanStart { root } if root == Path::new("/root")));
 
         let mut dirs: Vec<_> = events
             .iter()
@@ -914,7 +947,7 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel();
         let started = Instant::now();
-        run_scan(Path::new("/root"), (), 1, tx, cancel, read_dir);
+        run_scan(Path::new("/root"), (), 1, tx, cancel, 4, read_dir);
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "took {:?}",
@@ -955,7 +988,7 @@ mod tests {
     #[test]
     fn child_paths_join_with_one_separator() {
         let shared = shared();
-        let sep = SEPARATOR;
+        let sep = MAIN_SEPARATOR;
         for (dir, expected) in [
             (format!("{sep}"), format!("{sep}name")),
             (format!("{sep}a"), format!("{sep}a{sep}name")),
@@ -987,7 +1020,20 @@ mod tests {
     fn root_name_is_the_last_component_or_the_whole_root() {
         assert_eq!(root_name(Path::new("/home/user/projects")), "projects");
         assert_eq!(root_name(Path::new("/")), "/");
-        assert_eq!(display_path(r"\\?\C:\Windows"), r"C:\Windows");
+    }
+
+    #[test]
+    fn plain_paths_lose_the_verbatim_prefix() {
+        let plain = |path: &str| plain_path(Path::new(path)).to_str().unwrap().to_owned();
+        assert_eq!(plain(r"\\?\C:\Users\me\x.txt"), r"C:\Users\me\x.txt");
+        assert_eq!(plain(r"\\?\UNC\server\share\x.txt"), r"\\server\share\x.txt");
+        for unchanged in [
+            r"C:\Users\me\x.txt",
+            r"\\?\Volume{0b1c2d3e-0000-0000-0000-100000000000}\x.txt",
+            "/home/me/x.txt",
+        ] {
+            assert_eq!(plain(unchanged), unchanged);
+        }
     }
 
     #[test]

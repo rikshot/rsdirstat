@@ -1,7 +1,6 @@
 use super::dom::{delegated_attribute, listen, set_hidden, with_app};
 use super::network::fetch_volumes;
 use super::*;
-use crate::logic::crumb_label;
 
 impl TreemapApp {
     pub(super) fn install_event_listeners(&self) -> Result<(), JsValue> {
@@ -127,7 +126,7 @@ impl TreemapApp {
                 self.chrome.breadcrumb_bar.append_child(&separator)?;
             }
             let span = self.document.create_element("span")?;
-            span.set_text_content(Some(crumb_label(entry)));
+            span.set_text_content(Some(&entry.name));
             if index + 1 == self.view.breadcrumb.len() {
                 span.set_class_name("current");
             } else {

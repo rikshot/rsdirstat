@@ -59,11 +59,6 @@ pub(crate) fn join_path(parts: &[&str], separator: char) -> String {
     path
 }
 
-/// A breadcrumb entry's display name; the scan root of `/` arrives with an empty name.
-pub(crate) fn crumb_label(entry: &BreadcrumbEntry) -> &str {
-    if entry.name.is_empty() { "/" } else { &entry.name }
-}
-
 /// A laid-out rect ready to draw: geometry (in f64 layout space) plus the colours derived from its
 /// hue. This is the single rect representation used throughout the client.
 #[derive(Clone, Debug, PartialEq)]
@@ -191,7 +186,7 @@ pub(crate) fn build_hover_state(
     }
 
     let mut parts: Vec<&str> = Vec::with_capacity(breadcrumb.len() + hovered_ancestor_indices.len() + 1);
-    parts.extend(breadcrumb.iter().map(crumb_label));
+    parts.extend(breadcrumb.iter().map(|entry| entry.name.as_str()));
     parts.extend(
         hovered_ancestor_indices
             .iter()

@@ -118,7 +118,7 @@ impl TreemapApp {
             Some(ServerMessage::PickerMode) => {
                 self.show_picker()?;
             }
-            Some(ServerMessage::ScanStart { .. }) => {
+            Some(ServerMessage::ScanStart) => {
                 self.hide_picker()?;
                 self.view.rects.clear();
                 self.view.rect_index_by_id.clear();

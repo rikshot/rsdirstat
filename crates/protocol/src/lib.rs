@@ -133,7 +133,9 @@ impl VolumeInfo {
 /// Server → client WebSocket messages.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
-    ScanStart { path: String },
+    /// A new scan replaced the tree: the page clears its treemap. Comes before the scan's first
+    /// layout.
+    ScanStart,
     Layout(LayoutPayload),
     PickerMode,
 }
@@ -436,10 +438,7 @@ mod tests {
 
     #[test]
     fn scan_start_and_picker_mode_round_trip() {
-        let msg = ServerMessage::ScanStart {
-            path: "/tmp/test".into(),
-        };
-        assert_eq!(server_roundtrip(msg.clone()), msg);
+        assert_eq!(server_roundtrip(ServerMessage::ScanStart), ServerMessage::ScanStart);
         assert_eq!(server_roundtrip(ServerMessage::PickerMode), ServerMessage::PickerMode);
     }
 

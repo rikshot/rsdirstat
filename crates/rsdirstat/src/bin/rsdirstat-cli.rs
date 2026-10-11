@@ -2,12 +2,14 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
 use humansize::{BINARY, format_size};
-use rsdirstat_core::scan::ScanEvent;
+use rsdirstat_core::scan::{ScanEvent, ScannedFile};
 use rsdirstat_core::tree::DirTree;
 
 #[cfg(target_os = "linux")]
@@ -39,19 +41,20 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let root = std::fs::canonicalize(&args.path)?;
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let scan_root = root.clone();
-    let handle = std::thread::spawn(move || scanner::scan::scan(&scan_root, args.all, tx));
+    let (path, all) = (args.path.clone(), args.all);
+    let handle = std::thread::spawn(move || scanner::scan::scan(&path, all, tx, Arc::default()));
 
     let mut tree = DirTree::new();
-    let mut files: Vec<(u64, String, u64)> = Vec::new();
+    // With `--files`, the largest files so far as (size, directory, name), the smallest on top to
+    // be dropped first.
+    let mut files = BinaryHeap::new();
 
     while let Ok(event) = rx.recv() {
         match event {
-            // The tree only needs each directory's total, so files are kept (outside the tree)
-            // only when listing them.
+            // The tree only needs each directory's total, so files are kept (outside the tree, and
+            // only the largest) only when listing them.
             ScanEvent::Dir {
                 id,
                 parent,
@@ -59,9 +62,14 @@ fn main() -> Result<()> {
                 mtime,
                 files: dir_files,
             } => {
-                let size = dir_files.iter().map(|file| file.size).sum();
+                let size = ScannedFile::total(&dir_files);
                 if args.files {
-                    files.extend(dir_files.into_iter().map(|file| (id, file.name, file.size)));
+                    for file in dir_files {
+                        files.push(Reverse((file.size, id, file.name)));
+                        if files.len() > args.top {
+                            files.pop();
+                        }
+                    }
                 }
                 tree.insert_dir(id, parent, name, size, mtime);
             }
@@ -76,18 +84,19 @@ fn main() -> Result<()> {
     }
 
     if args.files {
-        top_n(&mut files, args.top, |&(_, _, size)| size);
+        // Sorted by `Reverse`, so largest first.
         print_entries(
             files
-                .iter()
-                .map(|(parent, name, size)| (tree.full_path(*parent, &root).unwrap_or_default().join(name), *size)),
+                .into_sorted_vec()
+                .into_iter()
+                .map(|Reverse((size, parent, name))| (tree.full_path(parent).unwrap_or_default().join(name), size)),
         );
     } else {
         let mut dirs: Vec<(u64, u64)> = tree.nodes.iter().map(|(&id, node)| (id, node.size)).collect();
         top_n(&mut dirs, args.top, |&(_, size)| size);
         print_entries(
             dirs.iter()
-                .map(|&(id, size)| (tree.full_path(id, &root).unwrap_or_default(), size)),
+                .map(|&(id, size)| (tree.full_path(id).unwrap_or_default(), size)),
         );
     }
 

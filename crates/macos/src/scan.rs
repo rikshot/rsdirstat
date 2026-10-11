@@ -7,7 +7,12 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, UnixDir, node_id, open_dir, run_scan};
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, UnixDir, cpu_count, node_id, open_dir, run_scan};
+
+/// The most worker threads a scan uses. More only queue up in the kernel, which serializes much of
+/// `openat` and `getattrlistbulk` on a volume: on a 10-core Mac with warm caches, /System/Library
+/// scans in 1.7 s with 3–4 threads and in 5.6 s with 10, which also burn 47 s of kernel CPU.
+const MAX_THREADS: usize = 4;
 
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
@@ -44,12 +49,9 @@ static SCAN_ATTRS: libc::attrlist = libc::attrlist {
     forkattr: 0,
 };
 
-pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
-    scan_cancellable(root, cross_filesystems, tx, Arc::default())
-}
-
-/// Scan, aborting promptly if `cancel` is set (the server sets it when it shuts down mid-scan).
-pub fn scan_cancellable(
+/// Scan `root`, stopping promptly once `cancel` is set (the server sets it when it shuts down
+/// mid-scan).
+pub fn scan(
     root: &Path,
     cross_filesystems: bool,
     tx: std::sync::mpsc::Sender<ScanEvent>,
@@ -61,7 +63,8 @@ pub fn scan_cancellable(
     let id = node_id(meta.dev(), meta.ino());
     let root_dev = meta.dev() as i32;
     let root = UnixDir::Root(Arc::new(fd));
-    run_scan(&path, root, id, tx, cancel, move |dir, buffer, sink| {
+    let threads = cpu_count().min(MAX_THREADS);
+    run_scan(&path, root, id, tx, cancel, threads, move |dir, buffer, sink| {
         read_dir(dir, buffer, sink, root_dev, cross_filesystems)
     });
     Ok(())
