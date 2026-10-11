@@ -1,4 +1,4 @@
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::Path;
@@ -6,9 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{
-    DirJob, DirSink, ScanEvent, ScanOutcome, node_id, open_dir, open_dir_at, raise_fd_limit, root_name, run_scan,
-};
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOutcome, node_id, open_dir, open_dir_at, run_scan};
 
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
@@ -43,27 +41,19 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
     scan_cancellable(root, cross_filesystems, tx, Arc::default())
 }
 
-/// Scan, aborting promptly if `cancel` is set. The server trips this when a scan is superseded by a
-/// rescan or a new `ScanPath` so the old worker threads stop walking the filesystem.
+/// Scan, aborting promptly if `cancel` is set (the server sets it when it shuts down mid-scan).
 pub fn scan_cancellable(
     root: &Path,
     cross_filesystems: bool,
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<ScanOutcome> {
-    raise_fd_limit();
     let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
     let meta = std::fs::metadata(&path).context("failed to stat root path")?;
     let fd = open_dir(&path).context("failed to open root directory")?;
-    let root = DirJob {
-        handle: fd,
-        id: node_id(meta.dev(), meta.ino()),
-        parent_id: 0,
-        name: root_name(&path),
-        path: path.display().to_string(),
-    };
+    let id = node_id(meta.dev(), meta.ino());
     let root_dev = meta.dev() as i32;
-    Ok(run_scan(root, tx, cancel, move |dir, buffer, sink| {
+    Ok(run_scan(&path, fd, id, tx, cancel, move |dir, buffer, sink| {
         read_dir(dir, buffer, sink, root_dev, cross_filesystems)
     }))
 }
@@ -120,10 +110,7 @@ fn read_dir(
                 let id = || node_id(parsed.dev_id as u32 as u64, parsed.file_id);
                 match parsed.obj_type {
                     VDIR => {
-                        if let Some(child) = CString::new(parsed.name)
-                            .ok()
-                            .and_then(|name| open_dir_at(&dir.handle, &name))
-                        {
+                        if let Some(child) = open_dir_at(&dir.handle, parsed.c_name) {
                             sink.dir(id(), parsed.name, sink.child_path(parsed.name), child);
                         }
                     }
@@ -148,6 +135,8 @@ fn read_dir(
 
 struct ParsedEntry<'a> {
     name: &'a str,
+    /// `name` as the NUL-terminated string in the buffer, for opening the entry.
+    c_name: &'a CStr,
     dev_id: i32,
     obj_type: u32,
     file_id: u64,
@@ -178,6 +167,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
     pos += 20;
 
     let mut name = "";
+    let mut c_name = c"";
     let mut dev_id = 0i32;
     let mut obj_type = 0u32;
     let mut file_id = 0u64;
@@ -206,7 +196,8 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
         if name_start >= entry.len() {
             return None;
         }
-        name = CStr::from_bytes_until_nul(&entry[name_start..]).ok()?.to_str().ok()?;
+        c_name = CStr::from_bytes_until_nul(&entry[name_start..]).ok()?;
+        name = c_name.to_str().ok()?;
     });
     field!(returned_common & libc::ATTR_CMN_DEVID != 0, 4, {
         dev_id = i32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
@@ -237,6 +228,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
 
     Some(ParsedEntry {
         name,
+        c_name,
         dev_id,
         obj_type,
         file_id,

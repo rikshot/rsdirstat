@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOutcome, node_id, root_name, run_scan};
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOutcome, node_id, run_scan};
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -67,8 +67,7 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
     scan_cancellable(root, cross_filesystems, tx, Arc::default())
 }
 
-/// Scan, aborting promptly if `cancel` is set. The server trips this when a scan is superseded by a
-/// rescan or a new `ScanPath` so the old worker threads stop walking the filesystem.
+/// Scan, aborting promptly if `cancel` is set (the server sets it when it shuts down mid-scan).
 pub fn scan_cancellable(
     root: &Path,
     cross_filesystems: bool,
@@ -78,17 +77,8 @@ pub fn scan_cancellable(
     let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
     let handle = open_dir(&wide_path(&path)).context("failed to open root directory")?;
     let (volume_serial, file_id) = get_volume_and_id(&handle).context("failed to get root directory info")?;
-    let root = DirJob {
-        handle,
-        id: node_id(volume_serial as u64, file_id),
-        parent_id: 0,
-        name: root_name(&path),
-        // Children are opened by path, built from this one. Keep its extended-length (\\?\)
-        // prefix: without it CreateFileW fails for paths over MAX_PATH (260), silently dropping
-        // deep subtrees.
-        path: path.display().to_string(),
-    };
-    Ok(run_scan(root, tx, cancel, move |dir, buffer, sink| {
+    let id = node_id(volume_serial as u64, file_id);
+    Ok(run_scan(&path, handle, id, tx, cancel, move |dir, buffer, sink| {
         read_dir(dir, buffer, sink, volume_serial, cross_filesystems)
     }))
 }

@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -28,8 +28,8 @@ pub enum ScanEvent {
         mtime: i64,
         files: Vec<ScannedFile>,
     },
-    /// The last event a consumer should apply. After a cancelled or stalled scan, a worker still
-    /// inside a directory may send a few more, which must be ignored.
+    /// The last event: nothing follows it, even from a worker still stuck inside a directory after
+    /// a cancelled or stalled scan.
     ScanDone,
 }
 
@@ -55,7 +55,7 @@ pub fn node_id(dev: u64, ino: u64) -> u64 {
 }
 
 #[cfg(unix)]
-pub fn raise_fd_limit() {
+fn raise_fd_limit() {
     // The scanner keeps every pending directory fd open at once, so the default soft limit
     // (256 on macOS) is easily exhausted on large trees. Raise it to the hard limit.
     unsafe {
@@ -125,13 +125,13 @@ pub fn open_dir_at(parent: &std::os::fd::OwnedFd, name: &std::ffi::CStr) -> Opti
 
 /// A path for showing to people: Windows paths are opened with the `\\?\` extended-length prefix,
 /// which is noise in messages.
-pub fn display_path(path: &str) -> &str {
+fn display_path(path: &str) -> &str {
     path.strip_prefix(r"\\?\").unwrap_or(path)
 }
 
 /// The scan root's name as shown in the breadcrumb: its last component, or the whole path for a
 /// filesystem root (`/`, `C:\`).
-pub fn root_name(path: &Path) -> String {
+fn root_name(path: &Path) -> String {
     path.file_name().map_or_else(
         || display_path(&path.display().to_string()).to_owned(),
         |name| name.to_string_lossy().into_owned(),
@@ -156,11 +156,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 pub struct DirJob<H> {
     /// The open directory (a file descriptor or handle); closed once it has been read.
     pub handle: H,
-    pub id: u64,
-    pub parent_id: u64,
     pub name: String,
+    id: u64,
+    parent_id: u64,
     /// Full path, for opening children by path (Windows) and for reporting a stuck directory.
-    pub path: String,
+    path: String,
 }
 
 /// How a scan ended.
@@ -175,27 +175,49 @@ pub enum ScanOutcome {
     Stalled,
 }
 
-/// Walk the tree under `root` on one worker thread per CPU, sending `ScanStart`, then a `File` per
-/// non-empty file and a `Dir` per directory (after its files), then `ScanDone`.
+/// Walk the tree under `root`, already opened as `handle` and identified as `id`, on one worker
+/// thread per CPU, sending `ScanStart`, then a `Dir` per directory carrying its files, then
+/// `ScanDone`.
 ///
 /// `read_dir` reads one directory: it reports every entry to the [`DirSink`] and calls
 /// [`DirSink::checkpoint`] after each read from the OS, stopping when it returns false.
 ///
 /// Returns once the walk finishes, the `cancel` flag is set (within [`POLL_INTERVAL`]), or the scan
-/// stalls. In the last two cases a worker may still be inside a directory, and its remaining events
-/// can arrive after `ScanDone`: consumers must stop at `ScanDone`. Workers are detached rather than
-/// joined so that one blocked in a syscall can't hold the scan open.
-pub fn run_scan<H, F>(root: DirJob<H>, tx: Sender<ScanEvent>, cancel: Arc<AtomicBool>, read_dir: F) -> ScanOutcome
+/// stalls. `ScanDone` is sent last, and `tx` is dropped on return, so the receiver's channel closes
+/// then. Workers are detached rather than joined so that one blocked in a syscall can't hold the
+/// scan open; whatever it finds afterwards is dropped.
+pub fn run_scan<H, F>(
+    root: &Path,
+    handle: H,
+    id: u64,
+    tx: Sender<ScanEvent>,
+    cancel: Arc<AtomicBool>,
+    read_dir: F,
+) -> ScanOutcome
 where
     H: Send + 'static,
     F: Fn(&DirJob<H>, &mut [u8], &mut DirSink<'_, H>) + Send + Sync + 'static,
 {
+    #[cfg(unix)]
+    raise_fd_limit();
+
+    let root = DirJob {
+        handle,
+        name: root_name(root),
+        id,
+        parent_id: 0,
+        // On Windows children are opened by path, built from this one. It keeps its
+        // extended-length (\\?\) prefix: without it CreateFileW fails for paths over MAX_PATH
+        // (260), silently dropping deep subtrees.
+        path: root.display().to_string(),
+    };
     let _ = tx.send(ScanEvent::ScanStart {
         path: root.name.clone(),
     });
 
     let shared = Arc::new(Shared {
         queue: WorkQueue::new(cancel),
+        tx: RwLock::new(Some(tx)),
         visited_dirs: DashSet::from_iter([root.id]),
         visited_files: DashSet::new(),
     });
@@ -206,10 +228,9 @@ where
     let read_dir = Arc::new(read_dir);
     for worker_index in 0..threads {
         let shared = Arc::clone(&shared);
-        let tx = tx.clone();
         let read_dir = Arc::clone(&read_dir);
         let active = Arc::clone(&active);
-        thread::spawn(move || run_worker(&shared, &tx, &*read_dir, &active[worker_index]));
+        thread::spawn(move || run_worker(&shared, &*read_dir, &active[worker_index]));
     }
 
     let outcome = shared.queue.wait(STALL_TIMEOUT, || {
@@ -221,12 +242,18 @@ where
             }
         }
     });
-    let _ = tx.send(ScanEvent::ScanDone);
+    // Taken under the write lock, so no worker is still sending once `ScanDone` goes out, and none
+    // can send after it.
+    if let Some(tx) = shared.tx.write().unwrap().take() {
+        let _ = tx.send(ScanEvent::ScanDone);
+    }
     outcome
 }
 
 struct Shared<H> {
     queue: WorkQueue<DirJob<H>>,
+    /// The scan's events go here until `run_scan` takes it to send `ScanDone`.
+    tx: RwLock<Option<Sender<ScanEvent>>>,
     /// Directories already queued, so one reachable under two names (a bind mount, a firmlink) is
     /// read once.
     visited_dirs: DashSet<u64>,
@@ -234,7 +261,7 @@ struct Shared<H> {
     visited_files: DashSet<u64>,
 }
 
-fn run_worker<H, F>(shared: &Shared<H>, tx: &Sender<ScanEvent>, read_dir: &F, active: &Mutex<String>)
+fn run_worker<H, F>(shared: &Shared<H>, read_dir: &F, active: &Mutex<String>)
 where
     F: Fn(&DirJob<H>, &mut [u8], &mut DirSink<'_, H>),
 {
@@ -264,13 +291,15 @@ where
         drop(handle);
         // One event per directory, carrying its files: a channel send and a tree lookup per file
         // would cost more than the files themselves.
-        let _ = tx.send(ScanEvent::Dir {
-            id,
-            parent: parent_id,
-            name,
-            mtime,
-            files,
-        });
+        if let Some(tx) = &*shared.tx.read().unwrap() {
+            let _ = tx.send(ScanEvent::Dir {
+                id,
+                parent: parent_id,
+                name,
+                mtime,
+                files,
+            });
+        }
         // Children are queued before this directory is finished, so the queue never looks empty
         // to the other workers while there is still work to discover.
         shared.queue.push(children);
@@ -735,16 +764,6 @@ mod tests {
         }
     }
 
-    fn root_job(tree: &[FakeDir]) -> DirJob<usize> {
-        DirJob {
-            handle: 0,
-            id: tree[0].id,
-            parent_id: 0,
-            name: tree[0].name.to_owned(),
-            path: format!("/{}", tree[0].name),
-        }
-    }
-
     #[test]
     fn run_scan_reports_each_directory_and_file_once() {
         let tree = Arc::new(vec![
@@ -769,7 +788,15 @@ mod tests {
             },
         ]);
         let (tx, rx) = mpsc::channel();
-        let outcome = run_scan(root_job(&tree), tx, Arc::default(), fake_read_dir(Arc::clone(&tree)));
+        let root = format!("/{}", tree[0].name);
+        let outcome = run_scan(
+            Path::new(&root),
+            0,
+            tree[0].id,
+            tx,
+            Arc::default(),
+            fake_read_dir(Arc::clone(&tree)),
+        );
         assert_eq!(outcome, ScanOutcome::Complete);
 
         let events: Vec<_> = rx.iter().collect();
@@ -833,22 +860,20 @@ mod tests {
                 sink.checkpoint();
             }
         };
-        let root = DirJob {
-            handle: (),
-            id: 1,
-            parent_id: 0,
-            name: "root".into(),
-            path: "/root".into(),
-        };
         let (tx, rx) = mpsc::channel();
         let started = Instant::now();
-        assert_eq!(run_scan(root, tx, cancel, read_dir), ScanOutcome::Cancelled);
+        assert_eq!(
+            run_scan(Path::new("/root"), (), 1, tx, cancel, read_dir),
+            ScanOutcome::Cancelled
+        );
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "took {:?}",
             started.elapsed()
         );
-        let events: Vec<_> = rx.iter().take_while(|e| !matches!(e, ScanEvent::ScanDone)).collect();
+        // The channel closes with `ScanDone`, even though workers may still be inside directories.
+        let events: Vec<_> = rx.iter().collect();
+        assert!(matches!(events.last(), Some(ScanEvent::ScanDone)));
         assert!(events.len() < 1000, "the walk must stop: {} events", events.len());
     }
 
@@ -856,6 +881,7 @@ mod tests {
     fn child_paths_join_with_one_separator() {
         let shared = Shared {
             queue: queue(),
+            tx: RwLock::new(None),
             visited_dirs: DashSet::new(),
             visited_files: DashSet::new(),
         };

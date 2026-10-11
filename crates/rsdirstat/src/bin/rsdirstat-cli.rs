@@ -65,13 +65,12 @@ fn main() -> Result<()> {
                 }
                 tree.insert_dir(id, parent, name, size, mtime);
             }
-            ScanEvent::ScanDone => break,
+            // `ScanDone`, the last event, recomputes the sizes.
             event => tree.apply(event),
         }
     }
 
     handle.join().map_err(|_| anyhow::anyhow!("scan thread panicked"))??;
-    tree.recompute_sizes();
 
     if args.files {
         top_n(&mut files, args.top, |&(_, _, size)| size);

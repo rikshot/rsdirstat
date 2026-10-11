@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 use std::sync::mpsc;
 
-use rsdirstat_core::scan::{ScanEvent, ScanOutcome};
-use rsdirstat_core::tree::DirTree;
+use rsdirstat_core::scan::ScanOutcome;
+use rsdirstat_core::tree::{DirTree, FileEntry};
 
 #[cfg(target_os = "linux")]
 use rsdirstat_linux as scanner;
@@ -13,31 +13,27 @@ use rsdirstat_macos as scanner;
 #[cfg(target_os = "windows")]
 use rsdirstat_windows as scanner;
 
-fn scan_to_tree(root: &Path) -> (DirTree, Vec<(u64, String, u64)>) {
+fn scan_to_tree(root: &Path) -> DirTree {
     let (tx, rx) = mpsc::channel();
     let root = root.to_path_buf();
     let handle = std::thread::spawn(move || scanner::scan::scan(&root, false, tx).unwrap());
 
     let mut tree = DirTree::new();
-    let mut files = Vec::new();
-
     // `ScanDone` is the last event, and applying it recomputes the sizes.
     for event in rx {
-        if let ScanEvent::Dir {
-            id, files: dir_files, ..
-        } = &event
-        {
-            files.extend(dir_files.iter().map(|file| (*id, file.name.clone(), file.size)));
-        }
-        let done = matches!(event, ScanEvent::ScanDone);
         tree.apply(event);
-        if done {
-            break;
-        }
     }
 
     assert_eq!(handle.join().unwrap(), ScanOutcome::Complete);
-    (tree, files)
+    tree
+}
+
+fn files(tree: &DirTree) -> impl Iterator<Item = &FileEntry> {
+    tree.nodes.values().flat_map(|node| &node.files)
+}
+
+fn file_names(tree: &DirTree) -> Vec<&str> {
+    files(tree).map(|file| &*file.name).collect()
 }
 
 fn create_test_dir() -> tempfile::TempDir {
@@ -60,7 +56,7 @@ fn create_test_dir() -> tempfile::TempDir {
 #[test]
 fn scanner_finds_all_directories() {
     let dir = create_test_dir();
-    let (tree, _) = scan_to_tree(dir.path());
+    let tree = scan_to_tree(dir.path());
 
     assert!(tree.root_id.is_some());
 
@@ -73,9 +69,9 @@ fn scanner_finds_all_directories() {
 #[test]
 fn scanner_finds_all_files() {
     let dir = create_test_dir();
-    let (_, files) = scan_to_tree(dir.path());
+    let tree = scan_to_tree(dir.path());
 
-    let file_names: Vec<&str> = files.iter().map(|(_, name, _)| name.as_str()).collect();
+    let file_names = file_names(&tree);
     assert!(file_names.contains(&"main.rs"), "missing main.rs in {file_names:?}");
     assert!(file_names.contains(&"lib.rs"), "missing lib.rs in {file_names:?}");
     assert!(file_names.contains(&"deep.rs"), "missing deep.rs in {file_names:?}");
@@ -92,9 +88,9 @@ fn scanner_finds_all_files() {
 #[test]
 fn scanner_reports_correct_file_sizes() {
     let dir = create_test_dir();
-    let (_, files) = scan_to_tree(dir.path());
+    let tree = scan_to_tree(dir.path());
 
-    let by_name: HashMap<&str, u64> = files.iter().map(|(_, name, size)| (name.as_str(), *size)).collect();
+    let by_name: HashMap<&str, u64> = files(&tree).map(|file| (&*file.name, file.size)).collect();
 
     assert_eq!(by_name["lib.rs"], 1024);
     assert_eq!(by_name["root_file.bin"], 4096);
@@ -104,7 +100,7 @@ fn scanner_reports_correct_file_sizes() {
 #[test]
 fn scanner_tree_sizes_are_consistent() {
     let dir = create_test_dir();
-    let (tree, _) = scan_to_tree(dir.path());
+    let tree = scan_to_tree(dir.path());
 
     let root_id = tree.root_id.unwrap();
     let root_size = tree.nodes[&root_id].size;
@@ -121,7 +117,7 @@ fn scanner_tree_sizes_are_consistent() {
 #[test]
 fn scanner_parent_child_relationships() {
     let dir = create_test_dir();
-    let (tree, _) = scan_to_tree(dir.path());
+    let tree = scan_to_tree(dir.path());
 
     let root_id = tree.root_id.unwrap();
     let root = &tree.nodes[&root_id];
@@ -147,18 +143,18 @@ fn scanner_handles_empty_directory() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("empty")).unwrap();
 
-    let (tree, files) = scan_to_tree(dir.path());
+    let tree = scan_to_tree(dir.path());
 
     assert!(tree.root_id.is_some());
     let names: Vec<&str> = tree.nodes.values().map(|n| &*n.name).collect();
     assert!(names.contains(&"empty"));
-    assert!(files.is_empty());
+    assert_eq!(files(&tree).count(), 0);
 }
 
 #[test]
 fn scanner_reports_positive_mtime() {
     let dir = create_test_dir();
-    let (tree, _) = scan_to_tree(dir.path());
+    let tree = scan_to_tree(dir.path());
 
     for node in tree.nodes.values() {
         if node.parent != 0 {
@@ -171,7 +167,7 @@ fn scanner_reports_positive_mtime() {
         }
     }
 
-    for file in tree.nodes.values().flat_map(|node| &node.files) {
+    for file in files(&tree) {
         assert!(
             file.mtime > 0,
             "file '{}' has non-positive mtime {}",
@@ -188,12 +184,12 @@ fn scanner_unicode_filenames() {
     fs::write(dir.path().join("données").join("日本語.txt"), "test").unwrap();
     fs::write(dir.path().join("café.rs"), vec![0u8; 512]).unwrap();
 
-    let (tree, files) = scan_to_tree(dir.path());
+    let tree = scan_to_tree(dir.path());
 
     let dir_names: Vec<&str> = tree.nodes.values().map(|n| &*n.name).collect();
     assert!(dir_names.contains(&"données"), "missing unicode dir in {dir_names:?}");
 
-    let file_names: Vec<&str> = files.iter().map(|(_, name, _)| name.as_str()).collect();
+    let file_names = file_names(&tree);
     assert!(
         file_names.contains(&"日本語.txt"),
         "missing unicode file in {file_names:?}"
@@ -214,7 +210,7 @@ fn scanner_dedups_hardlinks() {
     fs::write(root.join("original.bin"), vec![0u8; 10_240]).unwrap();
     fs::hard_link(root.join("original.bin"), root.join("hardlink.bin")).unwrap();
 
-    let (tree, _) = scan_to_tree(root);
+    let tree = scan_to_tree(root);
     let root_id = tree.root_id.unwrap();
     let root_size = tree.nodes[&root_id].size;
     assert_eq!(

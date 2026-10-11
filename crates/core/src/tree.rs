@@ -181,15 +181,8 @@ impl DirTree {
     }
 
     pub fn insert_file(&mut self, parent: u64, name: impl Into<Box<str>>, size: u64, mtime: i64) {
-        let name = name.into();
-        let hue = self.cached_extension_hue(&name);
-        self.update_mtime_range(mtime);
-
-        self.nodes
-            .entry(parent)
-            .or_default()
-            .files
-            .push(FileEntry { name, size, hue, mtime });
+        let entry = self.file_entry(name.into(), size, mtime);
+        self.nodes.entry(parent).or_default().files.push(entry);
     }
 
     /// A directory's scanned files, added with one lookup of its node.
@@ -199,21 +192,23 @@ impl DirTree {
         }
         let entries: Vec<FileEntry> = files
             .into_iter()
-            .map(|file| {
-                self.update_mtime_range(file.mtime);
-                FileEntry {
-                    hue: self.cached_extension_hue(&file.name),
-                    name: file.name.into_boxed_str(),
-                    size: file.size,
-                    mtime: file.mtime,
-                }
-            })
+            .map(|file| self.file_entry(file.name.into_boxed_str(), file.size, file.mtime))
             .collect();
         let node = self.nodes.entry(parent).or_default();
         if node.files.is_empty() {
             node.files = entries;
         } else {
             node.files.extend(entries);
+        }
+    }
+
+    fn file_entry(&mut self, name: Box<str>, size: u64, mtime: i64) -> FileEntry {
+        self.update_mtime_range(mtime);
+        FileEntry {
+            hue: self.cached_extension_hue(&name),
+            name,
+            size,
+            mtime,
         }
     }
 

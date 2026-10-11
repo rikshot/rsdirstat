@@ -5,9 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{
-    DirJob, DirSink, ScanEvent, ScanOutcome, node_id, open_dir, open_dir_at, raise_fd_limit, root_name, run_scan,
-};
+use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOutcome, node_id, open_dir, open_dir_at, run_scan};
 
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
@@ -99,27 +97,19 @@ pub fn scan(root: &Path, cross_filesystems: bool, tx: std::sync::mpsc::Sender<Sc
     scan_cancellable(root, cross_filesystems, tx, Arc::default())
 }
 
-/// Scan, aborting promptly if `cancel` is set. The server trips this when a scan is superseded by a
-/// rescan or a new `ScanPath` so the old worker threads stop walking the filesystem.
+/// Scan, aborting promptly if `cancel` is set (the server sets it when it shuts down mid-scan).
 pub fn scan_cancellable(
     root: &Path,
     cross_filesystems: bool,
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<ScanOutcome> {
-    raise_fd_limit();
     let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
     let fd = open_dir(&path).context("failed to open root directory")?;
     let sx = statx_fd(fd.as_raw_fd(), STATX_MNT_ID).context("failed to statx root directory")?;
-    let root = DirJob {
-        handle: fd,
-        id: node_id(makedev(sx.stx_dev_major, sx.stx_dev_minor), sx.stx_ino),
-        parent_id: 0,
-        name: root_name(&path),
-        path: path.display().to_string(),
-    };
+    let id = node_id(makedev(sx.stx_dev_major, sx.stx_dev_minor), sx.stx_ino);
     let root_mnt_id = sx.stx_mnt_id;
-    Ok(run_scan(root, tx, cancel, move |dir, buffer, sink| {
+    Ok(run_scan(&path, fd, id, tx, cancel, move |dir, buffer, sink| {
         read_dir(dir, buffer, sink, root_mnt_id, cross_filesystems)
     }))
 }
