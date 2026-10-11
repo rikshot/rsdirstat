@@ -26,19 +26,10 @@ impl TreemapApp {
             return Ok(());
         }
         self.session.scan_start_time = self.now();
-        let closure = Closure::wrap(Box::new(move || {
-            with_app(|app| {
-                let app = app.borrow_mut();
-                let seconds = (app.now() - app.session.scan_start_time) / 1000.0;
-                app.chrome
-                    .status_element
-                    .set_text_content(Some(&format!("Scanning... {seconds:.1}s")));
-            });
-        }) as Box<dyn FnMut()>);
-        let id = self
-            .window
-            .set_interval_with_callback_and_timeout_and_arguments_0(closure.as_ref().unchecked_ref(), 100)?;
-        closure.forget();
+        let id = self.window.set_interval_with_callback_and_timeout_and_arguments_0(
+            self.callbacks.scan_timer.as_ref().unchecked_ref(),
+            100,
+        )?;
         self.session.scan_timer_id = Some(id);
         Ok(())
     }

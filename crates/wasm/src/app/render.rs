@@ -7,13 +7,8 @@ impl TreemapApp {
             return Ok(());
         }
         self.surface.raf_pending = true;
-        let callback = Closure::once_into_js(move |_: f64| {
-            with_app(|app| {
-                let _ = app.borrow_mut().tick();
-            });
-        });
         self.window
-            .request_animation_frame(callback.unchecked_ref::<Function>())?;
+            .request_animation_frame(self.callbacks.tick.as_ref().unchecked_ref())?;
         Ok(())
     }
 

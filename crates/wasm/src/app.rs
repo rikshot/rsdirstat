@@ -131,6 +131,38 @@ struct TreemapApp {
     surface: SurfaceState,
     view: ViewState,
     session: SessionState,
+    callbacks: Callbacks,
+}
+
+/// Callbacks the app hands to the browser over and over, made once. Each reaches the app through
+/// `with_app` and captures nothing, so one closure serves every call: no allocation per frame, and
+/// no closure leaked per scan.
+struct Callbacks {
+    /// One animation frame, for `requestAnimationFrame`.
+    tick: Closure<dyn FnMut(f64)>,
+    /// The "Scanning... Ns" status, for `setInterval` while a scan runs.
+    scan_timer: Closure<dyn FnMut()>,
+}
+
+impl Callbacks {
+    fn new() -> Self {
+        Self {
+            tick: Closure::new(|_: f64| {
+                with_app(|app| {
+                    let _ = app.borrow_mut().tick();
+                });
+            }),
+            scan_timer: Closure::new(|| {
+                with_app(|app| {
+                    let app = app.borrow();
+                    let seconds = (app.now() - app.session.scan_start_time) / 1000.0;
+                    app.chrome
+                        .status_element
+                        .set_text_content(Some(&format!("Scanning... {seconds:.1}s")));
+                });
+            }),
+        }
+    }
 }
 
 /// `devicePixelRatio` can report 0 in some headless/embedded contexts; fall back to 1 so the
@@ -236,6 +268,7 @@ impl TreemapApp {
                 ws_callbacks: None,
                 reconnect_attempts: 0,
             },
+            callbacks: Callbacks::new(),
         })
     }
 
