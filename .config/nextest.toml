@@ -1,17 +1,23 @@
 [profile.default]
 slow-timeout = { period = "30s", terminate-after = 3 }
 
-[profile.ci]
-retries = 2
-slow-timeout = { period = "60s", terminate-after = 3 }
-
 [[profile.default.overrides]]
 filter = 'test(/^visual/)'
 slow-timeout = { period = "120s", terminate-after = 2 }
 threads-required = 1
+
+# Retries are for the browser tests only: they drive three real browsers on shared CI runners.
+# Everything else must pass first time, so a flaky unit or scanner test fails CI instead of
+# hiding behind a retry. A retried test still shows up as FLAKY, with its trace uploaded.
+[profile.ci]
+slow-timeout = { period = "60s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
 filter = 'test(/^visual/)'
 slow-timeout = { period = "120s", terminate-after = 2 }
 retries = 1
 threads-required = 1
+
+[[profile.ci.overrides]]
+filter = 'test(/^e2e/)'
+retries = 2

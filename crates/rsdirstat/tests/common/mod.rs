@@ -4,54 +4,71 @@ use std::io::{BufRead, BufReader};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use futures_util::FutureExt;
 use playwright_rs::protocol::WaitForFunctionOptions;
 
-/// Ensure the trunk frontend bundle exists; debug builds of the server read it from
-/// `crates/rsdirstat/dist` on disk (rust-embed only embeds in release), so the e2e/visual tests
-/// need it present. This is test-only orchestration (it never runs during a normal `cargo build`),
-/// so it does not reintroduce a build script.
+/// Ensure the trunk frontend bundle is built and up to date; debug builds of the server read it
+/// from `crates/rsdirstat/dist` on disk (rust-embed only embeds in release), so the e2e/visual
+/// tests need it, and a bundle older than the frontend sources would test stale code. This is
+/// test-only orchestration (it never runs during a normal `cargo build`), so it does not
+/// reintroduce a build script.
 ///
 /// nextest runs every test in its own process, so a `std::sync::Once` cannot serialize this —
 /// dozens of test processes would launch `trunk build` concurrently and race on trunk's shared
-/// wasm-bindgen download. So: skip if the bundle is already built (CI builds it once up front), and
-/// otherwise take a cross-process lock (atomic `create_dir`) so only one process builds at a time.
+/// wasm-bindgen download. Each process takes an OS file lock, which the OS releases when the
+/// process exits (so a killed run can't leave the next one waiting), and the first to find the
+/// bundle stale rebuilds it. CI builds it up front, so there it is always fresh.
+#[allow(clippy::incompatible_msrv)] // `File::lock` (1.89): test-only, and the dev-deps need newer Rust anyway
 fn ensure_frontend_built() {
     // Trunk.toml lives at the workspace root (two levels up from this crate).
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let bundle = root.join("crates/rsdirstat/dist/rsdirstat-wasm.js");
-    if bundle.exists() {
+    std::fs::create_dir_all(root.join("target")).unwrap();
+    let lock = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join("target/.trunk-build.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    if frontend_is_fresh(&root) {
         return;
     }
-    let lock = root.join("target/.trunk-build.lock");
-    let deadline = Instant::now() + Duration::from_secs(180);
-    loop {
-        if bundle.exists() {
-            return;
-        }
-        match std::fs::create_dir(&lock) {
-            Ok(()) => {
-                let status = Command::new("trunk")
-                    .arg("build")
-                    .current_dir(&root)
-                    .status()
-                    .expect("failed to run `trunk build` — is trunk installed? (cargo install trunk)");
-                // Release the lock before asserting so a failed build doesn't strand other waiters.
-                let _ = std::fs::remove_dir(&lock);
-                assert!(status.success(), "trunk build failed with status {status}");
-                return;
-            }
-            Err(_) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out waiting for another process to run `trunk build`"
-                );
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
+    let status = Command::new("trunk")
+        .arg("build")
+        .current_dir(&root)
+        .status()
+        .expect("failed to run `trunk build` — is trunk installed? (cargo install trunk)");
+    assert!(status.success(), "trunk build failed with status {status}");
+}
+
+/// Whether the bundle exists and is newer than everything trunk builds it from.
+fn frontend_is_fresh(root: &Path) -> bool {
+    let Ok(built) =
+        std::fs::metadata(root.join("crates/rsdirstat/dist/rsdirstat-wasm_bg.wasm")).and_then(|m| m.modified())
+    else {
+        return false;
+    };
+    ["crates/wasm", "crates/protocol/src", "Trunk.toml", "Cargo.lock"]
+        .iter()
+        .all(|input| newest_mtime(&root.join(input)) <= built)
+}
+
+fn newest_mtime(path: &Path) -> SystemTime {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return SystemTime::UNIX_EPOCH;
+    };
+    let own = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    if !meta.is_dir() {
+        return own;
     }
+    std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| newest_mtime(&entry.path()))
+        .fold(own, SystemTime::max)
 }
 
 pub struct TestServer {
@@ -167,26 +184,38 @@ pub async fn launch_browser_sized(
     (pw, browser, page)
 }
 
-/// Wait for the scan to finish, then let the treemap settle so callers can
-/// screenshot a stable frame.
-///
-/// `" dirs"` is the completion marker: while scanning, the frontend's interval
-/// timer writes `"Scanning... {n}s"`, and only the layout handler swaps in
-/// `"{dirs} dirs — {size}"`. Polling that predicate inside the page costs one
-/// driver round-trip instead of one per attempt, and the driver enforces the
-/// timeout itself, so a hang reports `Timeout 10000ms exceeded` rather than a
-/// bare panic.
-///
-/// The trailing sleep stays hand-rolled: the treemap paints to a canvas, so
-/// there is no DOM predicate for "render settled" to wait on instead.
+/// Wait for the scan to finish and its last layout to be drawn, so callers can assert on or
+/// screenshot a stable treemap.
 pub async fn wait_for_scan_done(page: &playwright_rs::Page) {
-    page.wait_for_function(
-        "() => document.querySelector('#status')?.textContent?.includes(' dirs')",
-        WaitForFunctionOptions::default().timeout(10_000.0),
-    )
-    .await
-    .expect("scan did not complete within 10 seconds");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_layout_after(page, 0).await;
+}
+
+/// How many layouts the page has received (`data-layout-seq` on the canvas, 0 before the first).
+/// Read it before an action that should produce a new layout, then pass it to
+/// [`wait_for_layout_after`].
+pub async fn layout_seq(page: &playwright_rs::Page) -> u64 {
+    page.evaluate_value("() => Number(document.querySelector('#treemap')?.dataset.layoutSeq ?? 0)")
+        .await
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// Wait until the page has received a layout newer than `after`, the scan is done, and that
+/// layout's final frame is drawn (any zoom animation has finished).
+///
+/// The frontend writes these markers as `data-*` attributes on the canvas, so the wait polls
+/// inside the page: one driver round-trip, and the driver enforces the timeout, so a hang reports
+/// `Timeout 10000ms exceeded` instead of a bare panic.
+pub async fn wait_for_layout_after(page: &playwright_rs::Page, after: u64) {
+    let settled = format!(
+        "() => {{ const d = document.querySelector('#treemap')?.dataset; \
+         return !!d && Number(d.layoutSeq) > {after} && d.scanDone === 'true' \
+         && d.renderedSeq === d.layoutSeq; }}"
+    );
+    page.wait_for_function(&settled, WaitForFunctionOptions::default().timeout(10_000.0))
+        .await
+        .unwrap_or_else(|e| panic!("no settled layout after #{after} within 10 seconds: {e}"));
 }
 
 /// Directory where Playwright failure traces are written. Only tests that fail

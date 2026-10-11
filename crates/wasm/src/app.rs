@@ -108,6 +108,9 @@ struct ViewState {
     /// Last pointer position over the canvas, if the pointer is on it.
     last_mouse: Option<(f64, f64)>,
     scan_done: bool,
+    /// Layouts received so far. Mirrored, with the last one fully drawn and whether the scan is
+    /// done, into `data-*` attributes on the canvas, which the e2e tests wait on.
+    layout_seq: u64,
 }
 
 struct SessionState {
@@ -222,6 +225,7 @@ impl TreemapApp {
                 hovered_ancestor_indices: Vec::new(),
                 last_mouse: None,
                 scan_done: false,
+                layout_seq: 0,
             },
             session: SessionState {
                 wait_mode,

@@ -51,6 +51,9 @@ impl TreemapApp {
                     .fill_rect(0.0, 0.0, self.surface.canvas_width, self.surface.canvas_height);
                 draw_rects(&self.surface.buffer_context, &self.view.rects, true)?;
                 self.view.buffer_dirty = false;
+                self.surface
+                    .canvas
+                    .set_attribute("data-rendered-seq", &self.view.layout_seq.to_string())?;
             }
             self.surface.ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)?;
             self.surface

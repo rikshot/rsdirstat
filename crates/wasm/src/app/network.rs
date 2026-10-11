@@ -161,6 +161,8 @@ impl TreemapApp {
                 self.start_scan_timer()?;
                 self.build_breadcrumb()?;
                 set_hidden(&self.chrome.change_button, true)?;
+                self.view.scan_done = false;
+                self.surface.canvas.set_attribute("data-scan-done", "false")?;
             }
             Some(ServerMessage::Layout(payload)) => {
                 set_hidden(&self.chrome.treemap_view, false)?;
@@ -245,6 +247,11 @@ impl TreemapApp {
                 .set_text_content(Some(&format!("{dir_count} dirs — {}", format_size(root_size))));
         }
         self.view.scan_done = new_scan_done;
+
+        self.view.layout_seq += 1;
+        let canvas = &self.surface.canvas;
+        canvas.set_attribute("data-layout-seq", &self.view.layout_seq.to_string())?;
+        canvas.set_attribute("data-scan-done", if new_scan_done { "true" } else { "false" })?;
         Ok(())
     }
 }

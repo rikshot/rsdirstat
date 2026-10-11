@@ -2,7 +2,8 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestServer, create_test_dir, launch_browser, wait_for_scan_done};
+use common::{TestServer, create_test_dir, launch_browser, layout_seq, wait_for_layout_after, wait_for_scan_done};
+use playwright_rs::expect;
 use playwright_rs::protocol::{HoverOptions, Position, WaitForFunctionOptions, WaitForOptions};
 
 /// Serve a scan of `dir`, open it in `browser_name`, wait for the scan, then run `f` on the page.
@@ -64,8 +65,9 @@ async fn depth_selector_changes_value(page: &playwright_rs::Page) {
     let depth = page.locator("#depth");
     assert_eq!(depth.input_value(None).await.unwrap(), "6");
 
+    let before = layout_seq(page).await;
     depth.select_option("1", None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_layout_after(page, before).await;
 
     assert_eq!(depth.input_value(None).await.unwrap(), "1");
 }
@@ -74,8 +76,9 @@ async fn color_mode_changes_layout(page: &playwright_rs::Page) {
     let canvas = page.locator("#treemap");
     let initial = canvas.screenshot(None).await.unwrap();
 
+    let before = layout_seq(page).await;
     page.locator("#color-mode").select_option("1", None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_layout_after(page, before).await;
 
     let after = canvas.screenshot(None).await.unwrap();
     assert_ne!(initial, after, "changing color mode should change the treemap");
@@ -86,24 +89,29 @@ async fn filter_by_extension(page: &playwright_rs::Page) {
     let initial = canvas.screenshot(None).await.unwrap();
 
     let filter_ext = page.locator("#filter-ext");
+    let before = layout_seq(page).await;
     filter_ext.fill("rs", None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    wait_for_layout_after(page, before).await;
 
     let filtered = canvas.screenshot(None).await.unwrap();
     assert_ne!(initial, filtered, "extension filter should change the treemap");
 
+    let before = layout_seq(page).await;
     page.locator("#filter-clear").click(None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_layout_after(page, before).await;
 
     assert!(filter_ext.input_value(None).await.unwrap().is_empty());
+    let cleared = canvas.screenshot(None).await.unwrap();
+    assert_eq!(initial, cleared, "clearing the filter should restore the treemap");
 }
 
 async fn filter_by_name(page: &playwright_rs::Page) {
     let canvas = page.locator("#treemap");
     let initial = canvas.screenshot(None).await.unwrap();
 
+    let before = layout_seq(page).await;
     page.locator("#filter-name").fill("main", None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    wait_for_layout_after(page, before).await;
 
     let filtered = canvas.screenshot(None).await.unwrap();
     assert_ne!(initial, filtered, "name filter should change the treemap");
@@ -113,8 +121,9 @@ async fn filter_by_min_size(page: &playwright_rs::Page) {
     let canvas = page.locator("#treemap");
     let initial = canvas.screenshot(None).await.unwrap();
 
+    let before = layout_seq(page).await;
     page.locator("#filter-min").fill("3", None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    wait_for_layout_after(page, before).await;
 
     let filtered = canvas.screenshot(None).await.unwrap();
     assert_ne!(initial, filtered, "size filter should change the treemap");
@@ -129,13 +138,7 @@ async fn hover_shows_tooltip(page: &playwright_rs::Page) {
     assert_eq!(display, "none");
 
     page.locator("#treemap").hover(None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let display = tooltip
-        .evaluate::<String, ()>("el => getComputedStyle(el).display", None)
-        .await
-        .unwrap();
-    assert_ne!(display, "none");
+    expect(tooltip).not().to_have_css("display", "none").await.unwrap();
 
     assert!(
         !page
@@ -162,9 +165,7 @@ async fn hover_shows_path_bar(page: &playwright_rs::Page) {
     assert!(path_text.text_content().await.unwrap().unwrap_or_default().is_empty());
 
     page.locator("#treemap").hover(None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    assert!(!path_text.text_content().await.unwrap().unwrap_or_default().is_empty());
+    expect(path_text).to_have_text_regex(r"\S").await.unwrap();
     assert!(
         !page
             .locator("#path-size")
@@ -180,28 +181,27 @@ async fn hover_shows_path_bar(page: &playwright_rs::Page) {
 /// bars: just inside its top-left is the "src" folder's header strip, just inside its bottom-left is
 /// `src/main.rs`. Regression: hover once landed on whatever was ~60px below the cursor.
 async fn hover_hits_rect_under_cursor(page: &playwright_rs::Page) {
-    let canvas = page.locator("#treemap");
-    let height: f64 = page
-        .evaluate_value("() => document.querySelector('#treemap').clientHeight")
+    let height = canvas_height(page).await;
+    for (y, expected) in [(5.0, "/src$"), (height - 5.0, r"/src/main\.rs$")] {
+        hover_canvas_at(page, 20.0, y).await;
+        expect(page.locator("#path-text"))
+            .to_have_text_regex(expected)
+            .await
+            .unwrap_or_else(|e| panic!("hover at canvas y={y}: {e}"));
+    }
+}
+
+async fn canvas_height(page: &playwright_rs::Page) -> f64 {
+    page.evaluate_value("() => document.querySelector('#treemap').clientHeight")
         .await
         .unwrap()
         .parse()
-        .unwrap();
-    for (y, expected) in [(5.0, "/src"), (height - 5.0, "/src/main.rs")] {
-        let at = HoverOptions::builder().position(Position { x: 20.0, y }).build();
-        canvas.hover(Some(at)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let path = page
-            .locator("#path-text")
-            .text_content()
-            .await
-            .unwrap()
-            .unwrap_or_default();
-        assert!(
-            path.ends_with(expected),
-            "hover at canvas y={y}: path {path:?}, expected …{expected}"
-        );
-    }
+        .unwrap()
+}
+
+async fn hover_canvas_at(page: &playwright_rs::Page, x: f64, y: f64) {
+    let at = HoverOptions::builder().position(Position { x, y }).build();
+    page.locator("#treemap").hover(Some(at)).await.unwrap();
 }
 
 async fn click_navigates_into_directory(page: &playwright_rs::Page) {
@@ -209,8 +209,9 @@ async fn click_navigates_into_directory(page: &playwright_rs::Page) {
     let initial_text = crumbs.text_content().await.unwrap().unwrap();
     let initial_parts: Vec<&str> = initial_text.split('/').collect();
 
+    let before = layout_seq(page).await;
     page.locator("#treemap").click(None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    wait_for_layout_after(page, before).await;
 
     let after_text = crumbs.text_content().await.unwrap().unwrap();
     let after_parts: Vec<&str> = after_text.split('/').collect();
@@ -222,14 +223,16 @@ async fn click_navigates_into_directory(page: &playwright_rs::Page) {
 }
 
 async fn breadcrumb_click_navigates_back(page: &playwright_rs::Page) {
+    let before = layout_seq(page).await;
     page.locator("#treemap").click(None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    wait_for_layout_after(page, before).await;
 
     let crumbs = page.locator("#crumbs");
     let deep_text = crumbs.text_content().await.unwrap().unwrap();
 
+    let before = layout_seq(page).await;
     page.locator("#crumbs span:first-child").click(None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    wait_for_layout_after(page, before).await;
 
     let back_text = crumbs.text_content().await.unwrap().unwrap();
     assert!(
@@ -302,14 +305,12 @@ async fn rescan_button_works(page: &playwright_rs::Page) {
     let classes = rescan.evaluate::<String, ()>("el => el.className", None).await.unwrap();
     assert!(!classes.contains("hidden"), "rescan should be visible: {classes}");
 
+    let before = layout_seq(page).await;
     rescan.click(None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_layout_after(page, before).await;
 
     let text = page.locator("#status").text_content().await.unwrap().unwrap();
-    assert!(
-        text.contains("dirs") || text.contains("Scanning"),
-        "after rescan: {text}"
-    );
+    assert!(text.contains(" dirs in "), "after rescan: {text}");
 }
 
 async fn js_unit_tests(page: &playwright_rs::Page) {
