@@ -305,10 +305,12 @@ async fn picker_volume_click_starts_scan(page: &playwright_rs::Page) {
 
 async fn picker_has_volume_details(page: &playwright_rs::Page) {
     assert!(page.locator("#picker").is_visible().await.unwrap());
-    assert!(
-        page.locator(".volume-card:first-child").is_visible().await.unwrap(),
-        "should show at least one volume card"
-    );
+    // The cards arrive with the page's `/volumes` request, after the picker itself.
+    page.locator(".volume-card")
+        .first()
+        .wait_for(visible())
+        .await
+        .expect("should show at least one volume card");
 
     let name = page
         .locator(".volume-card:first-child .volume-name")
