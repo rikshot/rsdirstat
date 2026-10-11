@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::ffi::CStr;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -18,6 +18,10 @@ const VDIR: u32 = 2;
 // surfaced via ATTR_CMN_FLAGS; reading attributes never triggers a download.
 const SF_DATALESS: u32 = 0x4000_0000;
 
+/// `ATTR_DIR_MOUNTSTATUS` bit (from <sys/attr.h>, not exposed by libc) marking a directory that
+/// mounts something when looked into: an autofs trigger.
+const DIR_MNTSTATUS_TRIGGER: u32 = 0x2;
+
 static SCAN_ATTRS: libc::attrlist = libc::attrlist {
     bitmapcount: libc::ATTR_BIT_MAP_COUNT,
     reserved: 0,
@@ -29,7 +33,9 @@ static SCAN_ATTRS: libc::attrlist = libc::attrlist {
         | libc::ATTR_CMN_FLAGS
         | libc::ATTR_CMN_FILEID,
     volattr: 0,
-    dirattr: 0,
+    // MOUNTSTATUS: a mount point's DEVID is the device of the directory it covers, so this is how
+    // another filesystem mounted inside the scan shows.
+    dirattr: libc::ATTR_DIR_MOUNTSTATUS,
     // DATALENGTH (logical data-fork length), not TOTALSIZE: the latter adds resource-fork bytes,
     // which Linux (stx_size) and Windows (EndOfFile) don't count, so the same tree would total
     // differently per platform. DATALENGTH matches their apparent-size semantics. LINKCOUNT lets us
@@ -113,8 +119,15 @@ fn read_dir(
                 let id = || node_id(parsed.dev_id as u32 as u64, parsed.file_id);
                 match parsed.obj_type {
                     VDIR => {
-                        let child = UnixDir::Child(Arc::clone(&fd), parsed.c_name.to_owned());
-                        sink.dir(id(), &parsed.name, sink.child_path(&parsed.name), child);
+                        let id = if parsed.mount_status == 0 {
+                            Some(id())
+                        } else {
+                            mount_point_id(&fd, &parsed, root_dev, cross_filesystems)
+                        };
+                        if let Some(id) = id {
+                            let child = UnixDir::Child(Arc::clone(&fd), parsed.c_name.to_owned());
+                            sink.dir(id, &parsed.name, sink.child_path(&parsed.name), child);
+                        }
                     }
                     VREG => {
                         // Unmaterialized cloud placeholders occupy 0 bytes on disk; count them as
@@ -136,6 +149,27 @@ fn read_dir(
     true
 }
 
+/// The node id of the mount point `entry` in the directory `dir`, or `None` if the scan leaves it
+/// out: when not crossing filesystems, one of another filesystem than the root's (a volume, `/dev`),
+/// and an automount trigger, which looking at would mount. The root's own filesystem can be mounted
+/// inside it too: `/System/Volumes/Data`, the data volume `/` reports the device of.
+fn mount_point_id(dir: &OwnedFd, entry: &ParsedEntry, root_dev: i32, cross_filesystems: bool) -> Option<u64> {
+    if !cross_filesystems && entry.mount_status & DIR_MNTSTATUS_TRIGGER != 0 {
+        return None;
+    }
+    // The entry's own attributes are the covered directory's; `fstatat` reports the mount's root.
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    let ok = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            entry.c_name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    (ok == 0 && (cross_filesystems || stat.st_dev == root_dev)).then(|| node_id(stat.st_dev as u32 as u64, stat.st_ino))
+}
+
 struct ParsedEntry<'a> {
     /// The name for display: lossy if it isn't UTF-8, which a network filesystem may pass through.
     name: Cow<'a, str>,
@@ -148,6 +182,8 @@ struct ParsedEntry<'a> {
     nlink: u32,
     mtime: i64,
     dataless: bool,
+    /// A directory's `ATTR_DIR_MOUNTSTATUS`: 0 unless something is (or would be) mounted on it.
+    mount_status: u32,
 }
 
 /// Parse one `getattrlistbulk` entry. The layout is dynamic: a leading `attribute_set_t`
@@ -167,6 +203,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
         return None;
     }
     let returned_common = u32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
+    let returned_dir = u32::from_ne_bytes(entry[pos + 8..pos + 12].try_into().ok()?);
     let returned_file = u32::from_ne_bytes(entry[pos + 12..pos + 16].try_into().ok()?);
     pos += 20;
 
@@ -178,6 +215,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
     let mut file_size = 0u64;
     let mut nlink = 0u32;
     let mut flags = 0u32;
+    let mut mount_status = 0u32;
 
     // Read a fixed-width field only if its bit is set, advancing `pos` past the bytes it occupies.
     macro_rules! field {
@@ -219,6 +257,10 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
     field!(returned_common & libc::ATTR_CMN_FILEID != 0, 8, {
         file_id = u64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
     });
+    // Directory attributes come before file attributes, and only for directories.
+    field!(returned_dir & libc::ATTR_DIR_MOUNTSTATUS != 0, 4, {
+        mount_status = u32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
+    });
     // File attributes only appear for files, so these bits are naturally clear for directories.
     // LINKCOUNT (bit 0x400) precedes DATALENGTH (bit 0x2000) in ascending-bit order.
     field!(returned_file & libc::ATTR_FILE_LINKCOUNT != 0, 4, {
@@ -238,6 +280,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
         nlink,
         mtime,
         dataless: flags & SF_DATALESS != 0,
+        mount_status,
     })
 }
 
@@ -245,10 +288,17 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
 mod tests {
     use super::*;
 
+    /// What a synthetic entry holds besides its common attributes.
+    enum Kind {
+        File { flags: u32, size: u64 },
+        Dir { mount_status: u32 },
+    }
+
     /// Build one synthetic `getattrlistbulk` entry mirroring `parse_entry`'s expected layout: a
     /// leading u32 length, the 5-word returned-attrs bitmap, then each requested attribute in
-    /// ascending-bit order, with the name bytes appended after the fixed fields.
-    fn build_file_entry(name: &str, flags: u32, file_size: u64) -> Vec<u8> {
+    /// ascending-bit order and group order (common, directory, file), with the name bytes appended
+    /// after the fixed fields.
+    fn build_entry(name: &str, kind: Kind) -> Vec<u8> {
         let mut e = Vec::new();
         e.extend_from_slice(&0u32.to_ne_bytes()); // entry length, backfilled below
 
@@ -258,10 +308,13 @@ mod tests {
             | libc::ATTR_CMN_MODTIME
             | libc::ATTR_CMN_FLAGS
             | libc::ATTR_CMN_FILEID;
-        let returned_file: u32 = libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_DATALENGTH;
+        let (obj_type, flags, returned_dir, returned_file) = match kind {
+            Kind::File { flags, .. } => (VREG, flags, 0, libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_DATALENGTH),
+            Kind::Dir { .. } => (VDIR, 0, libc::ATTR_DIR_MOUNTSTATUS, 0),
+        };
         e.extend_from_slice(&returned_common.to_ne_bytes());
         e.extend_from_slice(&0u32.to_ne_bytes()); // vol
-        e.extend_from_slice(&0u32.to_ne_bytes()); // dir
+        e.extend_from_slice(&returned_dir.to_ne_bytes());
         e.extend_from_slice(&returned_file.to_ne_bytes());
         e.extend_from_slice(&0u32.to_ne_bytes()); // fork
 
@@ -270,13 +323,18 @@ mod tests {
         e.extend_from_slice(&0i32.to_ne_bytes()); // offset, backfilled
         e.extend_from_slice(&((name.len() + 1) as u32).to_ne_bytes());
         e.extend_from_slice(&7i32.to_ne_bytes()); // DEVID
-        e.extend_from_slice(&VREG.to_ne_bytes()); // OBJTYPE
+        e.extend_from_slice(&obj_type.to_ne_bytes()); // OBJTYPE
         e.extend_from_slice(&111i64.to_ne_bytes()); // MODTIME tv_sec
         e.extend_from_slice(&0i64.to_ne_bytes()); // MODTIME tv_nsec
         e.extend_from_slice(&flags.to_ne_bytes()); // FLAGS
         e.extend_from_slice(&42u64.to_ne_bytes()); // FILEID
-        e.extend_from_slice(&1u32.to_ne_bytes()); // LINKCOUNT
-        e.extend_from_slice(&file_size.to_ne_bytes()); // DATALENGTH
+        match kind {
+            Kind::File { size, .. } => {
+                e.extend_from_slice(&1u32.to_ne_bytes()); // LINKCOUNT
+                e.extend_from_slice(&size.to_ne_bytes()); // DATALENGTH
+            }
+            Kind::Dir { mount_status } => e.extend_from_slice(&mount_status.to_ne_bytes()),
+        }
 
         let name_pos = e.len();
         e.extend_from_slice(name.as_bytes());
@@ -287,6 +345,20 @@ mod tests {
         let len = e.len() as u32;
         e[0..4].copy_from_slice(&len.to_ne_bytes());
         e
+    }
+
+    fn build_file_entry(name: &str, flags: u32, size: u64) -> Vec<u8> {
+        build_entry(name, Kind::File { flags, size })
+    }
+
+    #[test]
+    fn mount_status_is_read_for_directories() {
+        for mount_status in [0, libc::DIR_MNTSTATUS_MNTPOINT, DIR_MNTSTATUS_TRIGGER] {
+            let entry = build_entry("Volumes", Kind::Dir { mount_status });
+            let parsed = parse_entry(&entry).expect("entry should parse");
+            assert_eq!((parsed.obj_type, &*parsed.name), (VDIR, "Volumes"));
+            assert_eq!(parsed.mount_status, mount_status);
+        }
     }
 
     #[test]
