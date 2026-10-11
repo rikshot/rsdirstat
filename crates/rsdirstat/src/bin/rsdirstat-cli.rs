@@ -39,7 +39,7 @@ struct Args {
     #[arg(long)]
     all: bool,
 
-    /// Scan with this many threads, any number [default: one per CPU; on macOS 4]
+    /// Scan with this many threads, any number [default: one per CPU; two on Linux; 4 on macOS]
     #[arg(long)]
     threads: Option<NonZeroUsize>,
 }

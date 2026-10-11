@@ -112,6 +112,11 @@ fn statx_fd(fd: i32, mask: u32) -> Option<Statx> {
     statx(fd, c"", libc::AT_EMPTY_PATH, mask)
 }
 
+/// Worker threads per CPU by default. A scan of files not yet cached waits on the disk, and more
+/// requests in flight hide that: on a Ryzen 9 5900HS with an NVMe drive, the ext4 root scans cold
+/// in 0.39 s with 32 threads against 0.58 s with 16, while warm 32 cost 0.02 s (0.14 s, 0.12 s).
+const THREADS_PER_CPU: usize = 2;
+
 /// Scan `root`, stopping promptly once `cancel` is set (the server sets it when it shuts down
 /// mid-scan).
 pub fn scan(
@@ -131,7 +136,9 @@ pub fn scan(
         dir_id(&sx),
         tx,
         cancel,
-        options.threads.map_or_else(cpu_count, NonZeroUsize::get),
+        options
+            .threads
+            .map_or_else(|| cpu_count() * THREADS_PER_CPU, NonZeroUsize::get),
         move |dir, buffer, sink| read_dir(dir, buffer, sink, root_filesystem, options.cross_filesystems),
     );
     Ok(())

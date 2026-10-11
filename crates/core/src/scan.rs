@@ -201,8 +201,11 @@ pub struct ScanOptions {
     pub threads: Option<NonZeroUsize>,
 }
 
-/// Size of each worker's buffer for directory reads.
-const READ_BUFFER_SIZE: usize = 1024 * 1024;
+/// Size of each worker's buffer for directory reads. Measured from 16 KiB to 1 MiB, it makes no
+/// difference on Linux (`getdents64`) or macOS (`getattrlistbulk`). On Windows the file system
+/// filters pay for a large buffer on every listing call: C:\Windows scans about 10% faster with
+/// 64 KiB than with 1 MiB on one thread, 6% on 16.
+const READ_BUFFER_SIZE: usize = 64 * 1024;
 
 /// How long the scan may go without any progress before it is treated as stuck. Every read from the
 /// OS and every few entries count as progress, so only a syscall blocked this long on every busy

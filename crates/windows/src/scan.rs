@@ -178,12 +178,6 @@ fn classify(attrs: u32, reparse_tag: u32, end_of_file: i64, allocation_size: i64
     }
 }
 
-/// How much of the worker's buffer each listing call is given. The file system filters on a Windows
-/// volume (Defender, compression, bind links, ...) handle every call, and a large buffer costs them:
-/// C:\Windows scans about 10% faster with 64 KiB than with 1 MiB on one thread, 6% on 16. Smaller
-/// gains nothing.
-const LISTING_BUFFER_SIZE: usize = 64 * 1024;
-
 /// Read one directory with `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`, which returns
 /// entries with their sizes, times and attributes in batches.
 fn read_dir(
@@ -193,8 +187,6 @@ fn read_dir(
     root_volume_serial: u32,
     cross_filesystems: bool,
 ) -> bool {
-    let len = LISTING_BUFFER_SIZE.min(buffer.len());
-    let buffer = &mut buffer[..len];
     loop {
         let ok = unsafe {
             GetFileInformationByHandleEx(
