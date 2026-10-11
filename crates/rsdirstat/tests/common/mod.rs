@@ -3,8 +3,8 @@
 use std::io::{BufRead, BufReader};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::FutureExt;
 use playwright_rs::protocol::WaitForFunctionOptions;
@@ -92,13 +92,15 @@ impl TestServer {
 
     fn spawn(args: &[&str]) -> Self {
         ensure_frontend_built();
-        let bin = env!("CARGO_BIN_EXE_rsdirstat");
-        let mut child = Command::new(bin)
-            .args(args)
-            .stderr(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("failed to start rsdirstat");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rsdirstat"));
+        command.args(args).stderr(Stdio::piped()).stdout(Stdio::null());
+        // In a process group of its own, so `stop` can send it Ctrl+Break.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(
+            &mut command,
+            windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP,
+        );
+        let mut child = command.spawn().expect("failed to start rsdirstat");
 
         let stderr = child.stderr.take().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -123,18 +125,55 @@ impl TestServer {
             .expect("server did not print its URL within 10s");
         TestServer { child, url }
     }
-}
 
-impl Drop for TestServer {
-    fn drop(&mut self) {
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Wait up to `timeout` for the server to exit; how it exited, if it did.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Stop the server the way a terminal would (SIGTERM, or Ctrl+Break on Windows) and wait for it
+    /// to exit, killing it after 10s. A clean exit writes the server's coverage data, which a kill
+    /// would lose.
+    pub fn stop(&mut self) -> ExitStatus {
+        // Never signal a process that has already exited: its id may belong to another by now.
+        if let Ok(Some(status)) = self.child.try_wait() {
+            return status;
+        }
         #[cfg(unix)]
         unsafe {
             libc::kill(self.child.id() as i32, libc::SIGTERM);
         }
-        #[cfg(not(unix))]
-        let _ = self.child.kill();
+        // Sent to the server's own process group (see `spawn`).
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(
+                windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
+                self.child.id(),
+            );
+        }
+        self.wait_for_exit(Duration::from_secs(10)).unwrap_or_else(|| {
+            let _ = self.child.kill();
+            self.child.wait().expect("failed to wait for rsdirstat")
+        })
+    }
+}
 
-        let _ = self.child.wait();
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

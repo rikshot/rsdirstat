@@ -290,8 +290,14 @@ async fn shutdown_signal(state: Arc<AppState>) {
             .recv()
             .await;
     };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    // What a console sends a process group to stop it; the tests stop the server this way.
+    #[cfg(windows)]
+    let terminate = async {
+        tokio::signal::windows::ctrl_break()
+            .expect("failed to install Ctrl+Break handler")
+            .recv()
+            .await;
+    };
     tokio::select! {
         _ = terminate => {},
         _ = tokio::signal::ctrl_c() => {},
@@ -695,6 +701,22 @@ async fn volumes_handler() -> Json<Vec<wire::VolumeInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page names a file to reveal, and the server joins that name onto a scanned directory, so a
+    /// name that could climb out of it (`..`, a path, an absolute path) must be refused.
+    #[test]
+    fn reveal_names_must_be_one_plain_component() {
+        for name in ["a.txt", "My File.pdf", ".hidden", "..rc", "notes..", "a/"] {
+            assert!(is_safe_component(name), "{name:?} should be allowed");
+        }
+        for name in ["", ".", "..", "./a", "a/b", "a/..", "../etc/passwd", "/etc/passwd"] {
+            assert!(!is_safe_component(name), "{name:?} should be refused");
+        }
+        #[cfg(windows)]
+        for name in [r"a\b", r"..\x", r"C:\Windows", "C:x", r"\\server\share"] {
+            assert!(!is_safe_component(name), "{name:?} should be refused");
+        }
+    }
 
     #[test]
     fn loopback_origins_are_allowed() {

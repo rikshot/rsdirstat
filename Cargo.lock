@@ -1559,6 +1559,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower-http",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

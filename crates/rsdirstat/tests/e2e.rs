@@ -1,5 +1,9 @@
 mod common;
 
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
+
 use common::{
     TestServer, assert_no_layout_after, create_test_dir, launch_browser, layout_seq, wait_for_layout_after,
     wait_for_scan_done,
@@ -536,32 +540,85 @@ async fn e2e_wait_mode_start_button_starts_scan() {
     let _ = browser.close().await;
 }
 
-// Server lifecycle (no browser). SIGTERM mid-scan must cancel the walk: it runs on tokio's blocking
-// pool, which the runtime waits on at exit, so an uncancelled whole-disk scan kept the process alive
-// until it finished (60–100s on CI runners).
-#[cfg(unix)]
+// Server lifecycle (no browser). Stopping the server mid-scan (SIGTERM, or Ctrl+Break on Windows)
+// must cancel the walk: it runs on tokio's blocking pool, which the runtime waits on at exit, so an
+// uncancelled whole-disk scan kept the process alive until it finished (60–100s on CI runners). And
+// it must be a clean exit, not a kill, or the server's coverage data is lost.
 #[test]
-fn e2e_sigterm_mid_scan_exits_promptly() {
-    use std::time::{Duration, Instant};
-
-    let server = TestServer::start(std::path::Path::new("/"));
+fn e2e_stop_mid_scan_exits_promptly() {
+    let mut server = TestServer::start(std::path::Path::new("/"));
     std::thread::sleep(Duration::from_millis(500));
     let started = Instant::now();
-    drop(server); // SIGTERM, then wait for exit
+    let status = server.stop();
     let took = started.elapsed();
     assert!(
+        status.success(),
+        "the server should exit cleanly, not be killed: {status}"
+    );
+    assert!(
         took < Duration::from_secs(5),
-        "server took {took:?} to exit after SIGTERM mid-scan"
+        "server took {took:?} to exit after being stopped mid-scan"
+    );
+}
+
+/// A TCP connection to the server, as `TestServer::url`'s host names it.
+fn connect(server: &TestServer) -> TcpStream {
+    let port = server.url.rsplit_once(':').unwrap().1;
+    TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap()
+}
+
+/// Open the WebSocket a tab holds while it is open. Dropping the stream closes it, as closing the
+/// tab does.
+fn open_tab(server: &TestServer) -> TcpStream {
+    let mut stream = connect(server);
+    let host = server.url.trim_start_matches("http://");
+    write!(
+        stream,
+        "GET /ws HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    )
+    .unwrap();
+    let mut status = String::new();
+    BufReader::new(&stream).read_line(&mut status).unwrap();
+    assert!(status.starts_with("HTTP/1.1 101"), "WebSocket refused: {status}");
+    stream
+}
+
+/// The server exits a few seconds after its last tab closes, but not when a tab reloads: that
+/// closes its connection and opens a new one within the grace period.
+#[test]
+fn e2e_server_exits_after_its_last_tab_closes() {
+    let mut server = TestServer::start_picker();
+    drop(open_tab(&server));
+    let first_closed = Instant::now();
+    std::thread::sleep(Duration::from_secs(2));
+    let reloaded = open_tab(&server);
+    std::thread::sleep(Duration::from_secs(1));
+    drop(reloaded);
+    let last_closed = Instant::now();
+
+    // The grace period after the first close (5s) ends halfway through this wait.
+    std::thread::sleep(Duration::from_millis(6_500).saturating_sub(first_closed.elapsed()));
+    assert!(
+        server.is_running(),
+        "the server exited after a tab's first connection closed, though the tab reloaded"
+    );
+    let status = server
+        .wait_for_exit(Duration::from_secs(10))
+        .expect("the server should exit once its last tab has closed");
+    assert!(status.success(), "{status}");
+    assert!(
+        last_closed.elapsed() >= Duration::from_millis(4_500),
+        "the server exited {:?} after the last tab closed, before the grace period ended",
+        last_closed.elapsed()
     );
 }
 
 /// Send a raw GET with the given extra headers and return the status code. `host` overrides the
 /// `Host` header.
 fn http_status(server: &TestServer, path: &str, host: Option<&str>, headers: &[(&str, &str)]) -> u16 {
-    use std::io::{Read, Write};
     let authority = server.url.trim_start_matches("http://");
-    let port = authority.rsplit_once(':').unwrap().1;
-    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+    let mut stream = connect(server);
     let mut request = format!(
         "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
         host.unwrap_or(authority)
