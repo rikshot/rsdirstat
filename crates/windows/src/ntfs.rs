@@ -26,6 +26,9 @@ const REPARSE_POINT: u32 = 0xC0;
 const END_OF_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 /// `$FILE_NAME`'s namespace for a DOS 8.3 short name that has a long one besides.
 const DOS_NAMESPACE: u8 = 2;
+/// An attribute's flags for a compressed or a sparse stream, whose header then also has the space
+/// the stream takes on the disk.
+const COMPRESSED_OR_SPARSE: u16 = 0x0001 | 0x8000;
 
 /// The record of a volume's root folder.
 const ROOT_FOLDER: usize = 5;
@@ -84,9 +87,9 @@ impl FileRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Record {
     Base(FileRecord),
-    /// An extension record: attributes that didn't fit in the record numbered `base`.
+    /// An extension record: attributes that didn't fit in the base record, whose reference is `base`.
     Extension {
-        base: usize,
+        base: u64,
         attributes: FileRecord,
     },
 }
@@ -103,9 +106,8 @@ pub fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
 }
 
-/// Parse one MFT record as read from the disk, undoing its fixups in place. `None` for a record not
-/// in use, and for one torn by a write in progress while it was read.
-pub fn parse_record(record: &mut [u8]) -> Option<Record> {
+/// Where a record's fixup array is, and how many entries it has, if it looks like a record.
+fn fixup_array(record: &[u8]) -> Option<(usize, usize)> {
     if record.len() < 0x30 || &record[..4] != b"FILE" {
         return None;
     }
@@ -114,13 +116,28 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
     if fixup_count == 0 || fixups + 2 * fixup_count > record.len() || (fixup_count - 1) * FIXUP_STRIDE > record.len() {
         return None;
     }
-    // Each stride's last two bytes were swapped for the record's update sequence number, and the
-    // originals kept in the fixup array: a mismatch means that stride was written after the others.
+    Some((fixups, fixup_count))
+}
+
+/// Whether a record as read from the disk was caught being rewritten. Each stride's last two bytes
+/// were swapped for the record's update sequence number, and the originals kept in the fixup array:
+/// a mismatch means that stride was written after the others. Read again, it won't be.
+pub fn is_torn(record: &[u8]) -> bool {
+    let Some((fixups, fixup_count)) = fixup_array(record) else {
+        return false;
+    };
+    (1..fixup_count).any(|i| record[i * FIXUP_STRIDE - 2..i * FIXUP_STRIDE] != record[fixups..fixups + 2])
+}
+
+/// Parse one MFT record as read from the disk, undoing its fixups in place. `None` for a record not
+/// in use, and for one torn by a write in progress while it was read.
+pub fn parse_record(record: &mut [u8]) -> Option<Record> {
+    let (fixups, fixup_count) = fixup_array(record)?;
+    if is_torn(record) {
+        return None;
+    }
     for i in 1..fixup_count {
         let end = i * FIXUP_STRIDE;
-        if record[end - 2..end] != record[fixups..fixups + 2] {
-            return None;
-        }
         record[end - 2] = record[fixups + 2 * i];
         record[end - 1] = record[fixups + 2 * i + 1];
     }
@@ -137,6 +154,7 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
     let used = (u32_at(record, 0x18) as usize).min(record.len());
     // A reparse point's tag, as its names record it, for when `$REPARSE_POINT` isn't in the record.
     let mut name_reparse_tag = 0;
+    let mut is_reparse_point = false;
 
     let mut offset = u16_at(record, 0x14) as usize;
     while offset + 16 <= used {
@@ -161,8 +179,9 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
         match kind {
             STANDARD_INFORMATION if resident => {
                 let value = value();
-                if value.len() >= 16 {
+                if value.len() >= 0x24 {
                     file.mtime = filetime_to_unix(u64_at(value, 8) as i64);
+                    is_reparse_point = u32_at(value, 0x20) & FILE_ATTRIBUTE_REPARSE_POINT != 0;
                 }
             }
             FILE_NAME if resident => {
@@ -194,10 +213,16 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
                 file.size = value().len() as u64;
                 file.allocated = file.size;
             }
-            // A large stream's extents can span records; the one starting at VCN 0 has the sizes.
+            // A large stream's extents can span records; the one starting at VCN 0 has the sizes. A
+            // compressed or sparse one's allocated size counts what isn't on the disk, which its header
+            // then says apart: a dehydrated cloud placeholder has nothing there.
             DATA if unnamed && attribute.len() >= 0x40 && u64_at(attribute, 0x10) == 0 => {
                 file.has_data = true;
-                file.allocated = u64_at(attribute, 0x28);
+                file.allocated = if u16_at(attribute, 0x0C) & COMPRESSED_OR_SPARSE != 0 && attribute.len() >= 0x48 {
+                    u64_at(attribute, 0x40)
+                } else {
+                    u64_at(attribute, 0x28)
+                };
                 file.size = u64_at(attribute, 0x30);
             }
             REPARSE_POINT if resident => {
@@ -209,23 +234,23 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
             _ => {}
         }
     }
-    if file.reparse_tag == 0 {
+    // A name keeps the tag it was given when it was made or renamed, so only while the file is
+    // still a reparse point, as `$STANDARD_INFORMATION` keeps up to date.
+    if file.reparse_tag == 0 && is_reparse_point {
         file.reparse_tag = name_reparse_tag;
     }
     Some(if base == 0 {
         Record::Base(file)
     } else {
-        Record::Extension {
-            base: record_number(base),
-            attributes: file,
-        }
+        Record::Extension { base, attributes: file }
     })
 }
 
 /// A volume's MFT records, gathered in any order as the platform reads them.
 pub struct Mft {
     records: Vec<Option<FileRecord>>,
-    extensions: Vec<(usize, FileRecord)>,
+    /// Extension records: their numbers, their base records' references, and what they add.
+    extensions: Vec<(usize, u64, FileRecord)>,
 }
 
 impl Mft {
@@ -245,7 +270,7 @@ impl Mft {
         }
         match record {
             Record::Base(file) => self.records[number] = Some(file),
-            Record::Extension { base, attributes } => self.extensions.push((base, attributes)),
+            Record::Extension { base, attributes } => self.extensions.push((number, base, attributes)),
         }
     }
 
@@ -254,10 +279,18 @@ impl Mft {
     /// folder under it, parent first. Node ids are those the folder walk gives. Sends nothing, and
     /// returns false, if the root isn't a folder in this MFT. The names sent are taken out of it.
     pub fn send_scan(&mut self, root: &Path, root_reference: u64, volume: u64, tx: &Sender<ScanEvent>) -> bool {
-        for (base, attributes) in std::mem::take(&mut self.extensions) {
-            let Some(Some(file)) = self.records.get_mut(base) else {
+        let mut extensions = std::mem::take(&mut self.extensions);
+        // In record order, so a file's names come in the same order on every scan.
+        extensions.sort_unstable_by_key(|&(number, ..)| number);
+        for (_, base, attributes) in extensions {
+            // Only into the file it was written for, not one that has reused its record since.
+            let number = record_number(base);
+            let Some(Some(file)) = self.records.get_mut(number) else {
                 continue;
             };
+            if reference(number, file.sequence) != base {
+                continue;
+            }
             file.names.extend(attributes.names);
             if attributes.has_data {
                 file.has_data = true;
@@ -441,19 +474,34 @@ mod tests {
         }
 
         fn modified(self, unix: i64) -> Self {
+            self.information(unix, 0)
+        }
+
+        /// `$STANDARD_INFORMATION`: when the file was last modified, and its attributes.
+        fn information(self, unix: i64, attributes: u32) -> Self {
             let mut value = vec![0u8; 48];
             value[8..16].copy_from_slice(&filetime(unix).to_le_bytes());
+            value[0x20..0x24].copy_from_slice(&attributes.to_le_bytes());
             self.resident(STANDARD_INFORMATION, "", &value)
         }
 
-        fn name_in(self, parent: u64, name: &str, namespace: u8) -> Self {
+        /// A `$FILE_NAME`; a reparse point's records its `reparse_tag`.
+        fn file_name(self, parent: u64, name: &str, namespace: u8, reparse_tag: u32) -> Self {
             let units: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
             let mut value = vec![0u8; 0x42 + units.len()];
             value[0..8].copy_from_slice(&parent.to_le_bytes());
+            if reparse_tag != 0 {
+                value[0x38..0x3C].copy_from_slice(&FILE_ATTRIBUTE_REPARSE_POINT.to_le_bytes());
+                value[0x3C..0x40].copy_from_slice(&reparse_tag.to_le_bytes());
+            }
             value[0x40] = (units.len() / 2) as u8;
             value[0x41] = namespace;
             value[0x42..].copy_from_slice(&units);
             self.resident(FILE_NAME, "", &value)
+        }
+
+        fn name_in(self, parent: u64, name: &str, namespace: u8) -> Self {
+            self.file_name(parent, name, namespace, 0)
         }
 
         fn name(self, parent: u64, name: &str) -> Self {
@@ -474,6 +522,15 @@ mod tests {
             attribute[0x30..0x38].copy_from_slice(&size.to_le_bytes());
             attribute[0x38..0x40].copy_from_slice(&size.to_le_bytes());
             self.attributes.extend(attribute);
+            self
+        }
+
+        /// A sparse unnamed stream of which `on_disk` bytes of `allocated` are on the disk.
+        fn sparse_data(mut self, allocated: u64, on_disk: u64, size: u64) -> Self {
+            self = self.large_data(0, allocated, size);
+            let at = self.attributes.len() - 0x48;
+            self.attributes[at + 0x0C..at + 0x0E].copy_from_slice(&0x8000u16.to_le_bytes());
+            self.attributes[at + 0x40..at + 0x48].copy_from_slice(&on_disk.to_le_bytes());
             self
         }
 
@@ -542,7 +599,9 @@ mod tests {
     fn torn_unused_and_foreign_records_are_skipped() {
         let mut torn = Builder::file(1).name(reference(ROOT_FOLDER, 5), "a").build();
         torn[RECORD_SIZE - 1] ^= 0xFF;
+        assert!(is_torn(&torn));
         assert_eq!(parse_record(&mut torn), None);
+        assert!(!is_torn(&Builder::file(1).name(reference(ROOT_FOLDER, 5), "a").build()));
         assert_eq!(parsed(Builder::unused().name(reference(ROOT_FOLDER, 5), "a")), None);
         let mut not_a_record = vec![0u8; RECORD_SIZE];
         assert_eq!(parse_record(&mut not_a_record), None);
@@ -573,7 +632,7 @@ mod tests {
         assert_eq!(
             parsed(Builder::extension_of(reference(47, 1)).large_data(0, 12288, 10_000)),
             Some(Record::Extension {
-                base: 47,
+                base: reference(47, 1),
                 attributes: FileRecord {
                     sequence: 1,
                     has_data: true,
@@ -583,6 +642,21 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn a_name_gives_the_reparse_tag_only_while_the_file_is_a_reparse_point() {
+        let parent = reference(ROOT_FOLDER, 5);
+        // `$REPARSE_POINT` isn't in the record (it's too big, say), so the tag comes from the name.
+        let junction = Builder::folder(1)
+            .information(0, FILE_ATTRIBUTE_REPARSE_POINT)
+            .file_name(parent, "j", 1, JUNCTION_TAG);
+        assert_eq!(base(junction).reparse_tag, JUNCTION_TAG);
+        // Its reparse point removed since, it's a plain folder; the name still has the old tag.
+        let former = Builder::folder(1)
+            .information(0, 0)
+            .file_name(parent, "j", 1, JUNCTION_TAG);
+        assert_eq!(base(former).reparse_tag, 0);
     }
 
     /// The MFT from these records, numbered as given.
@@ -632,11 +706,13 @@ mod tests {
                 Builder::file(1)
                     .name(ville, "cloud")
                     .reparse(CLOUD_TAG_3)
-                    .large_data(0, 0, 500)
+                    .sparse_data(4096, 0, 500)
                     .modified(1500),
             ),
             (45, Builder::file(1).name(reference(20, 99), "orphan").data(70)),
             (46, Builder::extension_of(reference(47, 1)).large_data(0, 12288, 10_000)),
+            // Written for an earlier file in record 47.
+            (49, Builder::extension_of(reference(47, 9)).large_data(0, 4096, 99)),
             (
                 47,
                 Builder::file(1)
@@ -695,8 +771,8 @@ mod tests {
         assert!(sent);
         // Not $Extend's tree, NTFS's metafiles, the junction or the orphan. The hardlink counts once,
         // in the first of its folders. The symlink counts nothing and doesn't make its folder newer;
-        // the dehydrated placeholder counts nothing but, like the empty file, does. The big file's
-        // sizes come from its extension record.
+        // the dehydrated placeholder (sparse, nothing on the disk) counts nothing but, like the empty
+        // file, does. The big file's sizes come from its extension record, not a stale one.
         assert_eq!(
             folders(&events),
             vec![
@@ -743,6 +819,43 @@ mod tests {
                     ("big.bin".to_owned(), 10_000)
                 ]
             )]
+        );
+    }
+
+    #[test]
+    fn a_file_named_in_its_extension_records_goes_by_their_order() {
+        let root = PathBuf::from(r"C:\");
+        let volume = reference(ROOT_FOLDER, 5);
+        // All its names in extension records, gathered out of order: it goes in the first one's folder.
+        let records = vec![
+            (ROOT_FOLDER, Builder::folder(5).name(volume, ".")),
+            (20, Builder::folder(1).name(volume, "a")),
+            (21, Builder::folder(1).name(volume, "b")),
+            (30, Builder::file(1).data(10)),
+            (
+                32,
+                Builder::extension_of(reference(30, 1)).name(reference(21, 1), "in b"),
+            ),
+            (
+                31,
+                Builder::extension_of(reference(30, 1)).name(reference(20, 1), "in a"),
+            ),
+        ];
+        let (sent, events) = scan(mft(records), &root, ROOT_FOLDER, 5);
+        assert!(sent);
+        assert_eq!(
+            folders(&events),
+            vec![
+                (id(ROOT_FOLDER, 5), 0, root_name(&root), 0, vec![]),
+                (
+                    id(20, 1),
+                    id(ROOT_FOLDER, 5),
+                    "a".to_owned(),
+                    0,
+                    vec![("in a".to_owned(), 10)]
+                ),
+                (id(21, 1), id(ROOT_FOLDER, 5), "b".to_owned(), 0, vec![]),
+            ]
         );
     }
 

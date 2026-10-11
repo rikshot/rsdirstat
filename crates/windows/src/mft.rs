@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rsdirstat_core::scan::{ScanEvent, ScanOutcome, plain_path};
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -24,7 +24,7 @@ use windows_sys::Win32::System::Ioctl::{
     FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_GET_RETRIEVAL_POINTERS, NTFS_VOLUME_DATA_BUFFER,
 };
 
-use crate::ntfs::{Mft, Record, parse_record, u32_at, u64_at};
+use crate::ntfs::{Mft, Record, is_torn, parse_record, u32_at, u64_at};
 
 /// How much of the MFT one read takes.
 const CHUNK: usize = 4 << 20;
@@ -32,6 +32,8 @@ const CHUNK: usize = 4 << 20;
 const MAX_READERS: usize = 8;
 /// Unbuffered reads need a buffer aligned to the disk's sectors; a page covers any sector size.
 const ALIGNMENT: usize = 4096;
+/// How many times a read is made while it has a record caught being rewritten.
+const READ_ATTEMPTS: usize = 3;
 
 /// Scan the folder `path` (canonical), open as `root` with file reference `root_reference` on the
 /// volume with serial number `volume_serial`, from the volume's MFT, reading with up to `threads`
@@ -48,14 +50,22 @@ pub(crate) fn scan(
     cancel: &AtomicBool,
 ) -> Result<()> {
     let volume = volume_path(root)?;
-    let device = OpenOptions::new()
-        .access_mode(GENERIC_READ | GENERIC_WRITE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(&volume)
-        .context("opening the volume (needs administrator rights)")?;
-    // The MFT on the disk lags what Windows has cached by a few seconds; flushing the volume brings
-    // it up to date, so files made just before the scan are in it.
-    unsafe { FlushFileBuffers(device.as_raw_handle()) };
+    let open = |access| {
+        OpenOptions::new()
+            .access_mode(access)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&volume)
+    };
+    // The MFT on the disk lags what Windows has cached by a few seconds; flushing the volume, which
+    // takes opening it for writing, brings it up to date, so files made or deleted just before the
+    // scan are seen as they are. A volume that can't be written is read as it is.
+    let device = match open(GENERIC_READ | GENERIC_WRITE) {
+        Ok(device) => {
+            unsafe { FlushFileBuffers(device.as_raw_handle()) };
+            device
+        }
+        Err(_) => open(GENERIC_READ).context("opening the volume (needs administrator rights)")?,
+    };
     let mut data: NTFS_VOLUME_DATA_BUFFER = unsafe { std::mem::zeroed() };
     let data_bytes =
         unsafe { std::slice::from_raw_parts_mut(&mut data as *mut _ as *mut u8, size_of::<NTFS_VOLUME_DATA_BUFFER>()) };
@@ -73,6 +83,15 @@ pub(crate) fn scan(
     let _ = tx.send(ScanEvent::ScanStart {
         root: plain_path(path).into_owned(),
     });
+
+    // From here on, failing is unexpected: say so, as the walk takes over.
+    let fall_back = |e: anyhow::Error| {
+        eprintln!(
+            "Can't read the MFT for {}, walking it instead: {e:#}",
+            plain_path(path).display()
+        );
+        e
+    };
 
     // Each reader takes the next read, parses its records and hands them over; this thread gathers
     // them as they come. An error ends the gathering, which stops the readers.
@@ -97,14 +116,15 @@ pub(crate) fn scan(
             }
         }
         Ok(mft)
-    })?;
+    })
+    .map_err(fall_back)?;
 
     let outcome = if cancel.load(Ordering::Relaxed) {
         ScanOutcome::Cancelled
     } else if mft.send_scan(path, root_reference, volume_serial as u64, tx) {
         ScanOutcome::Complete
     } else {
-        bail!("the scan root isn't in its volume's MFT");
+        return Err(fall_back(anyhow!("the scan root isn't in its volume's MFT")));
     };
     // Before the table is freed, so nothing waits for that.
     let _ = tx.send(ScanEvent::ScanDone { outcome });
@@ -194,8 +214,15 @@ fn read_records(
             return Ok(());
         }
         let (mft_offset, disk_offset, length) = reads[index];
-        device.seek(SeekFrom::Start(disk_offset))?;
-        device.read_exact(&mut buffer[..length])?;
+        // A record NTFS is rewriting can be caught half written; read again, it won't be. One that
+        // stays torn is left out.
+        for _ in 0..READ_ATTEMPTS {
+            device.seek(SeekFrom::Start(disk_offset))?;
+            device.read_exact(&mut buffer[..length])?;
+            if !buffer[..length].chunks_exact(record_size).any(is_torn) {
+                break;
+            }
+        }
         let first = mft_offset / record_size;
         let records = buffer[..length]
             .chunks_exact_mut(record_size)

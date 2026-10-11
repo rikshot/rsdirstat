@@ -18,9 +18,9 @@ fn scan_to_tree(root: &Path) -> DirTree {
     let root = root.to_path_buf();
     let handle =
         std::thread::spawn(move || scanner::scan::scan(&root, Default::default(), tx, Default::default()).unwrap());
-    let tree = tree_from(rx);
+    // The scan's own failure first, before what it left out.
     handle.join().unwrap();
-    tree
+    tree_from(rx)
 }
 
 /// The tree a scan's `events` build, which must be complete.

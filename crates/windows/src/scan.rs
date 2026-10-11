@@ -135,7 +135,8 @@ pub fn scan(
 }
 
 /// Scan `root` by reading its volume's MFT only, as `scan` does for a whole volume where it can: an
-/// error where it can't (see `mft::scan`). For comparing the two ways.
+/// error where it can't (see `mft::scan`). For comparing the two ways in tests.
+#[doc(hidden)]
 pub fn scan_mft(root: &Path, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
     let (path, handle, volume_serial, file_id) = open_root(root)?;
     mft::scan(
