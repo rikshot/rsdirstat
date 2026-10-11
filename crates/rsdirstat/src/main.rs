@@ -4,7 +4,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::body::Bytes;
@@ -17,7 +17,7 @@ use clap::Parser;
 use parking_lot::{Mutex, RwLock};
 use rust_embed::RustEmbed;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, broadcast, watch};
+use tokio::sync::{broadcast, watch};
 use tower_http::compression::CompressionLayer;
 
 use rsdirstat_core::layout::{self, LayoutConfig};
@@ -55,6 +55,8 @@ struct Args {
     wait: bool,
 }
 
+/// One tab's view of the tree. Every tab has its own, so zooming or filtering in one leaves the
+/// others as they were.
 #[derive(Clone, PartialEq)]
 struct ViewConfig {
     viewport: (f64, f64),
@@ -63,6 +65,22 @@ struct ViewConfig {
     color_mode: u8,
     filter: FilterConfig,
 }
+
+impl Default for ViewConfig {
+    fn default() -> Self {
+        Self {
+            viewport: (0.0, 0.0),
+            view_root: None,
+            max_depth: wire::DEFAULT_DEPTH,
+            color_mode: wire::COLOR_MODE_TYPE,
+            filter: FilterConfig::default(),
+        }
+    }
+}
+
+/// How often a tab gets a new layout while a scan streams in. Once it's done, a tab gets one as soon
+/// as its view changes.
+const SCAN_LAYOUT_INTERVAL: Duration = Duration::from_millis(45);
 
 /// Grace period after the last client disconnects before the server exits. Long enough to
 /// survive a page reload (which briefly drops the WebSocket) without shutting down underneath
@@ -85,34 +103,27 @@ enum ScanPhase {
 
 struct ScanState {
     tree: RwLock<DirTree>,
-    version: AtomicU64,
     phase: Mutex<ScanPhase>,
     /// The canonical path being (or last) scanned.
     root: Mutex<PathBuf>,
     cross_filesystems: bool,
 }
 
-/// How messages reach the open tabs. Encoded messages are `Bytes`, so every tab shares one buffer.
-struct LayoutBroadcast {
-    /// The newest layout. A layout is "latest state", not a stream: a new tab gets it at once, and a
-    /// slow tab skips straight to it instead of working through a queue of stale ~1 MB layouts.
-    latest: watch::Sender<Option<Bytes>>,
-    /// Messages every tab must see, in order: `ScanStart` and `PickerMode`.
-    events: broadcast::Sender<Bytes>,
-    /// Wakes the layout loop.
-    notify: Notify,
-}
-
-impl LayoutBroadcast {
-    fn send_event(&self, message: wire::ServerMessage) {
-        let _ = self.events.send(message.encode().into());
-    }
+/// A message every tab must see, in order: `ScanStart` or `PickerMode`. Encoded once, as `Bytes`,
+/// so every tab shares the buffer.
+#[derive(Clone)]
+struct TabEvent {
+    message: Bytes,
+    /// A new scan started, so each tab's view goes back to the scan root.
+    new_scan: bool,
 }
 
 struct AppState {
     scan: ScanState,
-    view: Mutex<ViewConfig>,
-    layout: LayoutBroadcast,
+    events: broadcast::Sender<TabEvent>,
+    /// Bumped whenever the tree changes. Every tab watches it and lays out its own view again; a
+    /// tab that falls behind skips straight to the newest tree instead of a queue of stale layouts.
+    tree_version: watch::Sender<u64>,
     /// Open WebSocket connections (see `Connection`); the server exits after a grace period once the
     /// last one closes.
     connections: AtomicU64,
@@ -122,11 +133,16 @@ struct AppState {
 }
 
 impl AppState {
-    fn invalidate_layout(&self) {
-        // Release so the layout loop's Acquire load of `version` also observes the tree writes
-        // that happened before this call.
-        self.scan.version.fetch_add(1, Ordering::Release);
-        self.layout.notify.notify_one();
+    fn tree_changed(&self) {
+        self.tree_version.send_modify(|version| *version += 1);
+    }
+
+    fn send_event(&self, message: wire::ServerMessage) {
+        let new_scan = matches!(message, wire::ServerMessage::ScanStart { .. });
+        let _ = self.events.send(TabEvent {
+            message: message.encode().into(),
+            new_scan,
+        });
     }
 
     /// Send every tab to the volume picker and wait for a path, unless a scan is running.
@@ -137,21 +153,7 @@ impl AppState {
         }
         *phase = ScanPhase::AwaitingPath;
         drop(phase);
-        self.layout.send_event(wire::ServerMessage::PickerMode);
-    }
-
-    /// Mutate the view config under its lock, then trigger a relayout if anything changed.
-    /// Collapses the otherwise repeated lock-mutate-invalidate dance shared by every view-changing
-    /// client message (the client sends all three filter fields on any filter edit, for example).
-    fn update_view(&self, f: impl FnOnce(&mut ViewConfig)) {
-        let mut view = self.view.lock();
-        let before = view.clone();
-        f(&mut view);
-        let changed = *view != before;
-        drop(view);
-        if changed {
-            self.invalidate_layout();
-        }
+        self.send_event(wire::ServerMessage::PickerMode);
     }
 }
 
@@ -192,30 +194,17 @@ async fn run_server(args: Args) -> Result<()> {
     let state = Arc::new(AppState {
         scan: ScanState {
             tree: RwLock::new(DirTree::new()),
-            version: AtomicU64::new(0),
             phase: Mutex::new(phase),
             root: Mutex::new(scan_root),
             cross_filesystems,
         },
-        view: Mutex::new(ViewConfig {
-            viewport: (0.0, 0.0),
-            view_root: None,
-            max_depth: wire::DEFAULT_DEPTH,
-            color_mode: wire::COLOR_MODE_TYPE,
-            filter: FilterConfig::default(),
-        }),
-        layout: LayoutBroadcast {
-            latest: watch::channel(None).0,
-            // Events are rare (one per scan or picker switch), so a small buffer never lags.
-            events: broadcast::channel(16).0,
-            notify: Notify::new(),
-        },
+        // Events are rare (one per scan or picker switch), so a small buffer never lags.
+        events: broadcast::channel(16).0,
+        tree_version: watch::channel(0).0,
         connections: AtomicU64::new(0),
         connects: AtomicU64::new(0),
         shutdown: watch::channel(false).0,
     });
-
-    tokio::task::spawn(layout_loop(Arc::clone(&state)));
 
     if !wait {
         start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart));
@@ -261,75 +250,46 @@ async fn run_server(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Recompute and broadcast the layout whenever the tree or view changes: at most every ~45ms while
-/// a scan streams in, immediately otherwise, and not at all with no clients connected.
-async fn layout_loop(state: Arc<AppState>) {
-    let mut last_version = 0u64;
-    let mut last_compute = Instant::now();
-
-    loop {
-        tokio::select! {
-            _ = state.layout.notify.notified() => {},
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {},
-        }
-
-        let current_version = state.scan.version.load(Ordering::Acquire);
-        if current_version == last_version || state.layout.latest.receiver_count() == 0 {
-            continue;
-        }
-        // No layouts while waiting for a path or for Start: the tree may still hold an earlier
-        // scan, and a layout would bring its treemap back over the picker.
-        let scan_done = match *state.scan.phase.lock() {
-            ScanPhase::Running { .. } => false,
-            ScanPhase::Done => true,
-            ScanPhase::AwaitingPath | ScanPhase::AwaitingStart => continue,
-        };
-        if !scan_done && last_compute.elapsed() < Duration::from_millis(45) {
-            continue;
-        }
-
-        let view = state.view.lock().clone();
-        let (vw, vh) = view.viewport;
-        if vw <= 0.0 || vh <= 0.0 {
-            continue;
-        }
-
-        let tree = state.scan.tree.read();
-        let Some(root_id) = tree.root_id else {
-            continue;
-        };
-        let view_root = view
-            .view_root
-            .filter(|id| tree.nodes.contains_key(id))
-            .unwrap_or(root_id);
-
-        let config = LayoutConfig {
-            max_depth: view.max_depth,
-            color_mode: view.color_mode,
-            filter: view.filter,
-            mtime_range: tree.mtime_range,
-        };
-        let rects = layout::compute_layout(&tree, view_root, vw, vh, &config);
-        let breadcrumb = tree.breadcrumb(view_root);
-        let root_size = tree.nodes.get(&view_root).map_or(0, |node| node.size);
-        let dir_count = tree.nodes.len() as u32;
-        drop(tree);
-
-        let message = Bytes::from(
-            wire::ServerMessage::Layout(wire::LayoutPayload {
-                root_size,
-                dir_count,
-                scan_done,
-                breadcrumb,
-                rects,
-            })
-            .encode(),
-        );
-        state.layout.latest.send_replace(Some(message));
-
-        last_version = current_version;
-        last_compute = Instant::now();
+/// A tab's layout of the tree for `view`, encoded. `None` while there is nothing to show: waiting
+/// for a path or for Start (the tree may still hold an earlier scan, and a layout would bring its
+/// treemap back over the picker), before the tab's first viewport, or before a scan's root arrives.
+fn layout_for(state: &AppState, view: &ViewConfig) -> Option<Bytes> {
+    let scan_done = match *state.scan.phase.lock() {
+        ScanPhase::Running { .. } => false,
+        ScanPhase::Done => true,
+        ScanPhase::AwaitingPath | ScanPhase::AwaitingStart => return None,
+    };
+    let (vw, vh) = view.viewport;
+    if vw <= 0.0 || vh <= 0.0 {
+        return None;
     }
+
+    let tree = state.scan.tree.read();
+    let root_id = tree.root_id?;
+    let view_root = view
+        .view_root
+        .filter(|id| tree.nodes.contains_key(id))
+        .unwrap_or(root_id);
+    let config = LayoutConfig {
+        max_depth: view.max_depth,
+        color_mode: view.color_mode,
+        filter: view.filter.clone(),
+        mtime_range: tree.mtime_range,
+    };
+    let rects = layout::compute_layout(&tree, view_root, vw, vh, &config);
+    let breadcrumb = tree.breadcrumb(view_root);
+    let root_size = tree.nodes.get(&view_root).map_or(0, |node| node.size);
+    let dir_count = tree.nodes.len() as u32;
+    drop(tree);
+
+    let payload = wire::LayoutPayload {
+        root_size,
+        dir_count,
+        scan_done,
+        breadcrumb,
+        rects,
+    };
+    Some(wire::ServerMessage::Layout(payload).encode().into())
 }
 
 async fn shutdown_signal(state: Arc<AppState>) {
@@ -419,10 +379,7 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
             match &event {
                 ScanEvent::ScanStart { path } => {
                     started = true;
-                    state.view.lock().view_root = None;
-                    state
-                        .layout
-                        .send_event(wire::ServerMessage::ScanStart { path: path.clone() });
+                    state.send_event(wire::ServerMessage::ScanStart { path: path.clone() });
                 }
                 ScanEvent::ScanDone => done = true,
                 _ => {}
@@ -430,15 +387,15 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
             tree.apply(event);
             // `ScanDone` is the last event to apply: a cancelled or stalled scan can leave a
             // worker that is still inside a directory, and what it sends afterwards would change
-            // a result already shown as finished. End the phase under the tree lock, so the
-            // layout loop never sees the final tree still marked as running.
+            // a result already shown as finished. End the phase under the tree lock, so no tab
+            // lays out the final tree still marked as running.
             if done {
                 end_phase(ScanPhase::Done);
                 break;
             }
         }
         drop(tree);
-        state.invalidate_layout();
+        state.tree_changed();
     }
 
     if done {
@@ -447,10 +404,10 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
     if started {
         state.scan.tree.write().apply(ScanEvent::ScanDone);
         if end_phase(ScanPhase::Done) {
-            state.invalidate_layout();
+            state.tree_changed();
         }
     } else if end_phase(ScanPhase::AwaitingPath) {
-        state.layout.send_event(wire::ServerMessage::PickerMode);
+        state.send_event(wire::ServerMessage::PickerMode);
     }
 }
 
@@ -607,31 +564,39 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     // Held to the end of the handler, including the early returns when a send fails.
     let _connection = Connection::open(&state);
 
-    let mut events = state.layout.events.subscribe();
-    let mut layouts = state.layout.latest.subscribe();
+    let mut events = state.events.subscribe();
+    let mut tree_changes = state.tree_version.subscribe();
     let mut shutdown_rx = state.shutdown.subscribe();
 
-    // A new client starts on the picker while the server waits for a path, else on the latest
-    // layout (a reload while a previous scan's result is still current).
+    // A new tab starts on the picker while the server waits for a path. Otherwise its first layout
+    // follows the viewport it sends on connecting.
     let awaiting_path = matches!(*state.scan.phase.lock(), ScanPhase::AwaitingPath);
-    let sent = if awaiting_path {
-        socket
+    if awaiting_path
+        && socket
             .send(Message::Binary(wire::ServerMessage::PickerMode.encode().into()))
             .await
-            .is_ok()
-    } else {
-        send_latest_layout(&mut socket, &mut events, &mut layouts).await
-    };
-    if !sent {
+            .is_err()
+    {
         return;
     }
 
+    let mut view = ViewConfig::default();
+    // Whether the tree or the view changed since the last layout sent.
+    let mut stale = false;
+    let mut last_layout = tokio::time::Instant::now();
     loop {
+        // While a scan streams in, layouts are rate-limited; otherwise one goes out at once.
+        let scanning = matches!(*state.scan.phase.lock(), ScanPhase::Running { .. });
+        let layout_due = if scanning {
+            last_layout + SCAN_LAYOUT_INTERVAL
+        } else {
+            tokio::time::Instant::now()
+        };
         tokio::select! {
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Binary(data))) => {
-                        handle_client_message(&state, &data);
+                        stale |= handle_client_message(&state, &mut view, &data);
                     }
                     Some(Ok(_)) => {}
                     _ => break,
@@ -639,17 +604,47 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
             }
             event = events.recv() => {
                 match event {
-                    Ok(message) => {
-                        if socket.send(Message::Binary(message)).await.is_err() {
+                    Ok(event) => {
+                        if !forward_event(&mut socket, &mut view, event).await {
                             break;
                         }
+                        stale = true;
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            changed = layouts.changed() => {
-                if changed.is_err() || !send_latest_layout(&mut socket, &mut events, &mut layouts).await {
+            changed = tree_changes.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                stale = true;
+            }
+            () = tokio::time::sleep_until(layout_due), if stale => {
+                stale = false;
+                last_layout = tokio::time::Instant::now();
+                let Some(layout) = layout_for(&state, &view) else { continue };
+                // Events and layouts travel separately, but an event sent before this layout was
+                // computed must reach the page first: a new scan's `ScanStart` clears the page,
+                // so arriving after a layout of the new tree it would wipe it. Send those first,
+                // and if one started a new scan, lay out again instead of sending a layout that
+                // may predate it.
+                let mut new_scan = false;
+                loop {
+                    match events.try_recv() {
+                        Ok(event) => {
+                            new_scan |= event.new_scan;
+                            if !forward_event(&mut socket, &mut view, event).await {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+                if new_scan {
+                    stale = true;
+                } else if socket.send(Message::Binary(layout)).await.is_err() {
                     break;
                 }
             }
@@ -658,33 +653,13 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
-/// Send the newest layout, if there is one, after any events still queued for this tab. Events and
-/// layouts travel on separate channels, but an event sent before a layout was computed must arrive
-/// first: a new scan's `ScanStart` clears the page, so arriving after that scan's first layout it
-/// would wipe it, and a small scan may have no later layout to redraw it. The relay sends
-/// `ScanStart` before it touches the tree, so it is always in the queue by the time a layout of the
-/// new tree can be seen. Returns false once the socket is closed.
-async fn send_latest_layout(
-    socket: &mut WebSocket,
-    events: &mut broadcast::Receiver<Bytes>,
-    layouts: &mut watch::Receiver<Option<Bytes>>,
-) -> bool {
-    loop {
-        match events.try_recv() {
-            Ok(message) => {
-                if socket.send(Message::Binary(message)).await.is_err() {
-                    return false;
-                }
-            }
-            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-            Err(_) => break,
-        }
+/// Send `event` to the page, and reset the tab's view to the scan root if it starts a new scan.
+/// Returns false once the socket is closed.
+async fn forward_event(socket: &mut WebSocket, view: &mut ViewConfig, event: TabEvent) -> bool {
+    if event.new_scan {
+        view.view_root = None;
     }
-    let layout = layouts.borrow_and_update().clone();
-    match layout {
-        Some(layout) => socket.send(Message::Binary(layout)).await.is_ok(),
-        None => true,
-    }
+    socket.send(Message::Binary(event.message)).await.is_ok()
 }
 
 /// Reveal directory `dir_id`, or the file `name` inside it, in the platform file manager.
@@ -716,13 +691,36 @@ fn reveal_in_file_manager(path: &std::path::Path) {
     }
 }
 
-fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
-    let Some(msg) = ClientMessage::decode(data) else { return };
+/// Apply `change` to `view`, returning whether it changed anything. A page sends its toolbar's
+/// values whenever one of them is edited, so most messages leave the view as it was.
+fn change_view(view: &mut ViewConfig, change: impl FnOnce(&mut ViewConfig)) -> bool {
+    let before = view.clone();
+    change(view);
+    *view != before
+}
+
+/// Act on one message from a tab. View changes apply to that tab's `view` only; returns whether it
+/// changed, so the tab is laid out again.
+fn handle_client_message(state: &Arc<AppState>, view: &mut ViewConfig, data: &[u8]) -> bool {
+    let Some(msg) = ClientMessage::decode(data) else {
+        return false;
+    };
     match msg {
         ClientMessage::Viewport { width, height } => {
-            state.update_view(|v| v.viewport = (width as f64, height as f64));
+            return change_view(view, |v| v.viewport = (f64::from(width), f64::from(height)));
         }
-        ClientMessage::Navigate { id } => state.update_view(|v| v.view_root = Some(id)),
+        ClientMessage::Navigate { id } => return change_view(view, |v| v.view_root = Some(id)),
+        ClientMessage::SetDepth { depth } => return change_view(view, |v| v.max_depth = depth),
+        ClientMessage::ColorMode { mode } => return change_view(view, |v| v.color_mode = mode),
+        ClientMessage::FilterExt { extensions } => return change_view(view, |v| v.filter.extensions = extensions),
+        ClientMessage::FilterSize { min, max } => {
+            return change_view(view, |v| {
+                v.filter.min_size = min;
+                v.filter.max_size = max;
+            });
+        }
+        ClientMessage::FilterName { pattern } => return change_view(view, |v| v.filter.name_pattern = pattern),
+        ClientMessage::ClearFilter => return change_view(view, |v| v.filter = FilterConfig::default()),
         ClientMessage::RevealDir { id } => reveal(state, id, None),
         ClientMessage::RevealFile { dir_id, name } => {
             // `name` is attacker-controllable over the WS; only join a single, non-traversing
@@ -732,20 +730,11 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
             }
         }
         ClientMessage::Rescan => start_scan(state, None, |phase| matches!(phase, ScanPhase::Done)),
-        ClientMessage::SetDepth { depth } => state.update_view(|v| v.max_depth = depth),
-        ClientMessage::ColorMode { mode } => state.update_view(|v| v.color_mode = mode),
-        ClientMessage::FilterExt { extensions } => state.update_view(|v| v.filter.extensions = extensions),
-        ClientMessage::FilterSize { min, max } => state.update_view(|v| {
-            v.filter.min_size = min;
-            v.filter.max_size = max;
-        }),
-        ClientMessage::FilterName { pattern } => state.update_view(|v| v.filter.name_pattern = pattern),
-        ClientMessage::ClearFilter => state.update_view(|v| v.filter = FilterConfig::default()),
         ClientMessage::ScanPath { path } => {
             // Only from the picker, or once the current scan is done (never mid-scan).
             let allowed = |phase: &ScanPhase| matches!(phase, ScanPhase::AwaitingPath | ScanPhase::Done);
             if !allowed(&state.scan.phase.lock()) {
-                return;
+                return false;
             }
             // Canonicalize once, here, and don't start a scan that can't succeed: the page has
             // already left the picker, so send it back there.
@@ -758,6 +747,7 @@ fn handle_client_message(state: &Arc<AppState>, data: &[u8]) {
             }
         }
     }
+    false
 }
 
 async fn volumes_handler(headers: HeaderMap) -> Response {

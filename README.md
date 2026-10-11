@@ -106,6 +106,8 @@ draw are grouped into one *(other files)* block per folder.
   of the file name (case-insensitive), and **Min** hides files smaller than the given size.
   **Clear** resets them.
 - **Rescan** scans the same path again; **Change** goes back to the volume picker.
+- Each browser tab has its own view: zooming, depth, colors and filters in one tab leave the others
+  as they are.
 
 ### CLI
 

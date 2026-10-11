@@ -635,3 +635,64 @@ fn e2e_cross_site_api_requests_are_refused() {
         );
     }
 }
+
+async fn crumbs(page: &playwright_rs::Page) -> String {
+    page.locator("#crumbs")
+        .text_content()
+        .await
+        .unwrap()
+        .unwrap_or_default()
+}
+
+/// Each tab has its own view: zooming into a folder or filtering in one tab leaves another tab
+/// where it was.
+#[tokio::test]
+async fn e2e_tabs_have_independent_views() {
+    let dir = create_test_dir();
+    let server = TestServer::start(dir.path());
+    let (_pw, browser, first) = launch_browser("chromium").await;
+    let second = browser.new_page().await.unwrap();
+    second
+        .set_viewport_size(playwright_rs::Viewport {
+            width: 1280,
+            height: 720,
+        })
+        .await
+        .unwrap();
+    let label = common::trace_label("chromium", "tabs_have_independent_views");
+    common::with_trace_unit(&first, &label, async {
+        for page in [&first, &second] {
+            page.goto(&server.url, None).await.unwrap();
+            wait_for_scan_done(page).await;
+        }
+        let second_crumbs = crumbs(&second).await;
+        let second_canvas = second.locator("#treemap").screenshot(None).await.unwrap();
+
+        let before = layout_seq(&first).await;
+        first.locator("#treemap").click(None).await.unwrap();
+        wait_for_layout_after(&first, before).await;
+        let before = layout_seq(&first).await;
+        first.locator("#filter-name").fill("main", None).await.unwrap();
+        wait_for_layout_after(&first, before).await;
+        assert_ne!(crumbs(&first).await, second_crumbs, "the first tab zoomed in");
+
+        // Give the second tab time to receive a layout it shouldn't get.
+        let stray = second
+            .wait_for_function(
+                &format!(
+                    "() => Number(document.querySelector('#treemap').dataset.layoutSeq) > {}",
+                    layout_seq(&second).await
+                ),
+                WaitForFunctionOptions::default().timeout(1_000.0),
+            )
+            .await;
+        assert!(stray.is_err(), "the second tab got a layout for the first tab's view");
+        assert_eq!(crumbs(&second).await, second_crumbs);
+        assert_eq!(
+            second.locator("#treemap").screenshot(None).await.unwrap(),
+            second_canvas
+        );
+    })
+    .await;
+    let _ = browser.close().await;
+}
