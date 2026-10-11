@@ -50,12 +50,20 @@ fn main() -> Result<()> {
 
     while let Ok(event) = rx.recv() {
         match event {
-            // Directory sizes come from the `Dir` events alone, so files are only kept (outside
-            // the tree) when listing them.
-            ScanEvent::File { parent, name, size, .. } => {
+            // The tree only needs each directory's total, so files are kept (outside the tree)
+            // only when listing them.
+            ScanEvent::Dir {
+                id,
+                parent,
+                name,
+                mtime,
+                files: dir_files,
+            } => {
+                let size = dir_files.iter().map(|file| file.size).sum();
                 if args.files {
-                    files.push((parent, name, size));
+                    files.extend(dir_files.into_iter().map(|file| (id, file.name, file.size)));
                 }
+                tree.insert_dir(id, parent, name, size, mtime);
             }
             ScanEvent::ScanDone => break,
             event => tree.apply(event),

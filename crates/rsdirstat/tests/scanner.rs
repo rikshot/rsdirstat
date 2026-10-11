@@ -23,8 +23,11 @@ fn scan_to_tree(root: &Path) -> (DirTree, Vec<(u64, String, u64)>) {
 
     // `ScanDone` is the last event, and applying it recomputes the sizes.
     for event in rx {
-        if let ScanEvent::File { parent, name, size, .. } = &event {
-            files.push((*parent, name.clone(), *size));
+        if let ScanEvent::Dir {
+            id, files: dir_files, ..
+        } = &event
+        {
+            files.extend(dir_files.iter().map(|file| (*id, file.name.clone(), file.size)));
         }
         let done = matches!(event, ScanEvent::ScanDone);
         tree.apply(event);

@@ -18,23 +18,27 @@ pub enum ScanEvent {
     ScanStart {
         path: String,
     },
-    /// A directory, sent after all of its files. `size` is the total of those files.
+    /// A directory with its files, sent once it has been read: after its parent, before its
+    /// subdirectories. Its own size is the total of `files`. `mtime` is the newest of all its
+    /// files', including the empty ones, which `files` leaves out.
     Dir {
         id: u64,
         parent: u64,
         name: String,
-        size: u64,
         mtime: i64,
-    },
-    File {
-        parent: u64,
-        name: String,
-        size: u64,
-        mtime: i64,
+        files: Vec<ScannedFile>,
     },
     /// The last event a consumer should apply. After a cancelled or stalled scan, a worker still
     /// inside a directory may send a few more, which must be ignored.
     ScanDone,
+}
+
+/// A file of non-zero size in a `ScanEvent::Dir`.
+#[derive(Clone, Debug)]
+pub struct ScannedFile {
+    pub name: String,
+    pub size: u64,
+    pub mtime: i64,
 }
 
 /// Combine a `(device, inode)` pair into a stable node id. Inodes are only unique within a single
@@ -239,16 +243,15 @@ where
         active.lock().unwrap().clone_from(&job.path);
         let mut sink = DirSink {
             shared,
-            tx,
             dir_id: job.id,
             dir_path: &job.path,
-            size: 0,
             mtime: 0,
+            files: Vec::new(),
             children: Vec::new(),
         };
         read_dir(&job, &mut buffer, &mut sink);
         let DirSink {
-            size, mtime, children, ..
+            mtime, files, children, ..
         } = sink;
 
         let DirJob {
@@ -259,12 +262,14 @@ where
             ..
         } = job;
         drop(handle);
+        // One event per directory, carrying its files: a channel send and a tree lookup per file
+        // would cost more than the files themselves.
         let _ = tx.send(ScanEvent::Dir {
             id,
             parent: parent_id,
             name,
-            size,
             mtime,
+            files,
         });
         // Children are queued before this directory is finished, so the queue never looks empty
         // to the other workers while there is still work to discover.
@@ -277,11 +282,10 @@ where
 /// Where a platform's `read_dir` reports the entries of the directory being read.
 pub struct DirSink<'a, H> {
     shared: &'a Shared<H>,
-    tx: &'a Sender<ScanEvent>,
     dir_id: u64,
     dir_path: &'a str,
-    size: u64,
     mtime: i64,
+    files: Vec<ScannedFile>,
     children: Vec<DirJob<H>>,
 }
 
@@ -312,11 +316,9 @@ impl<H> DirSink<'_, H> {
         if hardlink.is_some_and(|id| !self.shared.visited_files.insert(id)) {
             return;
         }
-        self.size += size;
         self.mtime = self.mtime.max(mtime);
         if size > 0 {
-            let _ = self.tx.send(ScanEvent::File {
-                parent: self.dir_id,
+            self.files.push(ScannedFile {
                 name: name.into(),
                 size,
                 mtime,
@@ -780,10 +782,10 @@ mod tests {
                 ScanEvent::Dir {
                     id,
                     parent,
-                    size,
                     mtime,
+                    files,
                     ..
-                } => Some((*id, *parent, *size, *mtime)),
+                } => Some((*id, *parent, files.iter().map(|file| file.size).sum::<u64>(), *mtime)),
                 _ => None,
             })
             .collect();
@@ -798,16 +800,17 @@ mod tests {
 
         let mut files: Vec<_> = events
             .iter()
-            .filter_map(|event| match event {
-                ScanEvent::File { name, .. } => Some(name.as_str()),
-                _ => None,
+            .flat_map(|event| match event {
+                ScanEvent::Dir { files, .. } => files.as_slice(),
+                _ => &[],
             })
+            .map(|file| file.name.as_str())
             .collect();
         files.sort();
         assert_eq!(
             files.len(),
             3,
-            "no event for the empty file or the second link: {files:?}"
+            "no entry for the empty file or the second link: {files:?}"
         );
         assert!(files.contains(&"a.txt") && files.contains(&"b"));
     }
@@ -856,7 +859,6 @@ mod tests {
             visited_dirs: DashSet::new(),
             visited_files: DashSet::new(),
         };
-        let (tx, _rx) = mpsc::channel();
         let sep = SEPARATOR;
         for (dir, expected) in [
             (format!("{sep}"), format!("{sep}name")),
@@ -865,11 +867,10 @@ mod tests {
         ] {
             let sink: DirSink<'_, ()> = DirSink {
                 shared: &shared,
-                tx: &tx,
                 dir_id: 1,
                 dir_path: &dir,
-                size: 0,
                 mtime: 0,
+                files: Vec::new(),
                 children: Vec::new(),
             };
             assert_eq!(sink.child_path("name"), expected);

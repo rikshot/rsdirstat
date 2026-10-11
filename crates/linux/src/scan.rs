@@ -18,6 +18,8 @@ const STATX_NLINK: u32 = 0x0004;
 const STATX_SIZE: u32 = 0x0200;
 const STATX_MTIME: u32 = 0x0040;
 const STATX_MNT_ID: u32 = 0x1000;
+/// What a file's entry needs: its size, its mtime, and its link count (for hardlink dedup).
+const FILE_STATX_MASK: u32 = STATX_SIZE | STATX_MTIME | STATX_NLINK;
 const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
 
 /// Combine the statx device major/minor into a single value for node identity. This need not match
@@ -181,18 +183,19 @@ fn read_dir(
                 _ => continue,
             };
 
-            // Resolve DT_UNKNOWN via statx
-            let entry_type = if d_type == 0 {
-                match statx_path(dir_fd, name.as_ptr(), STATX_TYPE | STATX_MODE) {
-                    Some(sx) => match sx.stx_mode as u32 & libc::S_IFMT {
-                        libc::S_IFDIR => DT_DIR,
-                        libc::S_IFREG => DT_REG,
-                        _ => 0,
-                    },
-                    None => continue,
+            // Some filesystems leave the type unknown (DT_UNKNOWN). Resolve it with a statx that
+            // also asks for everything a file needs, so a file costs one statx either way.
+            let (entry_type, file_stat) = if d_type == 0 {
+                let Some(sx) = statx_path(dir_fd, name.as_ptr(), STATX_TYPE | STATX_MODE | FILE_STATX_MASK) else {
+                    continue;
+                };
+                match sx.stx_mode as u32 & libc::S_IFMT {
+                    libc::S_IFDIR => (DT_DIR, None),
+                    libc::S_IFREG => (DT_REG, Some(sx)),
+                    _ => continue,
                 }
             } else {
-                d_type
+                (d_type, None)
             };
 
             match entry_type {
@@ -211,7 +214,7 @@ fn read_dir(
                     sink.dir(node_id(child_dev, d_ino), name_str, sink.child_path(name_str), child);
                 }
                 DT_REG => {
-                    if let Some(sx) = statx_path(dir_fd, name.as_ptr(), STATX_SIZE | STATX_MTIME | STATX_NLINK) {
+                    if let Some(sx) = file_stat.or_else(|| statx_path(dir_fd, name.as_ptr(), FILE_STATX_MASK)) {
                         // Hardlink identity: the entry's inode (d_ino) with the file's device.
                         let hardlink =
                             (sx.stx_nlink > 1).then(|| node_id(makedev(sx.stx_dev_major, sx.stx_dev_minor), d_ino));

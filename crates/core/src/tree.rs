@@ -3,7 +3,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 
 use crate::color::{hash_name, hue_for_extension};
-use crate::scan::ScanEvent;
+use crate::scan::{ScanEvent, ScannedFile};
 
 pub struct FileEntry {
     pub name: Box<str>,
@@ -142,15 +142,13 @@ impl DirTree {
                 id,
                 parent,
                 name,
-                size,
                 mtime,
-            } => self.insert_dir(id, parent, name, size, mtime),
-            ScanEvent::File {
-                parent,
-                name,
-                size,
-                mtime,
-            } => self.insert_file(parent, name, size, mtime),
+                files,
+            } => {
+                let size = files.iter().fold(0u64, |total, file| total.saturating_add(file.size));
+                self.insert_files(id, files);
+                self.insert_dir(id, parent, name, size, mtime);
+            }
             ScanEvent::ScanDone => self.recompute_sizes(),
         }
     }
@@ -192,6 +190,31 @@ impl DirTree {
             .or_default()
             .files
             .push(FileEntry { name, size, hue, mtime });
+    }
+
+    /// A directory's scanned files, added with one lookup of its node.
+    fn insert_files(&mut self, parent: u64, files: Vec<ScannedFile>) {
+        if files.is_empty() {
+            return;
+        }
+        let entries: Vec<FileEntry> = files
+            .into_iter()
+            .map(|file| {
+                self.update_mtime_range(file.mtime);
+                FileEntry {
+                    hue: self.cached_extension_hue(&file.name),
+                    name: file.name.into_boxed_str(),
+                    size: file.size,
+                    mtime: file.mtime,
+                }
+            })
+            .collect();
+        let node = self.nodes.entry(parent).or_default();
+        if node.files.is_empty() {
+            node.files = entries;
+        } else {
+            node.files.extend(entries);
+        }
     }
 
     fn update_mtime_range(&mut self, mtime: i64) {
@@ -463,6 +486,36 @@ mod tests {
         assert!(!f.matches_file("a.rs", 50));
         // both match
         assert!(f.matches_file("a.rs", 100));
+    }
+
+    #[test]
+    fn a_dir_event_adds_its_files_and_their_total() {
+        let file = |name: &str, size, mtime| ScannedFile {
+            name: name.into(),
+            size,
+            mtime,
+        };
+        let mut tree = DirTree::new();
+        tree.apply(ScanEvent::ScanStart { path: "root".into() });
+        tree.apply(ScanEvent::Dir {
+            id: 1,
+            parent: 0,
+            name: "root".into(),
+            mtime: 5,
+            files: vec![file("a.rs", 10, 3), file("b", 5, 4)],
+        });
+        tree.apply(ScanEvent::Dir {
+            id: 2,
+            parent: 1,
+            name: "sub".into(),
+            mtime: 1,
+            files: vec![file("c", 7, 1)],
+        });
+        assert_eq!(tree.nodes[&1].files.len(), 2);
+        assert_eq!(tree.nodes[&1].direct_size, 15);
+        assert_eq!(tree.nodes[&2].direct_size, 7);
+        assert_eq!(tree.nodes[&1].size, 22, "a subdirectory's size reaches its parent");
+        assert_eq!(tree.mtime_range, (1, 5));
     }
 
     #[test]
