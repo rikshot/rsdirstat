@@ -9,7 +9,8 @@ pub struct BreadcrumbEntry {
 /// What a laid-out rect stands for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RectKind {
-    /// A folder drawn with its contents inside, below a header strip of [`header_height`].
+    /// A folder drawn with its contents inside, below a header strip of
+    /// [`LayoutRect::header_height`].
     Container,
     /// A folder drawn as one block: at the depth limit, or too small to open.
     #[default]
@@ -17,6 +18,17 @@ pub enum RectKind {
     File,
     /// One folder's files that are too small to draw on their own, summed into one block.
     OtherFiles,
+}
+
+impl RectKind {
+    /// A folder, drawn open or as one block.
+    pub fn is_dir(self) -> bool {
+        matches!(self, Self::Container | Self::Dir)
+    }
+
+    pub fn is_container(self) -> bool {
+        self == Self::Container
+    }
 }
 
 /// One rect of a treemap layout, in canvas pixels. Geometry is f32: a canvas is at most a few
@@ -45,7 +57,7 @@ impl LayoutRect {
     /// Height of the header strip above a container's contents (0 for any other rect). The layout
     /// engine and the client both compute it, so it isn't sent.
     pub fn header_height(&self) -> f32 {
-        if self.kind == RectKind::Container {
+        if self.kind.is_container() {
             header_height(self.w, self.h)
         } else {
             0.0
@@ -55,7 +67,7 @@ impl LayoutRect {
 
 /// Height of the header strip above a container of `width` × `height`: 15% of the height, at most
 /// 18px, and none when the result would be under 12px or the container is small.
-pub fn header_height(width: f32, height: f32) -> f32 {
+fn header_height(width: f32, height: f32) -> f32 {
     const MAX_HEADER: f32 = 18.0;
     if width > 60.0 && height > 30.0 {
         let header = (height * 0.15).floor().min(MAX_HEADER);
@@ -178,8 +190,8 @@ impl ClientMessage {
     }
 }
 
-/// DEFLATE level for `pack`. Kept low on purpose: layout messages are broadcast up to ~20×/sec
-/// during a scan, so compression must stay cheap. Level 1's fast/greedy matching skips the expensive
+/// DEFLATE level for `pack`. Kept low on purpose: each tab gets a layout up to ~20×/sec during a
+/// scan, so compression must stay cheap. Level 1's fast/greedy matching skips the expensive
 /// LZ77 search that dominates higher levels (it was ~37% of server CPU at level 6 on a large scan),
 /// while still shrinking the repetitive rect stream well. `unpack` inflates identically regardless
 /// of the level the sender used.

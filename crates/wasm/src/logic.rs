@@ -85,7 +85,7 @@ pub(crate) struct RenderRect {
 
 impl RenderRect {
     pub(crate) fn from_wire(rect: LayoutRect) -> Self {
-        let (fill, header_fill) = if rect.kind == RectKind::Container {
+        let (fill, header_fill) = if rect.kind.is_container() {
             (hsl(rect.hue, 25, 13), hsl(rect.hue, 35, 20))
         } else {
             let vivid = hsl(rect.hue, 62, 38);
@@ -109,19 +109,10 @@ impl RenderRect {
         }
     }
 
-    pub(crate) fn is_container(&self) -> bool {
-        self.kind == RectKind::Container
-    }
-
-    /// A folder, drawn open or as one block: something to navigate into or reveal.
-    pub(crate) fn is_dir(&self) -> bool {
-        matches!(self.kind, RectKind::Container | RectKind::Dir)
-    }
-
     /// What identifies this rect from one layout to the next: a folder's id, or a file's (or
     /// "(other files)" block's) folder and name. No file is named "", so the two can't collide.
     fn key(&self) -> (u64, &str) {
-        if self.is_dir() {
+        if self.kind.is_dir() {
             (self.id, "")
         } else {
             (self.parent_id, &self.name)
@@ -162,13 +153,13 @@ pub(crate) fn find_navigable_target_index(rects: &[RenderRect], mouse_x: f64, mo
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(index, rect)| (hit_test(rect, mouse_x, mouse_y) && rect.is_dir()).then_some(index))
+        .find_map(|(index, rect)| (hit_test(rect, mouse_x, mouse_y) && rect.kind.is_dir()).then_some(index))
 }
 
 pub(crate) fn build_rect_index(rects: &[RenderRect]) -> HashMap<u64, usize> {
     let mut id_to_index = HashMap::with_capacity(rects.len());
     for (index, rect) in rects.iter().enumerate() {
-        if rect.is_dir() {
+        if rect.kind.is_dir() {
             id_to_index.insert(rect.id, index);
         }
     }
@@ -188,7 +179,7 @@ pub(crate) fn build_hover_state(
     let mut hovered_ancestor_indices = Vec::new();
     while let Some(index) = id_to_index.get(&current_parent).copied() {
         let rect = &rects[index];
-        if rect.is_container() {
+        if rect.kind.is_container() {
             hovered_ancestor_indices.push(index);
         }
         current_parent = rect.parent_id;

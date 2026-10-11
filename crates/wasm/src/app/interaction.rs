@@ -153,7 +153,7 @@ impl TreemapApp {
                     dir_id: rect.parent_id,
                     name: rect.name.clone(),
                 })?;
-            } else if rect.is_dir() {
+            } else if rect.kind.is_dir() {
                 self.send_message(ClientMessage::RevealDir { id: rect.id })?;
             }
         }

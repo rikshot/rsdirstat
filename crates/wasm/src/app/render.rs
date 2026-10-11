@@ -298,7 +298,7 @@ fn draw_rects(ctx: &CanvasRenderingContext2d, rects: &[RenderRect], draw_labels:
     let mut headers: Vec<usize> = order
         .iter()
         .copied()
-        .filter(|&i| rects[i].is_container() && rects[i].header_height > 0.0)
+        .filter(|&i| rects[i].kind.is_container() && rects[i].header_height > 0.0)
         .collect();
     headers.sort_by_key(|&i| rects[i].header_fill);
     for &i in &headers {
@@ -321,7 +321,7 @@ fn draw_rects(ctx: &CanvasRenderingContext2d, rects: &[RenderRect], draw_labels:
             if w < 4.0 || h < 4.0 {
                 continue;
             }
-            if rects[i].is_container() {
+            if rects[i].kind.is_container() {
                 draw_container_label(ctx, &mut state, &rects[i], x, y, w)?;
             } else {
                 draw_leaf_label(ctx, &mut state, &rects[i], x, y, w, h)?;
@@ -363,7 +363,7 @@ fn draw_hover_overlay(
         let (x, y, w, h) = inset_rect(rect);
         if w > 0.0 && h > 0.0 {
             let radius = RADIUS.min(w / 2.0).min(h / 2.0);
-            let fill_height = if rect.is_container() && rect.header_height > 0.0 {
+            let fill_height = if rect.kind.is_container() && rect.header_height > 0.0 {
                 rect.header_height - GAP
             } else {
                 h
