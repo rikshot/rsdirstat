@@ -165,7 +165,7 @@ impl DirJob<UnixDir> {
 /// paths `canonicalize` gives on Windows, which scans keep for opening paths over `MAX_PATH`.
 /// `\\?\C:\x` is `C:\x`, and `\\?\UNC\server\share\x` is `\\server\share\x`; a path with no plainer
 /// form (`\\?\Volume{GUID}\`) is left as it is.
-fn plain_path(path: &Path) -> Cow<'_, Path> {
+pub fn plain_path(path: &Path) -> Cow<'_, Path> {
     let Some(rest) = path.to_str().and_then(|path| path.strip_prefix(r"\\?\")) else {
         return path.into();
     };
@@ -180,7 +180,7 @@ fn plain_path(path: &Path) -> Cow<'_, Path> {
 
 /// The scan root's name as shown in the breadcrumb: its last component, or the whole path for a
 /// filesystem root (`/`, `C:\`).
-fn root_name(path: &Path) -> String {
+pub fn root_name(path: &Path) -> String {
     path.file_name().map_or_else(
         || plain_path(path).display().to_string(),
         |name| name.to_string_lossy().into_owned(),
@@ -199,6 +199,9 @@ pub struct ScanOptions {
     pub cross_filesystems: bool,
     /// How many worker threads to scan with, instead of the platform's default.
     pub threads: Option<NonZeroUsize>,
+    /// On Windows, walk the folders even where NTFS's file index (the MFT) could be read instead,
+    /// which needs administrator rights.
+    pub no_mft: bool,
 }
 
 /// Size of each worker's buffer for directory reads. Measured from 16 KiB to 1 MiB, it makes no

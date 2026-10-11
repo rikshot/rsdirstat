@@ -2,10 +2,11 @@ use std::ffi::{OsStr, c_void};
 use std::num::NonZeroUsize;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use crate::mft;
 use anyhow::{Context, Result};
 use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOptions, cpu_count, node_id, run_scan};
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE, MAX_PATH};
@@ -93,6 +94,14 @@ fn get_volume_and_id(handle: &OwnedHandle) -> Option<(u32, u64)> {
     Some((info.dwVolumeSerialNumber, file_id))
 }
 
+/// The scan root: its canonical path, open, and its volume's serial number and file id.
+fn open_root(root: &Path) -> Result<(PathBuf, OwnedHandle, u32, u64)> {
+    let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
+    let handle = open_dir(&wide(&path)).context("failed to open root directory")?;
+    let (volume_serial, file_id) = get_volume_and_id(&handle).context("failed to get root directory info")?;
+    Ok((path, handle, volume_serial, file_id))
+}
+
 /// Scan `root`, stopping promptly once `cancel` is set (the server sets it when it shuts down
 /// mid-scan).
 pub fn scan(
@@ -101,9 +110,7 @@ pub fn scan(
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
-    let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
-    let handle = open_dir(&wide(&path)).context("failed to open root directory")?;
-    let (volume_serial, file_id) = get_volume_and_id(&handle).context("failed to get root directory info")?;
+    let (path, handle, volume_serial, file_id) = open_root(root)?;
     let id = node_id(volume_serial as u64, file_id);
     let root = WinDir {
         unique_file_ids: has_unique_file_ids(&handle),
@@ -111,10 +118,30 @@ pub fn scan(
         volume: volume_serial,
     };
     let threads = options.threads.map_or_else(cpu_count, NonZeroUsize::get);
+    // Reading the volume's MFT is several times faster where it can be done; it sends nothing
+    // when it can't, and the folders are walked instead.
+    if !options.no_mft && mft::scan(&path, &root.handle, file_id, volume_serial, threads, &tx, &cancel).is_ok() {
+        return Ok(());
+    }
     run_scan(&path, root, id, tx, cancel, threads, move |dir, buffer, sink| {
         read_dir(dir, buffer, sink, volume_serial, options.cross_filesystems)
     });
     Ok(())
+}
+
+/// Scan `root` by reading its volume's MFT only, which `scan` does where it can: an error, with
+/// nothing sent, where it can't (see `mft::scan`). For comparing the two ways.
+pub fn scan_mft(root: &Path, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
+    let (path, handle, volume_serial, file_id) = open_root(root)?;
+    mft::scan(
+        &path,
+        &handle,
+        file_id,
+        volume_serial,
+        cpu_count(),
+        &tx,
+        &AtomicBool::new(false),
+    )
 }
 
 /// An open directory, with what its files are told apart by.

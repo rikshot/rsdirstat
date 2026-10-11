@@ -15,7 +15,8 @@ Fast, cross-platform disk usage analyzer with an interactive treemap GUI.
 - **Multi-threaded scanning** using platform-native APIs for maximum speed
   - macOS: `getattrlistbulk` for batch directory + metadata reads
   - Linux: `getdents64` + `statx` via raw syscalls
-  - Windows: `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`
+  - Windows: `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`; run as administrator, it
+    reads an NTFS volume's file index (the MFT) straight off the disk instead, several times faster
 - **Interactive treemap GUI** served as a local web app over WebSocket
   - Squarified treemap layout with zoom navigation, updated live while the scan runs
   - Color by file type or modification time
@@ -72,6 +73,7 @@ rsdirstat                 # no path: pick a volume in the browser, then scan
 rsdirstat [path]          # scan a path, opens the treemap in your browser
 rsdirstat --all [path]    # cross filesystem boundaries
 rsdirstat --threads 16 [path]  # scan with 16 threads (default: one per CPU; two on Linux; 4 on macOS)
+rsdirstat --no-mft [path]      # Windows: walk the folders even as administrator
 rsdirstat --port 8080 [path]   # fixed port (default: random)
 rsdirstat --no-open [path]     # don't auto-open the browser
 ```
@@ -118,6 +120,7 @@ rsdirstat-cli --files [path]  # top 10 files by size
 rsdirstat-cli --top 20 [path] # show more results
 rsdirstat-cli --all [path]    # cross filesystem boundaries
 rsdirstat-cli --threads 16 [path] # scan with 16 threads (default: one per CPU; two on Linux; 4 on macOS)
+rsdirstat-cli --no-mft [path]     # Windows: walk the folders even as administrator
 ```
 
 ## Building

@@ -42,6 +42,10 @@ struct Args {
     /// Scan with this many threads, any number [default: one per CPU; two on Linux; 4 on macOS]
     #[arg(long)]
     threads: Option<NonZeroUsize>,
+
+    /// On Windows, walk the folders even as administrator, instead of reading NTFS's file index
+    #[arg(long)]
+    no_mft: bool,
 }
 
 fn main() -> Result<()> {
@@ -52,6 +56,7 @@ fn main() -> Result<()> {
     let options = ScanOptions {
         cross_filesystems: args.all,
         threads: args.threads,
+        no_mft: args.no_mft,
     };
     let handle = std::thread::spawn(move || scanner::scan::scan(&path, options, tx, Arc::default()));
 

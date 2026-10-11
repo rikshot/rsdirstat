@@ -248,6 +248,72 @@ fn scanner_leaves_out_unreadable_directories() {
     assert!(dir_names.contains(&"nested"), "the rest is scanned: {dir_names:?}");
 }
 
+/// On Windows a scan reads NTFS's file index (the MFT) where it can, as administrator, which is how
+/// CI runs: it must find what walking the folders finds. (Hardlinks are left out: the walk counts one
+/// in whichever of its folders a worker reaches first.)
+#[cfg(windows)]
+#[test]
+fn reading_the_mft_finds_what_the_folder_walk_finds() {
+    use std::collections::BTreeMap;
+
+    use rsdirstat_core::scan::ScanOptions;
+
+    let dir = create_test_dir();
+    let root = dir.path();
+    fs::write(root.join("src").join("empty"), "").unwrap();
+    fs::create_dir_all(root.join("a").join("b").join("c")).unwrap();
+    fs::write(root.join("a").join("b").join("c").join("big.bin"), vec![1u8; 300_000]).unwrap();
+    for i in 0..200 {
+        fs::write(root.join("a").join(format!("file{i:03}.txt")), vec![2u8; i]).unwrap();
+    }
+
+    let tree_of = |events: mpsc::Receiver<_>| {
+        let mut tree = DirTree::new();
+        for event in events {
+            tree.apply(event);
+        }
+        assert!(tree.complete);
+        tree
+    };
+    // Each folder by path: its id, size, newest file and files.
+    type Folders = BTreeMap<String, (u64, u64, i64, Vec<(String, u64)>)>;
+    let folders = |tree: &DirTree| -> Folders {
+        tree.nodes
+            .iter()
+            .map(|(&id, node)| {
+                let mut files: Vec<_> = node
+                    .files
+                    .iter()
+                    .map(|file| (file.name.to_string(), file.size))
+                    .collect();
+                files.sort();
+                let path = tree.full_path(id).unwrap().display().to_string();
+                (path, (id, node.size, node.mtime, files))
+            })
+            .collect()
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let options = ScanOptions {
+        no_mft: true,
+        ..Default::default()
+    };
+    scanner::scan::scan(root, options, tx, Default::default()).unwrap();
+    let walked = tree_of(rx);
+
+    let (tx, rx) = mpsc::channel();
+    if let Err(e) = scanner::scan::scan_mft(root, tx) {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI runs as administrator, so the MFT must be readable: {e:#}"
+        );
+        eprintln!("skipped: can't read the MFT here ({e:#}); run as administrator");
+        return;
+    }
+    let read = tree_of(rx);
+    assert_eq!(folders(&read), folders(&walked));
+}
+
 #[test]
 fn scanner_dedups_hardlinks() {
     let dir = tempfile::tempdir().unwrap();
