@@ -450,6 +450,56 @@ async fn e2e_unopenable_root_falls_back_to_picker() {
     let _ = browser.close().await;
 }
 
+/// After a finished scan, picking a path that can't be scanned sends the tabs back to the picker,
+/// and they must stay there: the server still holds the old scan's tree, and any view change (here
+/// a resize) once made it send that stale layout, which brought the treemap back.
+#[tokio::test]
+async fn e2e_failed_rescan_keeps_the_picker() {
+    let dir = create_test_dir();
+    let server = TestServer::start(dir.path());
+    let (_pw, browser, page) = launch_browser("chromium").await;
+    let label = common::trace_label("chromium", "failed_rescan_keeps_the_picker");
+    common::with_trace_unit(&page, &label, async {
+        let visible = || WaitForOptions::builder().timeout(10_000.0).build();
+        page.goto(&server.url, None).await.unwrap();
+        wait_for_scan_done(&page).await;
+
+        page.locator("#change").click(None).await.unwrap();
+        page.locator(".volume-card").first().wait_for(visible()).await.unwrap();
+        page.evaluate_expression(
+            "document.querySelector('.picker-grid').insertAdjacentHTML('afterbegin', \
+             '<div class=\"volume-card\" id=\"gone\" data-mount=\"/nonexistent/rsdirstat-e2e\">gone</div>')",
+        )
+        .await
+        .unwrap();
+        page.locator("#gone").click(None).await.unwrap();
+        page.locator("#picker").wait_for(visible()).await.unwrap();
+
+        page.reload(None).await.unwrap();
+        page.locator(".volume-card").first().wait_for(visible()).await.unwrap();
+        page.set_viewport_size(playwright_rs::Viewport {
+            width: 1000,
+            height: 700,
+        })
+        .await
+        .unwrap();
+        // The page sends its new viewport on resize; give a stale layout time to arrive.
+        let stale = page
+            .wait_for_function(
+                "() => document.querySelector('#treemap')?.dataset.layoutSeq !== undefined",
+                WaitForFunctionOptions::default().timeout(1_000.0),
+            )
+            .await;
+        assert!(
+            stale.is_err(),
+            "a reloaded tab got a layout while the server waits for a path"
+        );
+        assert!(!page.locator("#treemap-view").is_visible().await.unwrap());
+    })
+    .await;
+    let _ = browser.close().await;
+}
+
 /// `--wait` (for profiling) holds the scan until the page's Start button is clicked, so that button
 /// must be visible before any layout exists.
 #[tokio::test]
