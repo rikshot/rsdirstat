@@ -110,6 +110,8 @@ pub struct DirTree {
     /// How many scans have started on this tree (each `ScanStart` applied replaces its contents),
     /// so a change means it holds a different scan.
     pub scans: u64,
+    /// How many scanner events have been applied, so an unchanged count means an unchanged tree.
+    pub changes: u64,
     /// Whether the scan read everything: set by a `ScanDone` for a complete scan, so false while it
     /// runs, and after one that stopped early (a stall) or never reported how it ended.
     pub complete: bool,
@@ -130,6 +132,7 @@ impl DirTree {
             scan_path: String::new(),
             mtime_range: (i64::MAX, 0),
             scans: 0,
+            changes: 0,
             complete: false,
             hue_cache: HashMap::new(),
         }
@@ -146,6 +149,7 @@ impl DirTree {
 
     /// Fold one scanner event into the tree; `ScanDone` finalizes the recursive sizes.
     pub fn apply(&mut self, event: ScanEvent) {
+        self.changes += 1;
         match event {
             ScanEvent::ScanStart { path } => {
                 self.clear();

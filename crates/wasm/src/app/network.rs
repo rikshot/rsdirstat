@@ -197,6 +197,7 @@ impl TreemapApp {
         self.view.rects = rects;
         self.view.view_root_size = root_size;
         self.view.breadcrumb = payload.breadcrumb;
+        self.view.separator = payload.separator;
         self.build_breadcrumb()?;
         self.recompute_hover()?;
         self.view.buffer_dirty = true;

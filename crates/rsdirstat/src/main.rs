@@ -4,7 +4,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::future::IntoFuture;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -23,7 +23,7 @@ use tower_http::compression::CompressionLayer;
 
 use rsdirstat_core::layout::{self, LayoutConfig};
 use rsdirstat_core::scan::ScanEvent;
-use rsdirstat_core::tree::{DirTree, FilterConfig};
+use rsdirstat_core::tree::{DirTree, FilterConfig, NodeMap};
 use rsdirstat_protocol::{self as wire, ClientMessage};
 
 #[cfg(target_os = "linux")]
@@ -66,6 +66,18 @@ struct ViewConfig {
     max_depth: u8,
     color_mode: u8,
     filter: FilterConfig,
+    /// The sizes `filter` left at the last layout, kept while they still hold.
+    filtered: Option<FilteredSizes>,
+}
+
+/// Sizes under a filter, and what they were computed from: the tree as of `changes`, and the
+/// subtree under `view_root`. Filtering visits every file under the view, too much to repeat for
+/// every layout of a big tree that hasn't changed (resizing the window lays it out many times).
+struct FilteredSizes {
+    changes: u64,
+    view_root: u64,
+    filter: FilterConfig,
+    sizes: NodeMap<u64>,
 }
 
 impl Default for ViewConfig {
@@ -77,13 +89,19 @@ impl Default for ViewConfig {
             max_depth: wire::DEFAULT_DEPTH,
             color_mode: wire::COLOR_MODE_TYPE,
             filter: FilterConfig::default(),
+            filtered: None,
         }
     }
 }
 
-/// How often a tab gets a new layout while a scan streams in. Once it's done, a tab gets one as soon
-/// as its view changes.
+/// How often a tab gets a new layout while a scan streams in, at most. Once it's done, a tab gets one
+/// as soon as its view changes.
 const SCAN_LAYOUT_INTERVAL: Duration = Duration::from_millis(45);
+
+/// While a scan streams in, a tab waits at least this many times as long as its last layout took
+/// before the next. Laying out holds the tree's read lock, and a big filtered view can take longer
+/// than `SCAN_LAYOUT_INTERVAL`: back to back, a few tabs would keep the scan's events from the tree.
+const SCAN_LAYOUT_COST_FACTOR: u32 = 4;
 
 /// Grace period after the last client disconnects before the server exits. Long enough to
 /// survive a page reload (which briefly drops the WebSocket) without shutting down underneath
@@ -120,11 +138,9 @@ struct AppState {
     /// Signalled whenever the tree changes. Every tab watches it and lays out its own view again; a
     /// tab that falls behind skips straight to the newest tree instead of a queue of stale layouts.
     tree_changes: watch::Sender<()>,
-    /// Open WebSocket connections (see `Connection`); the server exits after a grace period once the
+    /// The WebSocket connections (see `Connection`); the server exits after a grace period once the
     /// last one closes.
-    connections: AtomicU64,
-    /// Connections ever opened. A shutdown timer only fires if this hasn't moved since it was armed.
-    connects: AtomicU64,
+    connections: Mutex<Connections>,
     shutdown: watch::Sender<bool>,
 }
 
@@ -139,8 +155,7 @@ impl AppState {
             },
             picker: watch::channel(()).0,
             tree_changes: watch::channel(()).0,
-            connections: AtomicU64::new(0),
-            connects: AtomicU64::new(0),
+            connections: Mutex::default(),
             shutdown: watch::channel(false).0,
         }
     }
@@ -292,7 +307,21 @@ fn update_tab(state: &AppState, view: &mut ViewConfig) -> (Option<Bytes>, Option
         filter: view.filter.clone(),
         mtime_range: tree.mtime_range,
     };
-    let layout = layout::compute_layout(&tree, view_root, vw, vh, &config);
+    let filtered = config.filter.is_active().then(|| {
+        let stale = |cached: &FilteredSizes| {
+            cached.changes != tree.changes || cached.view_root != view_root || cached.filter != config.filter
+        };
+        if view.filtered.as_ref().is_none_or(stale) {
+            view.filtered = Some(FilteredSizes {
+                changes: tree.changes,
+                view_root,
+                filter: config.filter.clone(),
+                sizes: tree.compute_filtered_sizes(&config.filter, view_root),
+            });
+        }
+        &view.filtered.as_ref().expect("just filled").sizes
+    });
+    let layout = layout::compute_layout_with(&tree, view_root, vw, vh, &config, filtered);
     let breadcrumb = tree.breadcrumb(view_root);
     let dir_count = tree.nodes.len() as u32;
     let partial = scan_done && !tree.complete;
@@ -304,6 +333,7 @@ fn update_tab(state: &AppState, view: &mut ViewConfig) -> (Option<Bytes>, Option
         scan_done,
         partial,
         scan_ms: u32::try_from(scan_time.as_millis()).unwrap_or(u32::MAX),
+        separator: std::path::MAIN_SEPARATOR,
         breadcrumb,
         rects: layout.rects,
     };
@@ -539,35 +569,49 @@ fn is_safe_component(name: &str) -> bool {
     matches!(components.next(), Some(std::path::Component::Normal(_))) && components.next().is_none()
 }
 
+/// The WebSocket connections, counted together under one lock: a shutdown timer armed as the last
+/// one closes must see every connection opened since, even one opening as it closes.
+#[derive(Default)]
+struct Connections {
+    open: u64,
+    /// Connections ever opened. A shutdown timer only fires if this hasn't moved since it was armed.
+    opened: u64,
+}
+
 /// Holds one count in `AppState::connections` for the life of a WebSocket handler, whichever way it
 /// exits. Dropping the last one arms the auto-shutdown timer.
 struct Connection(Arc<AppState>);
 
 impl Connection {
     fn open(state: &Arc<AppState>) -> Self {
-        state.connections.fetch_add(1, Ordering::Relaxed);
-        state.connects.fetch_add(1, Ordering::Relaxed);
+        let mut connections = state.connections.lock();
+        connections.open += 1;
+        connections.opened += 1;
         Self(Arc::clone(state))
     }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        if self.0.connections.fetch_sub(1, Ordering::Relaxed) != 1 {
-            return;
-        }
+        let armed_at = {
+            let mut connections = self.0.connections.lock();
+            connections.open -= 1;
+            if connections.open > 0 {
+                return;
+            }
+            connections.opened
+        };
         // A handler dropped while the runtime itself shuts down has no timer to arm.
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let state = Arc::clone(&self.0);
-        let armed_at = state.connects.load(Ordering::Relaxed);
         runtime.spawn(async move {
             tokio::time::sleep(SHUTDOWN_GRACE).await;
             // Shut down only if nobody connected during the grace period. Checking just the count
             // would let an earlier disconnect's timer fire right after a later reconnect-and-leave
             // (two quick reloads), well inside that second disconnect's grace period.
-            if state.connects.load(Ordering::Relaxed) == armed_at {
+            if state.connections.lock().opened == armed_at {
                 let _ = state.shutdown.send(true);
             }
         });
@@ -598,11 +642,12 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     // Whether the tree or the view changed since the last layout sent.
     let mut stale = false;
     let mut last_layout = tokio::time::Instant::now();
+    let mut layout_took = Duration::ZERO;
     loop {
         // While a scan streams in, layouts are rate-limited; otherwise one goes out at once.
         let scanning = matches!(*state.scan.phase.lock(), ScanPhase::Running { .. });
         let layout_due = if scanning {
-            last_layout + SCAN_LAYOUT_INTERVAL
+            last_layout + SCAN_LAYOUT_INTERVAL.max(layout_took * SCAN_LAYOUT_COST_FACTOR)
         } else {
             tokio::time::Instant::now()
         };
@@ -637,6 +682,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
                 // Before laying out, so a change made meanwhile makes the tab stale again.
                 tree_changes.mark_unchanged();
                 let (scan_start, layout) = update_tab(&state, &mut view);
+                layout_took = last_layout.elapsed();
                 for message in [scan_start, layout].into_iter().flatten() {
                     if socket.send(Message::Binary(message)).await.is_err() {
                         return;
@@ -677,19 +723,27 @@ fn without_verbatim_prefix(path: &std::path::Path) -> std::borrow::Cow<'_, std::
 }
 
 fn reveal_in_file_manager(path: &std::path::Path) {
+    let mut command;
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+        command = std::process::Command::new("open");
+        command.arg("-R").arg(path);
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(path.parent().unwrap_or(path))
-            .spawn();
+        command = std::process::Command::new("xdg-open");
+        command.arg(path.parent().unwrap_or(path));
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("explorer").arg("/select,").arg(path).spawn();
+        command = std::process::Command::new("explorer");
+        command.arg("/select,").arg(path);
+    }
+
+    // Waited for off the async workers (xdg-open can last as long as the file manager it opens),
+    // so the finished child is reaped instead of left a zombie for the life of the server.
+    if let Ok(mut child) = command.spawn() {
+        std::thread::spawn(move || child.wait());
     }
 }
 
@@ -792,17 +846,56 @@ mod tests {
         state
     }
 
+    /// The layout `view` gets now.
+    fn layout(state: &AppState, view: &mut ViewConfig) -> wire::LayoutPayload {
+        let (_, layout) = update_tab(state, view);
+        match wire::ServerMessage::decode(&layout.expect("a layout")) {
+            Some(wire::ServerMessage::Layout(layout)) => layout,
+            other => panic!("expected a layout, got {other:?}"),
+        }
+    }
+
     /// The layout a new tab gets.
     fn first_layout(state: &AppState) -> wire::LayoutPayload {
         let mut view = ViewConfig {
             viewport: (800.0, 600.0),
             ..ViewConfig::default()
         };
-        let (_, layout) = update_tab(state, &mut view);
-        match wire::ServerMessage::decode(&layout.expect("a layout")) {
-            Some(wire::ServerMessage::Layout(layout)) => layout,
-            other => panic!("expected a layout, got {other:?}"),
-        }
+        layout(state, &mut view)
+    }
+
+    /// A tab keeps its filtered sizes from one layout to the next, but not past a change to the
+    /// tree or to its filter.
+    #[test]
+    fn filtered_layouts_follow_the_tree_and_the_filter() {
+        let state = finished_scan(Some(ScanOutcome::Complete), Duration::ZERO);
+        let mut view = ViewConfig {
+            viewport: (800.0, 600.0),
+            filter: FilterConfig {
+                name_pattern: "a".into(),
+                ..FilterConfig::default()
+            },
+            ..ViewConfig::default()
+        };
+        assert_eq!(layout(&state, &mut view).root_size, 10);
+        assert_eq!(layout(&state, &mut view).root_size, 10, "laid out again");
+
+        let file = ScannedFile {
+            name: "ab".into(),
+            size: 5,
+            mtime: 0,
+        };
+        state.scan.tree.write().apply(ScanEvent::Dir {
+            id: 2,
+            parent: 1,
+            name: "sub".into(),
+            mtime: 0,
+            files: vec![file],
+        });
+        assert_eq!(layout(&state, &mut view).root_size, 15, "the tree changed");
+
+        view.filter.name_pattern = "ab".into();
+        assert_eq!(layout(&state, &mut view).root_size, 5, "the filter changed");
     }
 
     /// A finished scan's layouts tell the page whether it read everything: not when it stalled, nor

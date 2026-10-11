@@ -21,16 +21,31 @@ pub struct Layout {
 }
 
 pub fn compute_layout(tree: &DirTree, view_root: u64, canvas_w: f64, canvas_h: f64, config: &LayoutConfig) -> Layout {
-    let Some(root) = tree.nodes.get(&view_root) else {
-        return Layout::default();
-    };
     let filtered_sizes = config
         .filter
         .is_active()
         .then(|| tree.compute_filtered_sizes(&config.filter, view_root));
+    compute_layout_with(tree, view_root, canvas_w, canvas_h, config, filtered_sizes.as_ref())
+}
+
+/// `compute_layout` with the sizes under `config`'s filter already computed (by
+/// `DirTree::compute_filtered_sizes`, over at least `view_root`'s subtree), or `None` with no
+/// filter active. Filtering means visiting every file under the view, so a caller laying out an
+/// unchanged tree again (a resize, another depth) can keep them.
+pub fn compute_layout_with(
+    tree: &DirTree,
+    view_root: u64,
+    canvas_w: f64,
+    canvas_h: f64,
+    config: &LayoutConfig,
+    filtered_sizes: Option<&NodeMap<u64>>,
+) -> Layout {
+    let Some(root) = tree.nodes.get(&view_root) else {
+        return Layout::default();
+    };
     let mut ctx = LayoutCtx {
         tree,
-        filtered_sizes: filtered_sizes.as_ref(),
+        filtered_sizes,
         config,
         out: Vec::new(),
     };

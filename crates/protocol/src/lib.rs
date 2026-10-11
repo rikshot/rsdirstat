@@ -89,6 +89,9 @@ pub struct LayoutPayload {
     /// How long the scan has been running, or took once done, in milliseconds. From the server, so a
     /// tab that joins mid-scan, or after it, shows the scan's own time.
     pub scan_ms: u32,
+    /// The server's path separator, for showing the paths of what's in the view: the page can't
+    /// tell it from a root like `projects`.
+    pub separator: char,
     pub breadcrumb: Vec<BreadcrumbEntry>,
     pub rects: Vec<LayoutRect>,
 }
@@ -174,7 +177,8 @@ impl ClientMessage {
     }
 
     /// Canonicalize incoming values regardless of what a client sent: clamp the depth and color
-    /// mode to their valid ranges and lower-case the name filter for case-insensitive matching.
+    /// mode to their valid ranges, lower-case the name filter for case-insensitive matching, and
+    /// take extensions without the dot (or `*.`) people often type before them.
     fn normalize(&mut self) {
         match self {
             ClientMessage::Viewport { width, height } => {
@@ -191,6 +195,14 @@ impl ClientMessage {
             ClientMessage::SetDepth { depth } => *depth = (*depth).clamp(1, MAX_DEPTH),
             ClientMessage::ColorMode { mode } if *mode > COLOR_MODE_AGE => *mode = COLOR_MODE_TYPE,
             ClientMessage::FilterName { pattern } => *pattern = pattern.to_ascii_lowercase(),
+            ClientMessage::FilterExt { extensions } => {
+                for extension in extensions.iter_mut() {
+                    if extension.starts_with(['*', '.']) {
+                        *extension = extension.trim_start_matches(['*', '.']).into();
+                    }
+                }
+                extensions.retain(|extension| !extension.is_empty());
+            }
             _ => {}
         }
     }
@@ -403,6 +415,17 @@ mod tests {
     }
 
     #[test]
+    fn extensions_arrive_without_their_dot() {
+        let msg = ClientMessage::FilterExt {
+            extensions: vec![".mp4".into(), "*.MOV".into(), "rs".into(), ".".into(), "tar.gz".into()],
+        };
+        let expected = ClientMessage::FilterExt {
+            extensions: vec!["mp4".into(), "MOV".into(), "rs".into(), "tar.gz".into()],
+        };
+        assert_eq!(client_roundtrip(msg), expected);
+    }
+
+    #[test]
     fn filter_size_round_trips() {
         let msg = ClientMessage::FilterSize {
             min: 1024,
@@ -428,6 +451,7 @@ mod tests {
             scan_done: true,
             partial: true,
             scan_ms: 4_200,
+            separator: '\\',
             breadcrumb: vec![BreadcrumbEntry {
                 id: 7,
                 name: "root".into(),
@@ -445,6 +469,7 @@ mod tests {
             scan_done: false,
             partial: false,
             scan_ms: 0,
+            separator: '/',
             breadcrumb: vec![BreadcrumbEntry {
                 id: 0,
                 name: String::new(),

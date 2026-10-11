@@ -88,6 +88,8 @@ struct ViewState {
     rect_index_by_id: HashMap<u64, usize>,
     breadcrumb: Vec<BreadcrumbEntry>,
     rendered_breadcrumb: Vec<BreadcrumbEntry>,
+    /// The server's path separator, for the hovered rect's path.
+    separator: char,
     view_root_size: u64,
     zoom_anim: Option<ZoomAnim>,
     pending_old_rects: Option<Vec<RenderRect>>,
@@ -243,6 +245,7 @@ impl TreemapApp {
                 rect_index_by_id: HashMap::new(),
                 breadcrumb: Vec::new(),
                 rendered_breadcrumb: Vec::new(),
+                separator: '/',
                 view_root_size: 0,
                 zoom_anim: None,
                 pending_old_rects: None,

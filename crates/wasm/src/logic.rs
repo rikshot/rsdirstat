@@ -46,18 +46,12 @@ pub(crate) fn hsl(hue: u16, saturation: u8, lightness: u8) -> &'static str {
     })
 }
 
-/// Join path components for display. The separator is `\` when the scan root is a Windows path
-/// (its label holds one, as `C:\` does) and `/` otherwise, and none is added after a component that
-/// already ends with one, such as a root of `/` or `C:\`.
-pub(crate) fn join_path(parts: &[&str]) -> String {
-    let separator = if parts.first().is_some_and(|root| root.contains('\\')) {
-        '\\'
-    } else {
-        '/'
-    };
+/// Join path components for display with the server's `separator`, adding none after a component
+/// that already ends with one, such as a root of `/` or `C:\`.
+pub(crate) fn join_path(parts: &[&str], separator: char) -> String {
     let mut path = String::new();
     for part in parts {
-        if !path.is_empty() && !path.ends_with(['/', '\\']) {
+        if !path.is_empty() && !path.ends_with(separator) {
             path.push(separator);
         }
         path.push_str(part);
@@ -180,6 +174,7 @@ pub(crate) fn build_hover_state(
     rects: &[RenderRect],
     id_to_index: &HashMap<u64, usize>,
     breadcrumb: &[BreadcrumbEntry],
+    separator: char,
     mouse_x: f64,
     mouse_y: f64,
 ) -> Option<HoverState> {
@@ -204,7 +199,7 @@ pub(crate) fn build_hover_state(
             .map(|&index| rects[index].name.as_str()),
     );
     parts.push(&hovered_rect.name);
-    let path_text = join_path(&parts);
+    let path_text = join_path(&parts, separator);
 
     Some(HoverState {
         hovered_index,
@@ -318,6 +313,7 @@ pub(crate) fn self_checks() -> Vec<(&'static str, bool)> {
         scan_done: true,
         partial: false,
         scan_ms: 1_500,
+        separator: '/',
         breadcrumb: breadcrumb.clone(),
         rects: rects.clone(),
     });
@@ -354,7 +350,10 @@ pub(crate) fn self_checks() -> Vec<(&'static str, bool)> {
                         && decoded.rects == rects
             ),
         ),
-        ("join a path under /", join_path(&["/", "usr", "lib"]) == "/usr/lib"),
+        (
+            "join a path under /",
+            join_path(&["/", "usr", "lib"], '/') == "/usr/lib",
+        ),
     ]
 }
 
@@ -425,12 +424,17 @@ mod tests {
     }
 
     #[test]
-    fn join_path_uses_one_separator_of_the_roots_kind() {
-        assert_eq!(join_path(&["/"]), "/");
-        assert_eq!(join_path(&["/", "usr", "lib"]), "/usr/lib");
-        assert_eq!(join_path(&["projects", "src", "main.rs"]), "projects/src/main.rs");
+    fn join_path_uses_the_servers_separator_once() {
+        assert_eq!(join_path(&["/"], '/'), "/");
+        assert_eq!(join_path(&["/", "usr", "lib"], '/'), "/usr/lib");
+        assert_eq!(join_path(&["projects", "src", "main.rs"], '/'), "projects/src/main.rs");
         // Regression: a Windows drive root showed as `C:\/Windows/System32`.
-        assert_eq!(join_path(&["C:\\", "Windows", "System32"]), "C:\\Windows\\System32");
+        assert_eq!(
+            join_path(&["C:\\", "Windows", "System32"], '\\'),
+            "C:\\Windows\\System32"
+        );
+        // And any other Windows root as `projects/src`.
+        assert_eq!(join_path(&["projects", "src"], '\\'), "projects\\src");
     }
 
     #[test]
@@ -477,7 +481,7 @@ mod tests {
             name: "/tmp".into(),
         }];
         let rects = [root, child, leaf];
-        let hover = build_hover_state(&rects, &build_rect_index(&rects), &breadcrumb, 16.0, 16.0).unwrap();
+        let hover = build_hover_state(&rects, &build_rect_index(&rects), &breadcrumb, '/', 16.0, 16.0).unwrap();
         assert_eq!(hover.hovered_index, 2);
         assert_eq!(hover.hovered_ancestor_indices, vec![1, 0]);
         assert_eq!(hover.path_text, "/tmp/src/nested/main.rs");

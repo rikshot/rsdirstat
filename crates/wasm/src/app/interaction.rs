@@ -45,6 +45,7 @@ impl TreemapApp {
             &self.view.rects,
             &self.view.rect_index_by_id,
             &self.view.breadcrumb,
+            self.view.separator,
             mouse_x,
             mouse_y,
         );
