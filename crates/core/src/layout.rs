@@ -340,6 +340,28 @@ mod tests {
         }
     }
 
+    /// In Age mode a folder drawn as one block takes the colour of its newest content, not of its
+    /// own files: one holding only subfolders has none.
+    #[test]
+    fn age_colours_a_folder_block_by_its_newest_content() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 0);
+        tree.insert_dir(2, 1, "old", 0, 0);
+        tree.insert_dir(3, 2, "inside-old", 500, 1_000);
+        tree.insert_dir(4, 1, "new", 0, 0);
+        tree.insert_dir(5, 4, "inside-new", 500, 2_000);
+        let config = LayoutConfig {
+            max_depth: 1,
+            color_mode: COLOR_MODE_AGE,
+            mtime_range: tree.mtime_range,
+            ..default_config()
+        };
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
+        let rect = |name: &str| rects.iter().find(|rect| rect.name == name).unwrap();
+        assert_eq!((rect("old").hue, rect("old").mtime), (0, 1_000), "oldest: red");
+        assert_eq!((rect("new").hue, rect("new").mtime), (120, 2_000), "newest: green");
+    }
+
     #[test]
     fn empty_tree_produces_empty_layout() {
         let tree = DirTree::new();

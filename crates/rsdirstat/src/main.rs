@@ -423,7 +423,7 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
 
     // The scanner stopped without `ScanDone`, so the tree isn't marked complete: the page says so.
     if started {
-        state.scan.tree.write().recompute_sizes();
+        state.scan.tree.write().recompute_totals();
         if end_phase(ScanPhase::Done) {
             state.tree_changed();
         }

@@ -44,11 +44,15 @@ pub struct DirNode {
     /// Total size of this directory's own files.
     pub direct_size: u64,
     /// Total size of everything under this directory: its files and all its subdirectories.
-    /// Grows as directories are added during a scan; exact after `recompute_sizes`.
+    /// Grows as directories are added during a scan; exact after `recompute_totals`.
     pub size: u64,
     pub children: Vec<u64>,
     pub files: Vec<FileEntry>,
     pub hue: u16,
+    /// Newest modification time (Unix seconds) of this directory's own files; 0 with none.
+    pub direct_mtime: i64,
+    /// Newest modification time of anything under this directory, which Age mode colours it by: a
+    /// folder holding only subfolders is as recent as the newest file in them. Kept up like `size`.
     pub mtime: i64,
 }
 
@@ -160,7 +164,7 @@ impl DirTree {
                 self.insert_dir(id, parent, name, size, mtime);
             }
             ScanEvent::ScanDone { outcome } => {
-                self.recompute_sizes();
+                self.recompute_totals();
                 self.complete = outcome == ScanOutcome::Complete;
             }
         }
@@ -187,10 +191,10 @@ impl DirTree {
         node.parent = parent;
         node.name = name;
         node.direct_size = size;
+        node.direct_mtime = mtime;
         node.hue = hue;
-        node.mtime = mtime;
 
-        self.propagate_size(id, size);
+        self.propagate(id, size, mtime);
     }
 
     pub fn insert_file(&mut self, parent: u64, name: impl Into<Box<str>>, size: u64, mtime: i64) {
@@ -245,11 +249,13 @@ impl DirTree {
         hue
     }
 
-    /// Add `delta` to the size of `node_id` and of every directory above it.
-    fn propagate_size(&mut self, node_id: u64, delta: u64) {
+    /// Add `size` to the size of `node_id` and of every directory above it, and bring their newest
+    /// modification time up to `mtime`.
+    fn propagate(&mut self, node_id: u64, size: u64, mtime: i64) {
         let mut current = node_id;
         while let Some(node) = self.nodes.get_mut(&current) {
-            node.size = node.size.saturating_add(delta);
+            node.size = node.size.saturating_add(size);
+            node.mtime = node.mtime.max(mtime);
             if node.parent == 0 {
                 break;
             }
@@ -270,18 +276,22 @@ impl DirTree {
         order
     }
 
-    /// Recompute every directory's `size` bottom-up from the `direct_size`s. The running sizes kept
-    /// during a scan rely on each directory arriving before its subdirectories (as the scanner
-    /// sends them); this makes them exact whatever the order.
-    pub fn recompute_sizes(&mut self) {
+    /// Recompute every directory's `size` and `mtime` bottom-up from the `direct_` ones. The
+    /// running totals kept during a scan rely on each directory arriving before its subdirectories
+    /// (as the scanner sends them); this makes them exact whatever the order.
+    pub fn recompute_totals(&mut self) {
         let Some(root) = self.root_id else { return };
         for id in self.subtree_order(root).into_iter().rev() {
             let Some(node) = self.nodes.get(&id) else { continue };
-            let size = node.children.iter().fold(node.direct_size, |total, child| {
-                total.saturating_add(self.nodes.get(child).map_or(0, |child| child.size))
-            });
+            let totals = node
+                .children
+                .iter()
+                .filter_map(|child| self.nodes.get(child))
+                .fold((node.direct_size, node.direct_mtime), |(size, mtime), child| {
+                    (size.saturating_add(child.size), mtime.max(child.mtime))
+                });
             if let Some(node) = self.nodes.get_mut(&id) {
-                node.size = size;
+                (node.size, node.mtime) = totals;
             }
         }
     }
@@ -624,36 +634,55 @@ mod tests {
     }
 
     #[test]
-    fn recompute_sizes_matches_propagated() {
+    fn recompute_totals_matches_propagated() {
         let mut tree = sample_tree();
         for node in tree.nodes.values_mut() {
             node.size = 0;
         }
-        tree.recompute_sizes();
+        tree.recompute_totals();
         assert_eq!(tree.nodes[&1].size, 350);
         assert_eq!(tree.nodes[&2].size, 150);
         assert_eq!(tree.nodes[&3].size, 200);
         assert_eq!(tree.nodes[&4].size, 50);
     }
 
-    /// A directory whose own event arrives after a subdirectory's: the running sizes miss the
-    /// subdirectory higher up, and `recompute_sizes` (run at `ScanDone`) corrects them.
+    /// A directory whose own event arrives after a subdirectory's: the running totals miss the
+    /// subdirectory higher up, and `recompute_totals` (run at `ScanDone`) corrects them.
     #[test]
-    fn recompute_sizes_fixes_out_of_order_inserts() {
+    fn recompute_totals_fixes_out_of_order_inserts() {
         let mut tree = DirTree::new();
         tree.insert_dir(1, 0, "root", 0, 100);
-        tree.insert_dir(3, 2, "grandchild", 50, 100); // before its parent, 2
-        tree.insert_dir(2, 1, "child", 10, 100);
-        tree.recompute_sizes();
+        tree.insert_dir(3, 2, "grandchild", 50, 300); // before its parent, 2
+        tree.insert_dir(2, 1, "child", 10, 200);
+        tree.recompute_totals();
         assert_eq!(tree.nodes[&1].size, 60);
         assert_eq!(tree.nodes[&2].size, 60);
         assert_eq!(tree.nodes[&3].size, 50);
+        assert_eq!(tree.nodes[&1].mtime, 300);
+        assert_eq!(tree.nodes[&2].mtime, 300);
+    }
+
+    /// A folder's age is its newest content's, however deep: one holding only subfolders isn't
+    /// left without a date.
+    #[test]
+    fn a_folder_is_as_new_as_anything_in_it() {
+        let mut tree = DirTree::new();
+        tree.insert_dir(1, 0, "root", 0, 100);
+        tree.insert_dir(2, 1, "only-folders", 0, 0);
+        tree.insert_dir(3, 2, "old", 10, 500);
+        tree.insert_dir(4, 2, "new", 10, 900);
+        assert_eq!(tree.nodes[&2].direct_mtime, 0);
+        assert_eq!(tree.nodes[&2].mtime, 900, "kept up during a scan");
+        assert_eq!(tree.nodes[&1].mtime, 900);
+        tree.recompute_totals();
+        assert_eq!(tree.nodes[&2].mtime, 900, "and after it");
+        assert_eq!(tree.nodes[&3].mtime, 500);
     }
 
     #[test]
-    fn recompute_sizes_empty_tree() {
+    fn recompute_totals_empty_tree() {
         let mut tree = DirTree::new();
-        tree.recompute_sizes();
+        tree.recompute_totals();
         assert!(tree.nodes.is_empty());
     }
 
