@@ -154,13 +154,19 @@ cargo install --locked cargo-nextest trunk
 cargo install --locked playwright-rs@0.19.0 --features cli   # the version in Cargo.lock
 playwright-rs install chromium firefox webkit   # add --with-deps on Linux
 
-trunk build        # build the frontend once, before the browser tests
-cargo nextest run
+cargo nextest run   # the browser tests build the frontend first if it's missing or stale
 ```
 
-The visual tests compare screenshots against baselines in `crates/rsdirstat/tests/snapshots/`.
-Those are git-ignored and recorded on the first run, so delete them to re-record after an
-intentional rendering change.
+The visual tests compare screenshots against baselines in `crates/rsdirstat/tests/snapshots/`. CI
+uses the committed set for its OS (`linux/`, `macos/`, `windows/`), recorded on CI's own runners,
+and fails if one is missing. Your machine renders text differently from those runners, so local
+runs use `local/` instead: git-ignored, recorded on the first run, and re-recorded when you delete
+it.
+
+After an intentional change to what the treemap draws, re-record the committed baselines: push the
+change, run the **Update visual baselines** workflow on that branch
+(`gh workflow run visual-baselines.yml --ref <branch>`), then run
+`scripts/download-visual-baselines.sh` to put its results in place for review and commit.
 
 On macOS 27, if the Firefox tests fail with `Could not find profile folder`, point
 `CFFIXED_USER_HOME` at an empty directory: `CFFIXED_USER_HOME=$(mktemp -d) cargo nextest run`.

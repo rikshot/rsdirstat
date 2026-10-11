@@ -123,41 +123,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest,trunk,cargo-llvm-cov
-      # Each playwright-rs release bundles one driver build, so its version (read from the lockfile,
-      # never repeated here) keys the browser cache and pins the CLI below.
-      - id: playwright
-        shell: bash
-        run: |
-          version=$(tr -d '\r' < Cargo.lock | grep -A1 '^name = "playwright-rs"$' | sed -n 's/^version = "\(.*\)"$/\1/p')
-          test -n "$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v6
-        with:
-          key: playwright-rs-${{ steps.playwright.outputs.version }}-${{ runner.os }}
-          path: |
-            ~/.cache/ms-playwright
-            ~/Library/Caches/ms-playwright
-            ~/AppData/Local/ms-playwright
-            ~/.cache/playwright-rust
-            ~/Library/Caches/playwright-rust
-            ~/AppData/Local/playwright-rust
-      # Provision the driver + browsers via playwright-rs's own `install` CLI. Both it and the
-      # library's build.rs put the driver in the OS user cache (~/.cache/playwright-rust/<version>/).
-      # Because that cache is independent of the build's target/, it survives compile caching — so we
-      # no longer need the old `cargo clean -p playwright-rs` dance (which forced build.rs to
-      # re-download into target/), nor Node/npx. The CLI matches the dev-dependency's version so the
-      # bundled driver matches.
-      - run: cargo install --locked playwright-rs@${{ steps.playwright.outputs.version }} --features cli
-      - run: playwright-rs install --with-deps chromium firefox webkit
-      - uses: actions/cache@v6
-        with:
-          # Bump on every browser-engine change (the driver's bundled Chromium/Firefox/WebKit
-          # render text and antialiasing differently across majors) and on every intentional
-          # change to what the treemap draws, or the stale baselines fail.
-          key: visual-baselines-v6-${{ matrix.os }}
-          path: crates/rsdirstat/tests/snapshots/
-      # Build the frontend once here: nextest runs each test in its own process, so leaving the
-      # bundle to the test harness would launch many concurrent `trunk build`s that race.
+      - uses: ./.github/actions/setup-playwright
+      # Build the frontend up front, outside the instrumented test run. The test harness only
+      # rebuilds a bundle that is missing or older than its sources, so here it never has to.
       - run: trunk build
       # Run under instrumentation: the e2e/visual tests drive the server binary as a
       # subprocess, so this captures server/main.rs coverage that the unit `test` job can't.
@@ -171,11 +139,17 @@ jobs:
           flags: browser-${{ matrix.os }}
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
+      # The visual tests compare against the committed per-OS baselines and, on a mismatch, write
+      # `<name>-actual.png` and `<name>-diff.png` next to them. Upload those so a failure (or a
+      # retried flake) can be seen without reproducing it.
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: visual-snapshots-${{ matrix.os }}
-          path: crates/rsdirstat/tests/snapshots/
+          name: visual-diffs-${{ matrix.os }}
+          path: |
+            crates/rsdirstat/tests/snapshots/*/*-actual.png
+            crates/rsdirstat/tests/snapshots/*/*-diff.png
+          if-no-files-found: ignore
           retention-days: 14
       # Playwright traces are written only for failing browser tests (retain-on-failure);
       # upload them so a red cross-OS run is debuggable without reproducing locally. `always()`

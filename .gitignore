@@ -1,5 +1,7 @@
 /target
 /docs
-crates/rsdirstat/tests/snapshots/*.png
+crates/rsdirstat/tests/snapshots/local/
+crates/rsdirstat/tests/snapshots/**/*-actual.png
+crates/rsdirstat/tests/snapshots/**/*-diff.png
 crates/rsdirstat/tests/traces/
 crates/rsdirstat/dist/

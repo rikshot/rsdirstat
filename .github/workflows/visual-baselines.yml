@@ -1,0 +1,48 @@
+name: Update visual baselines
+
+# Re-record the committed visual-test baselines on CI's own runners, one set per OS. Run it after an
+# intentional change to what the treemap draws, or when a playwright-rs update brings new browser
+# builds: push the change, run this workflow on that branch, then download the results into the
+# repo with `scripts/download-visual-baselines.sh`, review them, and commit.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  record:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            dir: linux
+          - os: macos-latest
+            dir: macos
+          - os: windows-latest
+            dir: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest,trunk
+      - uses: ./.github/actions/setup-playwright
+      - run: trunk build
+      # Same profile and environment as the CI browser job (`CI` is set on every runner, so the
+      # tests write to `tests/snapshots/<os>/`), but recording instead of comparing.
+      - run: cargo nextest run --locked --profile ci -E 'test(/^visual/)'
+        env:
+          RSDIRSTAT_UPDATE_SNAPSHOTS: "1"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: visual-baselines-${{ matrix.dir }}
+          path: crates/rsdirstat/tests/snapshots/${{ matrix.dir }}/*.png
+          if-no-files-found: error
+          retention-days: 14

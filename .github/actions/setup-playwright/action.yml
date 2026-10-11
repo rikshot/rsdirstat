@@ -1,0 +1,34 @@
+name: Set up Playwright
+description: >
+  Install the playwright-rs CLI at the version in Cargo.lock, then its driver and the Chromium,
+  Firefox and WebKit builds it pins, cached per version and OS.
+
+runs:
+  using: composite
+  steps:
+    # Each playwright-rs release bundles one driver build, so its version (read from the lockfile,
+    # never repeated here) keys the browser cache and pins the CLI below.
+    - id: version
+      shell: bash
+      run: |
+        version=$(tr -d '\r' < Cargo.lock | grep -A1 '^name = "playwright-rs"$' | sed -n 's/^version = "\(.*\)"$/\1/p')
+        test -n "$version"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+    - uses: actions/cache@v6
+      with:
+        key: playwright-rs-${{ steps.version.outputs.version }}-${{ runner.os }}
+        path: |
+          ~/.cache/ms-playwright
+          ~/Library/Caches/ms-playwright
+          ~/AppData/Local/ms-playwright
+          ~/.cache/playwright-rust
+          ~/Library/Caches/playwright-rust
+          ~/AppData/Local/playwright-rust
+    # Provision the driver + browsers via playwright-rs's own `install` CLI. Both it and the
+    # library's build.rs put the driver in the OS user cache (~/.cache/playwright-rust/<version>/),
+    # which is independent of the build's target/, so it survives compile caching and needs neither
+    # Node nor npx. The CLI matches the dev-dependency's version so the bundled driver matches.
+    - shell: bash
+      run: cargo install --locked playwright-rs@${{ steps.version.outputs.version }} --features cli
+    - shell: bash
+      run: playwright-rs install --with-deps chromium firefox webkit
