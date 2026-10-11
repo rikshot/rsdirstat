@@ -1,7 +1,5 @@
 mod common;
 
-use std::time::Duration;
-
 use common::{
     TestServer, assert_no_layout_after, create_test_dir, launch_browser, layout_seq, wait_for_layout_after,
     wait_for_scan_done,
@@ -544,9 +542,11 @@ async fn e2e_wait_mode_start_button_starts_scan() {
 #[cfg(unix)]
 #[test]
 fn e2e_sigterm_mid_scan_exits_promptly() {
+    use std::time::{Duration, Instant};
+
     let server = TestServer::start(std::path::Path::new("/"));
     std::thread::sleep(Duration::from_millis(500));
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     drop(server); // SIGTERM, then wait for exit
     let took = started.elapsed();
     assert!(
