@@ -1,10 +1,11 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::future::IntoFuture;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::body::Bytes;
@@ -97,10 +98,11 @@ enum ScanPhase {
     AwaitingPath,
     /// A path is set, and the scan waits for the page's Start button (`--wait`).
     AwaitingStart,
-    /// Scanning. `cancel` stops it, and also identifies this scan to its relay task.
-    Running { cancel: Arc<AtomicBool> },
-    /// The last scan has ended (complete, or cut short by a cancel or stall).
-    Done,
+    /// Scanning since `started`. `cancel` stops it, and also identifies this scan to its relay task.
+    Running { cancel: Arc<AtomicBool>, started: Instant },
+    /// The last scan has ended (complete, or cut short by a cancel or stall), after running this
+    /// long.
+    Done(Duration),
 }
 
 struct ScanState {
@@ -148,8 +150,10 @@ impl AppState {
     }
 }
 
-/// How long shutdown waits for blocking tasks before exiting anyway (see `main`).
-const BLOCKING_TASK_GRACE: Duration = Duration::from_secs(2);
+/// How long shutdown waits for work in flight before exiting anyway: first for requests still being
+/// answered (see `serve_until_stopped`), then for blocking tasks (see `main`). Either can be stuck
+/// in a syscall on a dead network mount.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -159,7 +163,7 @@ fn main() -> Result<()> {
     // a dead network mount (a scan of it, or `statvfs` for /volumes) for as long as the mount takes
     // to time out, if it ever does. A healthy scan stops within ~200ms of being cancelled, so give
     // the tasks a moment, then exit regardless.
-    rt.shutdown_timeout(BLOCKING_TASK_GRACE);
+    rt.shutdown_timeout(DRAIN_GRACE);
     result
 }
 
@@ -223,11 +227,30 @@ async fn run_server(args: Args) -> Result<()> {
         }
     }
 
-    let shutdown = Arc::clone(&state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown))
-        .await?;
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(Arc::clone(&state)));
+    serve_until_stopped(server, state.shutdown.subscribe(), DRAIN_GRACE).await?;
     Ok(())
+}
+
+/// Run `server` until it finishes, or until `grace` after `shutdown` turns true. A graceful shutdown
+/// waits for every request in flight, and one can be stuck for as long as a dead network mount takes
+/// to time out (`statvfs` for /volumes), if it ever does; the server must still exit.
+async fn serve_until_stopped(
+    server: impl IntoFuture<Output = std::io::Result<()>>,
+    mut shutdown: watch::Receiver<bool>,
+    grace: Duration,
+) -> std::io::Result<()> {
+    let deadline = async move {
+        let _ = shutdown.wait_for(|&stopping| stopping).await;
+        tokio::time::sleep(grace).await;
+    };
+    tokio::select! {
+        result = server.into_future() => result,
+        () = deadline => {
+            eprintln!("Exiting with requests still unanswered");
+            Ok(())
+        }
+    }
 }
 
 /// What brings a tab up to date with the tree, encoded: a `ScanStart` if a new scan replaced the
@@ -236,9 +259,9 @@ async fn run_server(args: Args) -> Result<()> {
 /// hold an earlier scan, and a layout would bring its treemap back over the picker), before the
 /// tab's first viewport, or before a scan's root arrives.
 fn update_tab(state: &AppState, view: &mut ViewConfig) -> (Option<Bytes>, Option<Bytes>) {
-    let scan_done = match *state.scan.phase.lock() {
-        ScanPhase::Running { .. } => false,
-        ScanPhase::Done => true,
+    let (scan_done, scan_time) = match *state.scan.phase.lock() {
+        ScanPhase::Running { started, .. } => (false, started.elapsed()),
+        ScanPhase::Done(took) => (true, took),
         ScanPhase::AwaitingPath | ScanPhase::AwaitingStart => return (None, None),
     };
 
@@ -269,20 +292,20 @@ fn update_tab(state: &AppState, view: &mut ViewConfig) -> (Option<Bytes>, Option
         filter: view.filter.clone(),
         mtime_range: tree.mtime_range,
     };
-    let rects = layout::compute_layout(&tree, view_root, vw, vh, &config);
+    let layout = layout::compute_layout(&tree, view_root, vw, vh, &config);
     let breadcrumb = tree.breadcrumb(view_root);
-    let root_size = tree.nodes.get(&view_root).map_or(0, |node| node.size);
     let dir_count = tree.nodes.len() as u32;
     let partial = scan_done && !tree.complete;
     drop(tree);
 
     let payload = wire::LayoutPayload {
-        root_size,
+        root_size: layout.size,
         dir_count,
         scan_done,
         partial,
+        scan_ms: u32::try_from(scan_time.as_millis()).unwrap_or(u32::MAX),
         breadcrumb,
-        rects,
+        rects: layout.rects,
     };
     (scan_start, Some(wire::ServerMessage::Layout(payload).encode().into()))
 }
@@ -313,7 +336,7 @@ async fn shutdown_signal(state: Arc<AppState>) {
     let _ = state.shutdown.send(true);
     // Stop an in-flight scan too. It runs on the blocking pool, which the runtime waits on at
     // exit, so without this a Ctrl+C during a large scan hangs until the whole walk finishes.
-    if let ScanPhase::Running { cancel } = &*state.scan.phase.lock() {
+    if let ScanPhase::Running { cancel, .. } = &*state.scan.phase.lock() {
         cancel.store(true, Ordering::Relaxed);
     }
 }
@@ -330,6 +353,7 @@ fn start_scan(state: &Arc<AppState>, root: Option<PathBuf>, allowed: impl FnOnce
         }
         *phase = ScanPhase::Running {
             cancel: Arc::clone(&cancel),
+            started: Instant::now(),
         };
         let mut current_root = state.scan.root.lock();
         if let Some(root) = root {
@@ -356,14 +380,21 @@ fn start_scan(state: &Arc<AppState>, root: Option<PathBuf>, allowed: impl FnOnce
 /// `ScanDone`, or, if the scanner stops without one, back to the picker when it never started (it
 /// couldn't open the root) and `Done` with what it found when it did (it panicked).
 fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cancel: &Arc<AtomicBool>) {
-    // Only this scan's relay may end its phase.
-    let end_phase = |next: ScanPhase| {
+    // Only this scan's relay may end its phase. `next` gets how long the scan ran.
+    let end_phase = |next: fn(Duration) -> ScanPhase| {
         let mut phase = state.scan.phase.lock();
-        let current = matches!(&*phase, ScanPhase::Running { cancel: running } if Arc::ptr_eq(running, cancel));
-        if current {
-            *phase = next;
+        let ScanPhase::Running {
+            cancel: running,
+            started,
+        } = &*phase
+        else {
+            return false;
+        };
+        if !Arc::ptr_eq(running, cancel) {
+            return false;
         }
-        current
+        *phase = next(started.elapsed());
+        true
     };
 
     // Reused across iterations so the per-batch drain doesn't reallocate each wakeup.
@@ -396,7 +427,7 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
         if end_phase(ScanPhase::Done) {
             state.tree_changed();
         }
-    } else if end_phase(ScanPhase::AwaitingPath) {
+    } else if end_phase(|_| ScanPhase::AwaitingPath) {
         state.picker.send_replace(());
     }
 }
@@ -683,14 +714,14 @@ fn handle_client_message(state: &Arc<AppState>, view: &mut ViewConfig, data: &[u
             false
         }
         ClientMessage::Rescan => {
-            start_scan(state, None, |phase| matches!(phase, ScanPhase::Done));
+            start_scan(state, None, |phase| matches!(phase, ScanPhase::Done(_)));
             false
         }
         ClientMessage::ScanPath { path } => {
             // Only from the picker, or once the current scan is done (never mid-scan). A path that
             // can't be scanned sends the page back to the picker (see `relay_scan`).
             start_scan(state, Some(path.into()), |phase| {
-                matches!(phase, ScanPhase::AwaitingPath | ScanPhase::Done)
+                matches!(phase, ScanPhase::AwaitingPath | ScanPhase::Done(_))
             });
             false
         }
@@ -709,6 +740,54 @@ mod tests {
     use super::*;
     use rsdirstat_core::scan::{ScanOutcome, ScannedFile};
 
+    /// The state after relaying a scan that ran for `ran_for` and ended with `ending`, or without
+    /// a `ScanDone` at all, having found one 10-byte file.
+    fn finished_scan(ending: Option<ScanOutcome>, ran_for: Duration) -> AppState {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let running = ScanPhase::Running {
+            cancel: Arc::clone(&cancel),
+            started: Instant::now() - ran_for,
+        };
+        let state = AppState::new(running, PathBuf::from("/root"), false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let file = ScannedFile {
+            name: "a".into(),
+            size: 10,
+            mtime: 0,
+        };
+        for event in [
+            ScanEvent::ScanStart { path: "root".into() },
+            ScanEvent::Dir {
+                id: 1,
+                parent: 0,
+                name: "root".into(),
+                mtime: 0,
+                files: vec![file],
+            },
+        ]
+        .into_iter()
+        .chain(ending.map(|outcome| ScanEvent::ScanDone { outcome }))
+        {
+            tx.send(event).unwrap();
+        }
+        drop(tx);
+        relay_scan(&state, &rx, &cancel);
+        state
+    }
+
+    /// The layout a new tab gets.
+    fn first_layout(state: &AppState) -> wire::LayoutPayload {
+        let mut view = ViewConfig {
+            viewport: (800.0, 600.0),
+            ..ViewConfig::default()
+        };
+        let (_, layout) = update_tab(state, &mut view);
+        match wire::ServerMessage::decode(&layout.expect("a layout")) {
+            Some(wire::ServerMessage::Layout(layout)) => layout,
+            other => panic!("expected a layout, got {other:?}"),
+        }
+    }
+
     /// A finished scan's layouts tell the page whether it read everything: not when it stalled, nor
     /// when the scanner stopped without saying how it ended.
     #[test]
@@ -718,47 +797,35 @@ mod tests {
             (Some(ScanOutcome::Stalled), true),
             (None, true),
         ] {
-            let cancel = Arc::new(AtomicBool::new(false));
-            let running = ScanPhase::Running {
-                cancel: Arc::clone(&cancel),
-            };
-            let state = AppState::new(running, PathBuf::from("/root"), false);
-            let (tx, rx) = std::sync::mpsc::channel();
-            let file = ScannedFile {
-                name: "a".into(),
-                size: 10,
-                mtime: 0,
-            };
-            for event in [
-                ScanEvent::ScanStart { path: "root".into() },
-                ScanEvent::Dir {
-                    id: 1,
-                    parent: 0,
-                    name: "root".into(),
-                    mtime: 0,
-                    files: vec![file],
-                },
-            ]
-            .into_iter()
-            .chain(ending.map(|outcome| ScanEvent::ScanDone { outcome }))
-            {
-                tx.send(event).unwrap();
-            }
-            drop(tx);
-            relay_scan(&state, &rx, &cancel);
-
-            let mut view = ViewConfig {
-                viewport: (800.0, 600.0),
-                ..ViewConfig::default()
-            };
-            let (_, layout) = update_tab(&state, &mut view);
-            let Some(wire::ServerMessage::Layout(layout)) = wire::ServerMessage::decode(&layout.unwrap()) else {
-                panic!("expected a layout");
-            };
+            let layout = first_layout(&finished_scan(ending, Duration::ZERO));
             assert!(layout.scan_done, "{ending:?}");
             assert_eq!(layout.partial, partial, "{ending:?}");
             assert_eq!(layout.root_size, 10, "{ending:?}");
         }
+    }
+
+    /// Every tab is told how long the scan took, however long after it finished the tab opened.
+    #[test]
+    fn layouts_carry_how_long_the_scan_took() {
+        let state = finished_scan(Some(ScanOutcome::Complete), Duration::from_secs(5));
+        let took = first_layout(&state).scan_ms;
+        assert!((5_000..6_000).contains(&took), "{took}ms");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(first_layout(&state).scan_ms, took, "a later tab sees the same time");
+    }
+
+    /// Shutdown doesn't wait for ever on a request stuck in a syscall.
+    #[tokio::test]
+    async fn shutdown_gives_up_on_requests_that_never_finish() {
+        let (shutdown, stopping) = watch::channel(false);
+        let stuck = std::future::pending::<std::io::Result<()>>();
+        let serving = tokio::spawn(serve_until_stopped(stuck, stopping, Duration::from_millis(100)));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!serving.is_finished(), "it serves until shutdown starts");
+
+        shutdown.send_replace(true);
+        let served = tokio::time::timeout(Duration::from_secs(5), serving).await;
+        assert!(matches!(served, Ok(Ok(Ok(())))), "{served:?}");
     }
 
     /// A page names a file to reveal, and the server joins that name onto a scanned directory, so a

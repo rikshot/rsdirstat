@@ -22,13 +22,10 @@ pub(crate) fn format_size(bytes: u64) -> String {
     }
 }
 
-/// The status line for a finished scan: how many directories and bytes it found, how long it took
-/// (when this tab watched it run), and whether it stopped before reading everything.
-pub(crate) fn scan_summary(dir_count: u32, seconds: Option<f64>, root_size: u64, partial: bool) -> String {
-    let mut summary = match seconds {
-        Some(seconds) => format!("{dir_count} dirs in {seconds:.1}s — {}", format_size(root_size)),
-        None => format!("{dir_count} dirs — {}", format_size(root_size)),
-    };
+/// The status line for a finished scan: how many directories it found and how long it took, the
+/// size of the view, and whether the scan stopped before reading everything.
+pub(crate) fn scan_summary(dir_count: u32, seconds: f64, root_size: u64, partial: bool) -> String {
+    let mut summary = format!("{dir_count} dirs in {seconds:.1}s — {}", format_size(root_size));
     if partial {
         summary.push_str(" — incomplete: the scan got stuck (see the terminal)");
     }
@@ -320,6 +317,7 @@ pub(crate) fn self_checks() -> Vec<(&'static str, bool)> {
         dir_count: 3,
         scan_done: true,
         partial: false,
+        scan_ms: 1_500,
         breadcrumb: breadcrumb.clone(),
         rects: rects.clone(),
     });
@@ -412,11 +410,10 @@ mod tests {
 
     #[test]
     fn scan_summary_says_when_a_scan_is_incomplete() {
-        assert_eq!(scan_summary(12, Some(3.25), 2048, false), "12 dirs in 3.2s — 2.00 KiB");
-        assert_eq!(scan_summary(12, None, 2048, false), "12 dirs — 2.00 KiB");
+        assert_eq!(scan_summary(12, 3.25, 2048, false), "12 dirs in 3.2s — 2.00 KiB");
         assert_eq!(
-            scan_summary(12, None, 2048, true),
-            "12 dirs — 2.00 KiB — incomplete: the scan got stuck (see the terminal)"
+            scan_summary(12, 3.25, 2048, true),
+            "12 dirs in 3.2s — 2.00 KiB — incomplete: the scan got stuck (see the terminal)"
         );
     }
 

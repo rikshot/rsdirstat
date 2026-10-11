@@ -207,10 +207,11 @@ impl TreemapApp {
         set_hidden(&self.chrome.change_button, !new_scan_done)?;
         if !new_scan_done {
             self.start_scan_timer()?;
+            // The server's clock, so a tab that joined mid-scan counts from the scan's start.
+            self.session.scan_start_time = self.now() - f64::from(payload.scan_ms);
         } else {
-            // Timed only when this tab saw the scan finish.
-            let seconds = (!self.view.scan_done).then(|| (self.now() - self.session.scan_start_time) / 1000.0);
             self.stop_scan_timer();
+            let seconds = f64::from(payload.scan_ms) / 1000.0;
             self.chrome.status_element.set_text_content(Some(&scan_summary(
                 dir_count,
                 seconds,

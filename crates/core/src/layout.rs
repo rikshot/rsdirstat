@@ -11,15 +11,18 @@ pub struct LayoutConfig {
     pub mtime_range: (i64, i64),
 }
 
-pub fn compute_layout(
-    tree: &DirTree,
-    view_root: u64,
-    canvas_w: f64,
-    canvas_h: f64,
-    config: &LayoutConfig,
-) -> Vec<LayoutRect> {
+/// A view's treemap.
+#[derive(Default)]
+pub struct Layout {
+    /// The size the rects divide up: the view root's, counting with a filter active only the files
+    /// it matches, as the rects do.
+    pub size: u64,
+    pub rects: Vec<LayoutRect>,
+}
+
+pub fn compute_layout(tree: &DirTree, view_root: u64, canvas_w: f64, canvas_h: f64, config: &LayoutConfig) -> Layout {
     let Some(root) = tree.nodes.get(&view_root) else {
-        return Vec::new();
+        return Layout::default();
     };
     let filtered_sizes = config
         .filter
@@ -37,9 +40,9 @@ pub fn compute_layout(
         w: canvas_w,
         h: canvas_h,
     };
-    let total_size = ctx.size(view_root, root);
-    ctx.layout_node(view_root, root, total_size, canvas, 0.0, 0);
-    ctx.out
+    let size = ctx.size(view_root, root);
+    ctx.layout_node(view_root, root, size, canvas, 0.0, 0);
+    Layout { size, rects: ctx.out }
 }
 
 #[derive(Clone, Copy)]
@@ -341,7 +344,7 @@ mod tests {
     fn empty_tree_produces_empty_layout() {
         let tree = DirTree::new();
         let config = default_config();
-        let rects = compute_layout(&tree, 0, 800.0, 600.0, &config);
+        let rects = compute_layout(&tree, 0, 800.0, 600.0, &config).rects;
         assert!(rects.is_empty());
     }
 
@@ -350,7 +353,7 @@ mod tests {
         let mut tree = DirTree::new();
         tree.insert_dir(1, 0, "root", 100, 100);
         let config = default_config();
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
         assert!(rects.is_empty());
     }
 
@@ -362,7 +365,7 @@ mod tests {
         tree.insert_dir(3, 1, "b", 500, 100);
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
 
         let top_level: Vec<&LayoutRect> = rects.iter().filter(|r| r.depth == 0).collect();
         assert_eq!(top_level.len(), 2);
@@ -384,7 +387,7 @@ mod tests {
         tree.insert_dir(3, 1, "small", 100, 100);
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
 
         let top_level: Vec<&LayoutRect> = rects.iter().filter(|r| r.depth == 0).collect();
         assert_eq!(top_level.len(), 2);
@@ -417,7 +420,7 @@ mod tests {
         tree.insert_dir(5, 1, "d", 100, 100);
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
 
         let siblings: Vec<&LayoutRect> = rects.iter().filter(|r| r.depth == 0).collect();
         for i in 0..siblings.len() {
@@ -444,7 +447,7 @@ mod tests {
         tree.insert_dir(4, 1, "c", 200, 100);
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config);
+        let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config).rects;
 
         let eps = 0.01_f64;
         for r in &rects {
@@ -478,7 +481,7 @@ mod tests {
         tree.insert_dir(4, 1, "c", 100, 100);
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config);
+        let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config).rects;
 
         let top_area: f64 = rects
             .iter()
@@ -502,7 +505,7 @@ mod tests {
         tree.nodes.get_mut(&1).unwrap().size += 15000;
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
 
         let file_rects: Vec<&LayoutRect> = rects.iter().filter(|r| r.kind == RectKind::File).collect();
         assert!(
@@ -530,7 +533,7 @@ mod tests {
         }
 
         let config_no_filter = default_config();
-        let rects_no_filter = compute_layout(&tree, 1, 800.0, 600.0, &config_no_filter);
+        let rects_no_filter = compute_layout(&tree, 1, 800.0, 600.0, &config_no_filter).rects;
         let dirs_no_filter: Vec<&str> = rects_no_filter
             .iter()
             .filter(|r| r.depth == 0 && r.kind.is_dir())
@@ -550,7 +553,7 @@ mod tests {
             },
             mtime_range: (0, 0),
         };
-        let rects_filtered = compute_layout(&tree, 1, 800.0, 600.0, &config_filtered);
+        let rects_filtered = compute_layout(&tree, 1, 800.0, 600.0, &config_filtered).rects;
 
         let filtered_names: Vec<&str> = rects_filtered
             .iter()
@@ -562,6 +565,11 @@ mod tests {
             !filtered_names.contains(&"docs"),
             "docs should be hidden with .rs filter (no .rs files)"
         );
+
+        // The total is what the rects divide up: with a filter, only the files it matches. The
+        // page measures each rect's share of the view against it.
+        assert_eq!(compute_layout(&tree, 1, 800.0, 600.0, &config_no_filter).size, 12_000);
+        assert_eq!(compute_layout(&tree, 1, 800.0, 600.0, &config_filtered).size, 8_000);
     }
 
     /// `max_depth` is the number of levels drawn: 1 is a flat map of the view root's children, and
@@ -580,7 +588,7 @@ mod tests {
                 max_depth,
                 ..default_config()
             };
-            let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+            let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
             rects.iter().map(|r| r.depth + 1).max().unwrap_or(0)
         };
         for max_depth in 1..=4 {
@@ -592,7 +600,7 @@ mod tests {
             max_depth: 1,
             ..default_config()
         };
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config);
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &config).rects;
         assert!(
             rects.iter().all(|r| r.kind != RectKind::Container),
             "max_depth=1 should not open any folder"
@@ -609,7 +617,7 @@ mod tests {
         tree.insert_file(2, "a.pdf", 2000, 100);
         tree.insert_file(2, "b.pdf", 1000, 100);
 
-        let rects = compute_layout(&tree, 1, 800.0, 600.0, &default_config());
+        let rects = compute_layout(&tree, 1, 800.0, 600.0, &default_config()).rects;
         let folder = rects.iter().find(|r| r.name == "scans").unwrap();
         assert_eq!(folder.kind, RectKind::Container, "a files-only folder should open up");
         let mut files: Vec<&str> = rects
@@ -633,7 +641,7 @@ mod tests {
         }
 
         let config = default_config();
-        let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config);
+        let rects = compute_layout(&tree, 1, canvas_w, canvas_h, &config).rects;
 
         let top_level: Vec<&LayoutRect> = rects.iter().filter(|r| r.depth == 0).collect();
         assert_eq!(top_level.len(), 20);

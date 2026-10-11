@@ -54,6 +54,14 @@ async fn crumbs(page: &playwright_rs::Page) -> String {
         .unwrap_or_default()
 }
 
+async fn status(page: &playwright_rs::Page) -> String {
+    page.locator("#status")
+        .text_content()
+        .await
+        .unwrap()
+        .unwrap_or_default()
+}
+
 /// Wait options for an element that should appear.
 fn visible() -> WaitForOptions {
     WaitForOptions::builder().timeout(10_000.0).build()
@@ -74,7 +82,7 @@ async fn page_title(page: &playwright_rs::Page) {
 }
 
 async fn status_bar_shows_scan_results(page: &playwright_rs::Page) {
-    let text = page.locator("#status").text_content().await.unwrap().unwrap();
+    let text = status(page).await;
     assert!(text.contains("dirs"), "status should show dir count: {text}");
     assert!(text.contains("MiB"), "status should show total size: {text}");
 }
@@ -125,6 +133,10 @@ async fn filter_by_extension(page: &playwright_rs::Page) {
 
     let filtered = canvas.screenshot(None).await.unwrap();
     assert_ne!(initial, filtered, "extension filter should change the treemap");
+    // The total, and so each rect's share in the tooltip, counts only the matching files: the
+    // three .rs files, 9 MB of the 17.3 MB.
+    let text = status(page).await;
+    assert!(text.contains("— 8.58 MiB"), "filtered total: {text}");
 
     let before = layout_seq(page).await;
     page.locator("#filter-clear").click(None).await.unwrap();
@@ -133,6 +145,8 @@ async fn filter_by_extension(page: &playwright_rs::Page) {
     assert!(filter_ext.input_value(None).await.unwrap().is_empty());
     let cleared = canvas.screenshot(None).await.unwrap();
     assert_eq!(initial, cleared, "clearing the filter should restore the treemap");
+    let text = status(page).await;
+    assert!(text.contains("— 16.5 MiB"), "total: {text}");
 }
 
 async fn filter_by_name(page: &playwright_rs::Page) {
@@ -365,7 +379,7 @@ async fn rescan_button_works(page: &playwright_rs::Page) {
     rescan.click(None).await.unwrap();
     wait_for_layout_after(page, before).await;
 
-    let text = page.locator("#status").text_content().await.unwrap().unwrap();
+    let text = status(page).await;
     assert!(text.contains(" dirs in "), "after rescan: {text}");
 }
 

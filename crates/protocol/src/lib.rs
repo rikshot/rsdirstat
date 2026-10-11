@@ -86,6 +86,9 @@ pub struct LayoutPayload {
     /// The scan stopped before reading everything (it stalled on a stuck directory), so the tree is
     /// missing whatever it hadn't reached. Only once `scan_done`.
     pub partial: bool,
+    /// How long the scan has been running, or took once done, in milliseconds. From the server, so a
+    /// tab that joins mid-scan, or after it, shows the scan's own time.
+    pub scan_ms: u32,
     pub breadcrumb: Vec<BreadcrumbEntry>,
     pub rects: Vec<LayoutRect>,
 }
@@ -424,6 +427,7 @@ mod tests {
             dir_count: 3,
             scan_done: true,
             partial: true,
+            scan_ms: 4_200,
             breadcrumb: vec![BreadcrumbEntry {
                 id: 7,
                 name: "root".into(),
@@ -440,6 +444,7 @@ mod tests {
             dir_count: 1000,
             scan_done: false,
             partial: false,
+            scan_ms: 0,
             breadcrumb: vec![BreadcrumbEntry {
                 id: 0,
                 name: String::new(),
