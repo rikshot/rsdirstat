@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::mpsc::Sender;
 
-use rsdirstat_core::scan::{ScanEvent, ScanOutcome, ScannedFile, node_id, plain_path, root_name};
+use rsdirstat_core::scan::{ScanEvent, ScanOutcome, ScannedFile, node_id, root_name};
 
 /// Records below this are NTFS's own metadata files ($MFT, $LogFile, ..., and $Extend, which holds
 /// more of them), which folder listings never show.
@@ -30,6 +30,14 @@ const REPARSE_POINT: u32 = 0xC0;
 const END_OF_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 /// `$FILE_NAME`'s namespace for a DOS 8.3 short name that has a long one besides.
 const DOS_NAMESPACE: u8 = 2;
+
+/// The record of a volume's root folder.
+const ROOT_FOLDER: usize = 5;
+
+/// Whether the file reference `reference` is a volume's root folder.
+pub fn is_volume_root(reference: u64) -> bool {
+    record_number(reference) == ROOT_FOLDER
+}
 
 /// The record number in a file reference; the top 16 bits are the record's sequence number.
 fn record_number(reference: u64) -> usize {
@@ -246,9 +254,9 @@ impl Mft {
     }
 
     /// Send the scan of the folder `root` (a canonical path) whose file reference is `root_reference`,
-    /// on the volume with serial number `volume`: `ScanStart`, a `Dir` per folder under it, parent
-    /// first, and `ScanDone`. Node ids are those the folder walk gives. Sends nothing, and returns
-    /// false, if the root isn't a folder in this MFT.
+    /// on the volume with serial number `volume`, after its `ScanStart`: a `Dir` per folder under it,
+    /// parent first, and `ScanDone`. Node ids are those the folder walk gives. Sends nothing, and
+    /// returns false, if the root isn't a folder in this MFT.
     pub fn send_scan(mut self, root: &Path, root_reference: u64, volume: u64, tx: &Sender<ScanEvent>) -> bool {
         for (base, attributes) in std::mem::take(&mut self.extensions) {
             let Some(Some(file)) = self.records.get_mut(base) else {
@@ -344,9 +352,6 @@ impl Mft {
             let file = records[number].as_ref().unwrap();
             node_id(volume, reference(number, file.sequence))
         };
-        let _ = tx.send(ScanEvent::ScanStart {
-            root: plain_path(root).into_owned(),
-        });
         for (folder_place, (&number, folder_files)) in order.iter().zip(files).enumerate() {
             let (parent, name) = if folder_place == 0 {
                 (0, root_name(root))
@@ -648,8 +653,7 @@ mod tests {
         ]
     }
 
-    /// What `send_scan` sends for the folder `root_number`: the root event and `(id, parent, name,
-    /// mtime, [(file, size)])` per folder.
+    /// What `send_scan` sends for the folder `root_number`.
     fn scan(mft: Mft, root: &Path, root_number: usize, root_sequence: u16) -> (bool, Vec<ScanEvent>) {
         let (tx, rx) = mpsc::channel();
         let sent = mft.send_scan(root, reference(root_number, root_sequence), VOLUME, &tx);
@@ -690,7 +694,6 @@ mod tests {
         let root = PathBuf::from(r"C:\");
         let (sent, events) = scan(mft(volume()), &root, ROOT, 5);
         assert!(sent);
-        assert!(matches!(&events[0], ScanEvent::ScanStart { root: r } if r == &root));
         assert!(matches!(
             events.last(),
             Some(ScanEvent::ScanDone {

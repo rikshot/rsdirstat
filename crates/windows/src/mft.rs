@@ -34,8 +34,9 @@ const ALIGNMENT: usize = 4096;
 
 /// Scan the folder `path` (canonical), open as `root` with file reference `root_reference` on the
 /// volume with serial number `volume_serial`, from the volume's MFT, reading with up to `threads`
-/// reads in flight. An error, with nothing sent, means the volume can't be read this way (no
-/// administrator rights, not NTFS, a network share) and the folder walk should scan it instead.
+/// reads in flight. The whole MFT is read however small the folder. An error means the volume can't
+/// be read this way (no administrator rights, not NTFS, a network share) and the folder walk should
+/// scan it instead; `ScanStart` may have been sent by then, which the walk's own starts over.
 pub(crate) fn scan(
     path: &Path,
     root: &OwnedHandle,
@@ -67,6 +68,10 @@ pub(crate) fn scan(
     }
     let record_count = data.MftValidDataLength as usize / record_size;
     let reads = mft_reads(&volume, cluster, data.MftValidDataLength as usize)?;
+    // The volume can be read: the scan has started, though nothing is known until it's all read.
+    let _ = tx.send(ScanEvent::ScanStart {
+        root: plain_path(path).into_owned(),
+    });
 
     // Each reader takes the next read, parses its records and hands them over; this thread gathers
     // them as they come.
@@ -111,9 +116,6 @@ pub(crate) fn scan(
     }
 
     if cancel.load(Ordering::Relaxed) {
-        let _ = tx.send(ScanEvent::ScanStart {
-            root: plain_path(path).into_owned(),
-        });
         let _ = tx.send(ScanEvent::ScanDone {
             outcome: ScanOutcome::Cancelled,
         });

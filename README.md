@@ -15,8 +15,9 @@ Fast, cross-platform disk usage analyzer with an interactive treemap GUI.
 - **Multi-threaded scanning** using platform-native APIs for maximum speed
   - macOS: `getattrlistbulk` for batch directory + metadata reads
   - Linux: `getdents64` + `statx` via raw syscalls
-  - Windows: `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`; run as administrator, it
-    reads an NTFS volume's file index (the MFT) straight off the disk instead, several times faster
+  - Windows: `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`; scanning a whole NTFS drive
+    as administrator, it reads the drive's file index (the MFT) straight off the disk instead,
+    several times faster
 - **Interactive treemap GUI** served as a local web app over WebSocket
   - Squarified treemap layout with zoom navigation, updated live while the scan runs
   - Color by file type or modification time

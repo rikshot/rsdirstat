@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crate::mft;
+use crate::{mft, ntfs};
 use anyhow::{Context, Result};
 use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOptions, cpu_count, node_id, run_scan};
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE, MAX_PATH};
@@ -118,9 +118,13 @@ pub fn scan(
         volume: volume_serial,
     };
     let threads = options.threads.map_or_else(cpu_count, NonZeroUsize::get);
-    // Reading the volume's MFT is several times faster where it can be done; it sends nothing
-    // when it can't, and the folders are walked instead.
-    if !options.no_mft && mft::scan(&path, &root.handle, file_id, volume_serial, threads, &tx, &cancel).is_ok() {
+    // Reading a volume's MFT is several times faster than walking all of it, where it can be done,
+    // but takes seconds on a big volume however little of it is scanned: so for whole volumes only.
+    // Where it can't be done, the folders are walked instead.
+    if !options.no_mft
+        && ntfs::is_volume_root(file_id)
+        && mft::scan(&path, &root.handle, file_id, volume_serial, threads, &tx, &cancel).is_ok()
+    {
         return Ok(());
     }
     run_scan(&path, root, id, tx, cancel, threads, move |dir, buffer, sink| {
@@ -129,8 +133,8 @@ pub fn scan(
     Ok(())
 }
 
-/// Scan `root` by reading its volume's MFT only, which `scan` does where it can: an error, with
-/// nothing sent, where it can't (see `mft::scan`). For comparing the two ways.
+/// Scan `root` by reading its volume's MFT only, as `scan` does for a whole volume where it can: an
+/// error where it can't (see `mft::scan`). For comparing the two ways.
 pub fn scan_mft(root: &Path, tx: std::sync::mpsc::Sender<ScanEvent>) -> Result<()> {
     let (path, handle, volume_serial, file_id) = open_root(root)?;
     mft::scan(

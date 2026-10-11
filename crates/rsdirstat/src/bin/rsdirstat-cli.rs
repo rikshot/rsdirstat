@@ -43,7 +43,8 @@ struct Args {
     #[arg(long)]
     threads: Option<NonZeroUsize>,
 
-    /// On Windows, walk the folders even as administrator, instead of reading NTFS's file index
+    /// On Windows, walk a whole drive's folders even as administrator, instead of reading NTFS's
+    /// file index
     #[arg(long)]
     no_mft: bool,
 }

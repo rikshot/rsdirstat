@@ -248,9 +248,10 @@ fn scanner_leaves_out_unreadable_directories() {
     assert!(dir_names.contains(&"nested"), "the rest is scanned: {dir_names:?}");
 }
 
-/// On Windows a scan reads NTFS's file index (the MFT) where it can, as administrator, which is how
-/// CI runs: it must find what walking the folders finds. (Hardlinks are left out: the walk counts one
-/// in whichever of its folders a worker reaches first.)
+/// On Windows a scan of a whole drive reads NTFS's file index (the MFT) where it can, as
+/// administrator, which is how CI runs: read for any folder, it must find what walking the folders
+/// finds. (Hardlinks are left out: the walk counts one in whichever of its folders a worker reaches
+/// first.)
 #[cfg(windows)]
 #[test]
 fn reading_the_mft_finds_what_the_folder_walk_finds() {
