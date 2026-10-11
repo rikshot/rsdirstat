@@ -20,7 +20,6 @@ use playwright_rs::protocol::WaitForFunctionOptions;
 /// wasm-bindgen download. Each process takes an OS file lock, which the OS releases when the
 /// process exits (so a killed run can't leave the next one waiting), and the first to find the
 /// bundle stale rebuilds it. CI builds it up front, so there it is always fresh.
-#[allow(clippy::incompatible_msrv)] // `File::lock` (1.89): test-only, and the dev-deps need newer Rust anyway
 fn ensure_frontend_built() {
     // Trunk.toml lives at the workspace root (two levels up from this crate).
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

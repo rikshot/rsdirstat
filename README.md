@@ -55,7 +55,7 @@ Or download an archive for your platform directly from the
 
 ```sh
 cargo binstall rsdirstat   # fetches the prebuilt binaries from the GitHub release
-cargo install rsdirstat    # compiles from source (requires Rust 1.88+, edition 2024)
+cargo install rsdirstat    # compiles from source (requires Rust 1.89+, edition 2024)
 ```
 
 Every method installs two binaries: **`rsdirstat`** (the GUI server, with the web frontend

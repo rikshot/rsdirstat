@@ -69,14 +69,14 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
-  # Enforce the declared MSRV (rust-version = "1.88"): if a dependency bump or a
+  # Enforce the declared MSRV (rust-version = "1.89"): if a dependency bump or a
   # 2024-edition feature raises the real floor, `cargo install rsdirstat` breaks for
-  # users on 1.88 — catch it here. No `--all-targets`: dev-deps (playwright-rs) have a
+  # users on 1.89 — catch it here. No `--all-targets`: dev-deps (playwright-rs) have a
   # higher MSRV and users never build the tests. No `--workspace`: that would drag in
   # the wrong-OS scanner crates (they only compile on their native platform); the
   # default-members set already checks each host's scanner via `rsdirstat`'s deps.
   # `build-warnings: ""` drops the action's default `CARGO_BUILD_WARNINGS=deny` so a warning
-  # under an older rustc can't fail the check (cargo 1.88 predates `build.warnings` anyway).
+  # under an older rustc can't fail the check (cargo 1.89 predates `build.warnings` anyway).
   msrv:
     needs: lint
     strategy:
@@ -87,7 +87,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
           build-warnings: ""
       - run: cargo check --locked
 
