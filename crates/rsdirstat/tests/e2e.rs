@@ -226,13 +226,28 @@ async fn hover_shows_path_bar(page: &playwright_rs::Page) {
 /// `src/main.rs`. Regression: hover once landed on whatever was ~60px below the cursor.
 async fn hover_hits_rect_under_cursor(page: &playwright_rs::Page) {
     let height = canvas_height(page).await;
-    for (y, expected) in [(5.0, "/src$"), (height - 5.0, r"/src/main\.rs$")] {
+    for (y, expected) in [
+        (5.0, path_ending(&["src"])),
+        (height - 5.0, path_ending(&["src", "main.rs"])),
+    ] {
         hover_canvas_at(page, 20.0, y).await;
         expect(page.locator("#path-text"))
-            .to_have_text_regex(expected)
+            .to_have_text_regex(&expected)
             .await
             .unwrap_or_else(|e| panic!("hover at canvas y={y}: {e}"));
     }
+}
+
+/// A pattern for a path-bar text ending in `parts`, joined as the server joins paths on this
+/// platform.
+fn path_ending(parts: &[&str]) -> String {
+    let separator = if cfg!(windows) { r"\\" } else { "/" };
+    let mut pattern: String = parts
+        .iter()
+        .map(|part| format!("{separator}{}", part.replace('.', r"\.")))
+        .collect();
+    pattern.push('$');
+    pattern
 }
 
 async fn canvas_height(page: &playwright_rs::Page) -> f64 {
@@ -268,7 +283,10 @@ async fn reload_keeps_treemap_in_sync_with_toolbar(page: &playwright_rs::Page) {
     hover_canvas_at(page, 20.0, canvas_height(page).await - 5.0).await;
     let path_text = expect(page.locator("#path-text"));
     if filter.is_empty() {
-        path_text.to_have_text_regex(r"/src/main\.rs$").await.unwrap();
+        path_text
+            .to_have_text_regex(&path_ending(&["src", "main.rs"]))
+            .await
+            .unwrap();
     } else {
         path_text.to_have_text("").await.unwrap();
     }
