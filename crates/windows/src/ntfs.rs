@@ -8,18 +8,14 @@
 use std::path::Path;
 use std::sync::mpsc::Sender;
 
-use rsdirstat_core::scan::{ScanEvent, ScanOutcome, ScannedFile, node_id, root_name};
+use rsdirstat_core::scan::{ScanEvent, ScannedFile, node_id, root_name};
+use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
+
+use crate::scan::{EntryKind, classify, filetime_to_unix};
 
 /// Records below this are NTFS's own metadata files ($MFT, $LogFile, ..., and $Extend, which holds
 /// more of them), which folder listings never show.
 const FIRST_USER_RECORD: usize = 16;
-/// The reparse tag bit marking a name surrogate (a symlink, junction or mount point): the folder walk
-/// neither counts nor enters one, so neither does this.
-const NAME_SURROGATE: u32 = 0x2000_0000;
-/// Cloud placeholder tags share this base, with a provider index in the `CLOUD_MASK` nibble.
-const CLOUD_TAG: u32 = 0x9000_001A;
-const CLOUD_MASK: u32 = 0x0000_F000;
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 /// Each 512 bytes of a record end in a fixup, whatever the disk's sector size.
 const FIXUP_STRIDE: usize = 512;
 
@@ -66,18 +62,21 @@ pub struct FileRecord {
     pub mtime: i64,
     pub reparse_tag: u32,
     /// Each name with its parent folder's reference; DOS short names with a long one are left out.
-    pub names: Vec<(u64, String)>,
+    pub names: Vec<(u64, Box<str>)>,
 }
 
 impl FileRecord {
-    fn is_name_surrogate(&self) -> bool {
-        self.reparse_tag & NAME_SURROGATE != 0
-    }
-
-    /// The size the folder walk counts: 0 for a cloud placeholder whose data isn't on the disk.
-    fn counted_size(&self) -> u64 {
-        let dehydrated = self.reparse_tag & !CLOUD_MASK == CLOUD_TAG && self.allocated == 0;
-        if dehydrated { 0 } else { self.size }
+    /// What the folder walk does with this file, from what a folder listing would show of it.
+    fn kind(&self) -> EntryKind {
+        let mut attributes = 0;
+        if self.is_dir {
+            attributes |= FILE_ATTRIBUTE_DIRECTORY;
+        }
+        // Only a reparse point has a tag.
+        if self.reparse_tag != 0 {
+            attributes |= FILE_ATTRIBUTE_REPARSE_POINT;
+        }
+        classify(attributes, self.reparse_tag, self.size as i64, self.allocated as i64)
     }
 }
 
@@ -96,17 +95,12 @@ fn u16_at(bytes: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([bytes[at], bytes[at + 1]])
 }
 
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
+pub fn u32_at(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
+pub fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
-}
-
-/// A Windows FILETIME (100 ns ticks since 1601) in Unix seconds.
-fn filetime_to_unix(filetime: i64) -> i64 {
-    filetime / 10_000_000 - 11_644_473_600
 }
 
 /// Parse one MFT record as read from the disk, undoing its fixups in place. `None` for a record not
@@ -180,13 +174,17 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
                 if value[0x41] == DOS_NAMESPACE || value.len() < 0x42 + 2 * length {
                     continue;
                 }
-                let units: Vec<u16> = value[0x42..0x42 + 2 * length]
+                let units = value[0x42..0x42 + 2 * length]
                     .as_chunks::<2>()
                     .0
                     .iter()
-                    .map(|&unit| u16::from_le_bytes(unit))
-                    .collect();
-                file.names.push((u64_at(value, 0), String::from_utf16_lossy(&units)));
+                    .map(|&unit| u16::from_le_bytes(unit));
+                // Room for an ASCII name, the usual kind, so it's allocated once at its size.
+                let mut name = String::with_capacity(length);
+                name.extend(char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)));
+                // Most files have one name, and a first push would make room for four.
+                file.names.reserve_exact(1);
+                file.names.push((u64_at(value, 0), name.into_boxed_str()));
                 if u32_at(value, 0x38) & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                     name_reparse_tag = u32_at(value, 0x3C);
                 }
@@ -233,31 +231,29 @@ pub struct Mft {
 impl Mft {
     /// Room for `record_count` records, numbered from 0.
     pub fn new(record_count: usize) -> Self {
-        let mut records = Vec::new();
-        records.resize_with(record_count, || None);
         Self {
-            records,
+            records: vec![None; record_count],
             extensions: Vec::new(),
         }
     }
 
-    /// Record number `number`, as parsed.
+    /// Record number `number`, as parsed. Records past the room made for them are left out: a read
+    /// may run on past the end of the MFT's valid data.
     pub fn insert(&mut self, number: usize, record: Record) {
+        if number >= self.records.len() {
+            return;
+        }
         match record {
-            Record::Base(file) => {
-                if let Some(slot) = self.records.get_mut(number) {
-                    *slot = Some(file);
-                }
-            }
+            Record::Base(file) => self.records[number] = Some(file),
             Record::Extension { base, attributes } => self.extensions.push((base, attributes)),
         }
     }
 
     /// Send the scan of the folder `root` (a canonical path) whose file reference is `root_reference`,
-    /// on the volume with serial number `volume`, after its `ScanStart`: a `Dir` per folder under it,
-    /// parent first, and `ScanDone`. Node ids are those the folder walk gives. Sends nothing, and
-    /// returns false, if the root isn't a folder in this MFT.
-    pub fn send_scan(mut self, root: &Path, root_reference: u64, volume: u64, tx: &Sender<ScanEvent>) -> bool {
+    /// on the volume with serial number `volume`, between its `ScanStart` and `ScanDone`: a `Dir` per
+    /// folder under it, parent first. Node ids are those the folder walk gives. Sends nothing, and
+    /// returns false, if the root isn't a folder in this MFT. The names sent are taken out of it.
+    pub fn send_scan(&mut self, root: &Path, root_reference: u64, volume: u64, tx: &Sender<ScanEvent>) -> bool {
         for (base, attributes) in std::mem::take(&mut self.extensions) {
             let Some(Some(file)) = self.records.get_mut(base) else {
                 continue;
@@ -273,11 +269,6 @@ impl Mft {
             }
         }
         let records = &self.records;
-        let root_number = record_number(root_reference);
-        match records.get(root_number) {
-            Some(Some(file)) if file.is_dir && reference(root_number, file.sequence) == root_reference => {}
-            _ => return false,
-        }
 
         // A name's parent, if that record still holds the folder the name was made in.
         let folder = |parent: u64| {
@@ -287,6 +278,9 @@ impl Mft {
                 _ => None,
             }
         };
+        let Some(root_number) = folder(root_reference) else {
+            return false;
+        };
 
         // Every folder under its parent, sorted for finding a folder's subfolders.
         let mut subfolders: Vec<(usize, usize)> = records
@@ -295,7 +289,7 @@ impl Mft {
             .skip(FIRST_USER_RECORD)
             .filter_map(|(number, file)| {
                 let file = file.as_ref()?;
-                if !file.is_dir || file.is_name_surrogate() {
+                if file.kind() != EntryKind::Directory {
                     return None;
                 }
                 Some((folder(file.names.first()?.0)?, number))
@@ -323,53 +317,55 @@ impl Mft {
                 }
             }
         }
+        // Each folder's reference, by its place.
+        let references: Vec<u64> = order
+            .iter()
+            .map(|&number| reference(number, records[number].as_ref().unwrap().sequence))
+            .collect();
+        // A name's parent's place, if that's a folder under the root that the name was made in.
+        let placed = |parent: u64| {
+            let folder_place = *place.get(record_number(parent))?;
+            (folder_place != u32::MAX && references[folder_place as usize] == parent).then_some(folder_place as usize)
+        };
 
         // Each file goes in the first folder that has it under the root: a hardlink counts once.
         let mut files: Vec<Vec<ScannedFile>> = vec![Vec::new(); order.len()];
         let mut mtimes = vec![0i64; order.len()];
-        for file in records.iter().skip(FIRST_USER_RECORD) {
-            let Some(file) = file else { continue };
-            if file.is_dir || file.is_name_surrogate() {
+        for file in self.records.iter_mut().skip(FIRST_USER_RECORD).flatten() {
+            let EntryKind::File { size } = file.kind() else {
                 continue;
-            }
-            let found = file.names.iter().find_map(|(parent, name)| {
-                let parent = folder(*parent)?;
-                (place[parent] != u32::MAX).then_some((place[parent] as usize, name))
-            });
+            };
+            let found = file
+                .names
+                .iter_mut()
+                .find_map(|(parent, name)| Some((placed(*parent)?, name)));
             let Some((folder_place, name)) = found else { continue };
             mtimes[folder_place] = mtimes[folder_place].max(file.mtime);
-            let size = file.counted_size();
             if size > 0 {
                 files[folder_place].push(ScannedFile {
-                    name: name.clone(),
+                    name: std::mem::take(name).into(),
                     size,
                     mtime: file.mtime,
                 });
             }
         }
 
-        let id = |number: usize| {
-            let file = records[number].as_ref().unwrap();
-            node_id(volume, reference(number, file.sequence))
-        };
         for (folder_place, (&number, folder_files)) in order.iter().zip(files).enumerate() {
             let (parent, name) = if folder_place == 0 {
                 (0, root_name(root))
             } else {
-                let (parent, name) = &records[number].as_ref().unwrap().names[0];
-                (id(record_number(*parent)), name.clone())
+                // Its first name, which put it under its parent.
+                let (parent, name) = &mut self.records[number].as_mut().unwrap().names[0];
+                (node_id(volume, *parent), std::mem::take(name).into())
             };
             let _ = tx.send(ScanEvent::Dir {
-                id: id(number),
+                id: node_id(volume, references[folder_place]),
                 parent,
                 name,
                 mtime: mtimes[folder_place],
                 files: folder_files,
             });
         }
-        let _ = tx.send(ScanEvent::ScanDone {
-            outcome: ScanOutcome::Complete,
-        });
         true
     }
 }
@@ -382,7 +378,6 @@ mod tests {
     use super::*;
 
     const RECORD_SIZE: usize = 1024;
-    const ROOT: usize = 5;
     const VOLUME: u64 = 0xABCD;
     const SYMLINK_TAG: u32 = 0xA000_000C;
     const JUNCTION_TAG: u32 = 0xA000_0003;
@@ -536,7 +531,7 @@ mod tests {
                 .name(reference(40, 2), "abcdefghijklmnop")
                 .data(10),
         );
-        assert_eq!(file.names, vec![(reference(40, 2), "abcdefghijklmnop".to_owned())]);
+        assert_eq!(file.names, vec![(reference(40, 2), "abcdefghijklmnop".into())]);
         assert_eq!(
             (file.is_dir, file.sequence, file.size, file.mtime),
             (false, 3, 10, 1_700_000_000)
@@ -545,10 +540,10 @@ mod tests {
 
     #[test]
     fn torn_unused_and_foreign_records_are_skipped() {
-        let mut torn = Builder::file(1).name(reference(ROOT, 5), "a").build();
+        let mut torn = Builder::file(1).name(reference(ROOT_FOLDER, 5), "a").build();
         torn[RECORD_SIZE - 1] ^= 0xFF;
         assert_eq!(parse_record(&mut torn), None);
-        assert_eq!(parsed(Builder::unused().name(reference(ROOT, 5), "a")), None);
+        assert_eq!(parsed(Builder::unused().name(reference(ROOT_FOLDER, 5), "a")), None);
         let mut not_a_record = vec![0u8; RECORD_SIZE];
         assert_eq!(parse_record(&mut not_a_record), None);
     }
@@ -557,12 +552,15 @@ mod tests {
     fn short_dos_names_and_named_streams_are_left_out() {
         let file = base(
             Builder::file(1)
-                .name_in(reference(ROOT, 5), "LONGFI~1.TXT", DOS_NAMESPACE)
-                .name(reference(ROOT, 5), "long file name.txt")
+                .name_in(reference(ROOT_FOLDER, 5), "LONGFI~1.TXT", DOS_NAMESPACE)
+                .name(reference(ROOT_FOLDER, 5), "long file name.txt")
                 .resident(DATA, "Zone.Identifier", &[1u8; 30])
                 .data(5),
         );
-        assert_eq!(file.names, vec![(reference(ROOT, 5), "long file name.txt".to_owned())]);
+        assert_eq!(
+            file.names,
+            vec![(reference(ROOT_FOLDER, 5), "long file name.txt".into())]
+        );
         assert_eq!(file.size, 5);
     }
 
@@ -601,11 +599,11 @@ mod tests {
     /// A small volume: the root, metadata NTFS hides, two folders, and files of every kind the
     /// folder walk treats specially.
     fn volume() -> Vec<(usize, Builder)> {
-        let root = reference(ROOT, 5);
+        let root = reference(ROOT_FOLDER, 5);
         let users = reference(20, 1);
         let ville = reference(21, 1);
         vec![
-            (ROOT, Builder::folder(5).name(root, ".")),
+            (ROOT_FOLDER, Builder::folder(5).name(root, ".")),
             (0, Builder::file(1).name(root, "$MFT").large_data(0, 1 << 20, 1 << 20)),
             (11, Builder::folder(11).name(root, "$Extend")),
             (30, Builder::file(1).name(reference(11, 11), "$UsnJrnl").data(100)),
@@ -654,7 +652,7 @@ mod tests {
     }
 
     /// What `send_scan` sends for the folder `root_number`.
-    fn scan(mft: Mft, root: &Path, root_number: usize, root_sequence: u16) -> (bool, Vec<ScanEvent>) {
+    fn scan(mut mft: Mft, root: &Path, root_number: usize, root_sequence: u16) -> (bool, Vec<ScanEvent>) {
         let (tx, rx) = mpsc::channel();
         let sent = mft.send_scan(root, reference(root_number, root_sequence), VOLUME, &tx);
         drop(tx);
@@ -663,24 +661,25 @@ mod tests {
 
     type Folder = (u64, u64, String, i64, Vec<(String, u64)>);
 
+    /// The folders sent, which is all `send_scan` sends.
     fn folders(events: &[ScanEvent]) -> Vec<Folder> {
         events
             .iter()
-            .filter_map(|event| match event {
+            .map(|event| match event {
                 ScanEvent::Dir {
                     id,
                     parent,
                     name,
                     mtime,
                     files,
-                } => Some((
+                } => (
                     *id,
                     *parent,
                     name.clone(),
                     *mtime,
                     files.iter().map(|file| (file.name.clone(), file.size)).collect(),
-                )),
-                _ => None,
+                ),
+                other => panic!("only folders are sent, not {other:?}"),
             })
             .collect()
     }
@@ -692,23 +691,17 @@ mod tests {
     #[test]
     fn a_volume_is_sent_as_the_folder_walk_sees_it() {
         let root = PathBuf::from(r"C:\");
-        let (sent, events) = scan(mft(volume()), &root, ROOT, 5);
+        let (sent, events) = scan(mft(volume()), &root, ROOT_FOLDER, 5);
         assert!(sent);
-        assert!(matches!(
-            events.last(),
-            Some(ScanEvent::ScanDone {
-                outcome: ScanOutcome::Complete
-            })
-        ));
         // Not $Extend's tree, NTFS's metafiles, the junction or the orphan. The hardlink counts once,
-        // in the first of its folders; the symlink and the dehydrated placeholder count nothing, but
-        // like the empty file, still make their folder newer. The big file's sizes come from its
-        // extension record.
+        // in the first of its folders. The symlink counts nothing and doesn't make its folder newer;
+        // the dehydrated placeholder counts nothing but, like the empty file, does. The big file's
+        // sizes come from its extension record.
         assert_eq!(
             folders(&events),
             vec![
                 (
-                    id(ROOT, 5),
+                    id(ROOT_FOLDER, 5),
                     0,
                     root_name(&root),
                     0,
@@ -716,7 +709,7 @@ mod tests {
                 ),
                 (
                     id(20, 1),
-                    id(ROOT, 5),
+                    id(ROOT_FOLDER, 5),
                     "Users".to_owned(),
                     10,
                     vec![("link1".to_owned(), 50)]

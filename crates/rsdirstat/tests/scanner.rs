@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::mpsc;
 
+use rsdirstat_core::scan::ScanEvent;
 use rsdirstat_core::tree::{DirTree, FileEntry};
 
 #[cfg(target_os = "linux")]
@@ -17,14 +18,18 @@ fn scan_to_tree(root: &Path) -> DirTree {
     let root = root.to_path_buf();
     let handle =
         std::thread::spawn(move || scanner::scan::scan(&root, Default::default(), tx, Default::default()).unwrap());
+    let tree = tree_from(rx);
+    handle.join().unwrap();
+    tree
+}
 
+/// The tree a scan's `events` build, which must be complete.
+fn tree_from(events: mpsc::Receiver<ScanEvent>) -> DirTree {
     let mut tree = DirTree::new();
     // `ScanDone` is the last event, and applying it recomputes the sizes.
-    for event in rx {
+    for event in events {
         tree.apply(event);
     }
-
-    handle.join().unwrap();
     assert!(tree.complete, "the scan must read everything");
     tree
 }
@@ -268,14 +273,6 @@ fn reading_the_mft_finds_what_the_folder_walk_finds() {
         fs::write(root.join("a").join(format!("file{i:03}.txt")), vec![2u8; i]).unwrap();
     }
 
-    let tree_of = |events: mpsc::Receiver<_>| {
-        let mut tree = DirTree::new();
-        for event in events {
-            tree.apply(event);
-        }
-        assert!(tree.complete);
-        tree
-    };
     // Each folder by path: its id, size, newest file and files.
     type Folders = BTreeMap<String, (u64, u64, i64, Vec<(String, u64)>)>;
     let folders = |tree: &DirTree| -> Folders {
@@ -300,7 +297,7 @@ fn reading_the_mft_finds_what_the_folder_walk_finds() {
         ..Default::default()
     };
     scanner::scan::scan(root, options, tx, Default::default()).unwrap();
-    let walked = tree_of(rx);
+    let walked = tree_from(rx);
 
     let (tx, rx) = mpsc::channel();
     if let Err(e) = scanner::scan::scan_mft(root, tx) {
@@ -311,7 +308,7 @@ fn reading_the_mft_finds_what_the_folder_walk_finds() {
         eprintln!("skipped: can't read the MFT here ({e:#}); run as administrator");
         return;
     }
-    let read = tree_of(rx);
+    let read = tree_from(rx);
     assert_eq!(folders(&read), folders(&walked));
 }
 

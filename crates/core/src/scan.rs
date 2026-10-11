@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use dashmap::DashSet;
 
-/// What a scan reports, in order: `ScanStart`, then the entries, then `ScanDone`. In-process only;
-/// nothing here goes over the wire.
+/// What a scan reports, in order: `ScanStart`, then the entries, then `ScanDone`. `ScanStart` may
+/// come again before the first entry, when a scanner falls back to another way of scanning; each
+/// starts the scan over. In-process only; nothing here goes over the wire.
 #[derive(Clone, Debug)]
 pub enum ScanEvent {
     /// The first event, with the scan root as people see it: canonical, and on Windows without the

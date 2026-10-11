@@ -5,7 +5,8 @@
 
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
-use std::os::windows::fs::{FileExt, OpenOptionsExt};
+use std::io::{Read, Seek, SeekFrom};
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -23,7 +24,7 @@ use windows_sys::Win32::System::Ioctl::{
     FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_GET_RETRIEVAL_POINTERS, NTFS_VOLUME_DATA_BUFFER,
 };
 
-use crate::ntfs::{Mft, Record, parse_record};
+use crate::ntfs::{Mft, Record, parse_record, u32_at, u64_at};
 
 /// How much of the MFT one read takes.
 const CHUNK: usize = 4 << 20;
@@ -36,7 +37,7 @@ const ALIGNMENT: usize = 4096;
 /// volume with serial number `volume_serial`, from the volume's MFT, reading with up to `threads`
 /// reads in flight. The whole MFT is read however small the folder. An error means the volume can't
 /// be read this way (no administrator rights, not NTFS, a network share) and the folder walk should
-/// scan it instead; `ScanStart` may have been sent by then, which the walk's own starts over.
+/// scan it instead: `ScanStart` may have been sent by then, but nothing after it.
 pub(crate) fn scan(
     path: &Path,
     root: &OwnedHandle,
@@ -74,56 +75,39 @@ pub(crate) fn scan(
     });
 
     // Each reader takes the next read, parses its records and hands them over; this thread gathers
-    // them as they come.
-    let mut mft = Mft::new(record_count);
+    // them as they come. An error ends the gathering, which stops the readers.
     let next = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
     let (records_tx, records_rx) = mpsc::channel::<Result<Vec<(usize, Record)>>>();
-    let mut error = None;
-    std::thread::scope(|scope| {
+    let mut mft = std::thread::scope(|scope| -> Result<Mft> {
         for _ in 0..threads.clamp(1, MAX_READERS) {
             let records_tx = records_tx.clone();
-            let (volume, reads, next, failed) = (&volume, &reads, &next, &failed);
+            let (volume, reads, next) = (&volume, &reads, &next);
             scope.spawn(move || {
-                let result = read_records(
-                    volume,
-                    reads,
-                    next,
-                    record_size,
-                    record_count,
-                    cancel,
-                    failed,
-                    &records_tx,
-                );
-                if let Err(e) = result {
-                    failed.store(true, Ordering::Relaxed);
+                if let Err(e) = read_records(volume, reads, next, record_size, cancel, &records_tx) {
                     let _ = records_tx.send(Err(e));
                 }
             });
         }
         drop(records_tx);
-        for batch in records_rx {
-            match batch {
-                Ok(records) => records
-                    .into_iter()
-                    .for_each(|(number, record)| mft.insert(number, record)),
-                Err(e) => error = Some(e),
+        // Made while the first reads are under way: a big MFT's table takes a while to set up.
+        let mut mft = Mft::new(record_count);
+        for records in records_rx {
+            for (number, record) in records? {
+                mft.insert(number, record);
             }
         }
-    });
-    if let Some(e) = error {
-        return Err(e);
-    }
+        Ok(mft)
+    })?;
 
-    if cancel.load(Ordering::Relaxed) {
-        let _ = tx.send(ScanEvent::ScanDone {
-            outcome: ScanOutcome::Cancelled,
-        });
-        return Ok(());
-    }
-    if !mft.send_scan(path, root_reference, volume_serial as u64, tx) {
+    let outcome = if cancel.load(Ordering::Relaxed) {
+        ScanOutcome::Cancelled
+    } else if mft.send_scan(path, root_reference, volume_serial as u64, tx) {
+        ScanOutcome::Complete
+    } else {
         bail!("the scan root isn't in its volume's MFT");
-    }
+    };
+    // Before the table is freed, so nothing waits for that.
+    let _ = tx.send(ScanEvent::ScanDone { outcome });
     Ok(())
 }
 
@@ -162,13 +146,12 @@ fn mft_reads(volume: &str, cluster: usize, valid: usize) -> Result<Vec<(usize, u
     let mut pointers = vec![0u8; 1 << 20];
     ioctl(&mft, FSCTL_GET_RETRIEVAL_POINTERS, &0i64.to_le_bytes(), &mut pointers)
         .context("finding the MFT on the disk")?;
-    let u64_at = |at: usize| u64::from_le_bytes(pointers[at..at + 8].try_into().unwrap());
-    let count = u32::from_le_bytes(pointers[0..4].try_into().unwrap()) as usize;
+    let count = u32_at(&pointers, 0) as usize;
     let cluster = cluster as u64;
-    let mut vcn = u64_at(8);
+    let mut vcn = u64_at(&pointers, 8);
     let mut reads = Vec::new();
     for i in 0..count {
-        let (next_vcn, lcn) = (u64_at(16 + 16 * i), u64_at(24 + 16 * i) as i64);
+        let (next_vcn, lcn) = (u64_at(&pointers, 16 + 16 * i), u64_at(&pointers, 24 + 16 * i) as i64);
         if lcn >= 0 {
             let mut at = vcn;
             while at < next_vcn && ((at * cluster) as usize) < valid {
@@ -186,21 +169,18 @@ fn mft_reads(volume: &str, cluster: usize, valid: usize) -> Result<Vec<(usize, u
     Ok(reads)
 }
 
-/// One reader: take reads from `reads` until none are left, the scan is cancelled or another reader
-/// failed, and send each read's parsed records. Its own handle to `volume`, unbuffered, so the reads
-/// run side by side and don't fill Windows' cache.
-#[allow(clippy::too_many_arguments)]
+/// One reader: take reads from `reads` until none are left, the scan is cancelled or the records stop
+/// being gathered, and send each read's parsed records. Its own handle to `volume`, unbuffered, so
+/// the reads run side by side and don't fill Windows' cache.
 fn read_records(
     volume: &str,
     reads: &[(usize, u64, usize)],
     next: &AtomicUsize,
     record_size: usize,
-    record_count: usize,
     cancel: &AtomicBool,
-    failed: &AtomicBool,
     records_tx: &Sender<Result<Vec<(usize, Record)>>>,
 ) -> Result<()> {
-    let device = OpenOptions::new()
+    let mut device = OpenOptions::new()
         .access_mode(GENERIC_READ)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_NO_BUFFERING)
@@ -210,35 +190,23 @@ fn read_records(
     let buffer = &mut raw[start..start + CHUNK];
     loop {
         let index = next.fetch_add(1, Ordering::Relaxed);
-        if index >= reads.len() || cancel.load(Ordering::Relaxed) || failed.load(Ordering::Relaxed) {
+        if index >= reads.len() || cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
         let (mft_offset, disk_offset, length) = reads[index];
-        read_exact_at(&device, &mut buffer[..length], disk_offset)?;
+        device.seek(SeekFrom::Start(disk_offset))?;
+        device.read_exact(&mut buffer[..length])?;
         let first = mft_offset / record_size;
         let records = buffer[..length]
             .chunks_exact_mut(record_size)
             .enumerate()
             .map(|(i, bytes)| (first + i, bytes))
-            .take_while(|&(number, _)| number < record_count)
             .filter_map(|(number, bytes)| Some((number, parse_record(bytes)?)))
             .collect();
         if records_tx.send(Ok(records)).is_err() {
             return Ok(());
         }
     }
-}
-
-fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> Result<()> {
-    let mut filled = 0;
-    while filled < buffer.len() {
-        let read = file.seek_read(&mut buffer[filled..], offset + filled as u64)?;
-        if read == 0 {
-            bail!("the volume ended at {} reading the MFT", offset + filled as u64);
-        }
-        filled += read;
-    }
-    Ok(())
 }
 
 fn ioctl(file: &File, code: u32, input: &[u8], output: &mut [u8]) -> Result<()> {

@@ -30,7 +30,7 @@ const IO_REPARSE_TAG_CLOUD_MASK: u32 = 0x0000_F000;
 const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
 
 // Convert Windows FILETIME (100ns since 1601-01-01) to Unix epoch seconds
-fn filetime_to_unix(ft: i64) -> i64 {
+pub(crate) fn filetime_to_unix(ft: i64) -> i64 {
     const EPOCH_DIFF: i64 = 11_644_473_600;
     (ft / 10_000_000) - EPOCH_DIFF
 }
@@ -119,9 +119,10 @@ pub fn scan(
     };
     let threads = options.threads.map_or_else(cpu_count, NonZeroUsize::get);
     // Reading a volume's MFT is several times faster than walking all of it, where it can be done,
-    // but takes seconds on a big volume however little of it is scanned: so for whole volumes only.
-    // Where it can't be done, the folders are walked instead.
+    // but takes seconds on a big volume however little of it is scanned: so for whole NTFS volumes
+    // only. Where it can't be done, the folders are walked instead.
     if !options.no_mft
+        && root.unique_file_ids
         && ntfs::is_volume_root(file_id)
         && mft::scan(&path, &root.handle, file_id, volume_serial, threads, &tx, &cancel).is_ok()
     {
@@ -159,7 +160,7 @@ struct WinDir {
 
 /// What to do with one enumerated directory entry.
 #[derive(Debug, PartialEq, Eq)]
-enum EntryKind {
+pub(crate) enum EntryKind {
     /// A directory to descend into (a plain directory, or a cloud-placeholder directory).
     Directory,
     /// A file contributing `size` bytes — 0 for an online-only (dehydrated) cloud placeholder.
@@ -184,7 +185,7 @@ fn is_cloud_reparse_tag(tag: u32) -> bool {
 ///
 /// `reparse_tag` is only meaningful when `FILE_ATTRIBUTE_REPARSE_POINT` is set — the directory
 /// enumeration overlays it onto the entry's `EaSize` field (per [MS-FSCC]).
-fn classify(attrs: u32, reparse_tag: u32, end_of_file: i64, allocation_size: i64) -> EntryKind {
+pub(crate) fn classify(attrs: u32, reparse_tag: u32, end_of_file: i64, allocation_size: i64) -> EntryKind {
     let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
     let is_reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
 
