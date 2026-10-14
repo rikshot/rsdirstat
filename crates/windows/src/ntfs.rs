@@ -23,6 +23,7 @@ const STANDARD_INFORMATION: u32 = 0x10;
 const FILE_NAME: u32 = 0x30;
 const DATA: u32 = 0x80;
 const REPARSE_POINT: u32 = 0xC0;
+const EA_INFORMATION: u32 = 0xD0;
 const END_OF_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 /// `$FILE_NAME`'s namespace for a DOS 8.3 short name that has a long one besides.
 const DOS_NAMESPACE: u8 = 2;
@@ -63,6 +64,8 @@ pub struct FileRecord {
     pub allocated: u64,
     /// The last modification, in Unix seconds.
     pub mtime: i64,
+    /// Its attributes, as `$STANDARD_INFORMATION` keeps them up to date.
+    pub attributes: u32,
     pub reparse_tag: u32,
     /// Each name with its parent folder's reference; DOS short names with a long one are left out.
     pub names: Vec<(u64, Box<str>)>,
@@ -71,7 +74,7 @@ pub struct FileRecord {
 impl FileRecord {
     /// What the folder walk does with this file, from what a folder listing would show of it.
     fn kind(&self) -> EntryKind {
-        let mut attributes = 0;
+        let mut attributes = self.attributes;
         if self.is_dir {
             attributes |= FILE_ATTRIBUTE_DIRECTORY;
         }
@@ -153,8 +156,9 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
     let base = u64_at(record, 0x20);
     let used = (u32_at(record, 0x18) as usize).min(record.len());
     // A reparse point's tag, as its names record it, for when `$REPARSE_POINT` isn't in the record.
+    // A name holds the size of the file's extended attributes there instead, if it has any.
     let mut name_reparse_tag = 0;
-    let mut is_reparse_point = false;
+    let mut has_eas = false;
 
     let mut offset = u16_at(record, 0x14) as usize;
     while offset + 16 <= used {
@@ -181,7 +185,7 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
                 let value = value();
                 if value.len() >= 0x24 {
                     file.mtime = filetime_to_unix(u64_at(value, 8) as i64);
-                    is_reparse_point = u32_at(value, 0x20) & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+                    file.attributes = u32_at(value, 0x20);
                 }
             }
             FILE_NAME if resident => {
@@ -225,6 +229,7 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
                 };
                 file.size = u64_at(attribute, 0x30);
             }
+            EA_INFORMATION => has_eas = true,
             REPARSE_POINT if resident => {
                 let value = value();
                 if value.len() >= 4 {
@@ -236,7 +241,7 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
     }
     // A name keeps the tag it was given when it was made or renamed, so only while the file is
     // still a reparse point, as `$STANDARD_INFORMATION` keeps up to date.
-    if file.reparse_tag == 0 && is_reparse_point {
+    if file.reparse_tag == 0 && file.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && !has_eas {
         file.reparse_tag = name_reparse_tag;
     }
     Some(if base == 0 {
@@ -407,6 +412,8 @@ impl Mft {
 mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
 
     use super::*;
 
@@ -657,6 +664,12 @@ mod tests {
             .information(0, 0)
             .file_name(parent, "j", 1, JUNCTION_TAG);
         assert_eq!(base(former).reparse_tag, 0);
+        // With extended attributes, what a name has there is their size, not a tag.
+        let with_eas = Builder::file(1)
+            .information(0, FILE_ATTRIBUTE_REPARSE_POINT)
+            .file_name(parent, "s", 1, 0x2D)
+            .resident(EA_INFORMATION, "", &[0u8; 8]);
+        assert_eq!(base(with_eas).reparse_tag, 0);
     }
 
     /// The MFT from these records, numbered as given.
@@ -708,6 +721,14 @@ mod tests {
                     .reparse(CLOUD_TAG_3)
                     .sparse_data(4096, 0, 500)
                     .modified(1500),
+            ),
+            (
+                50,
+                Builder::file(1)
+                    .information(1200, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+                    .name(ville, "partly downloaded")
+                    .reparse(CLOUD_TAG_3)
+                    .sparse_data(8192, 4096, 6000),
             ),
             (45, Builder::file(1).name(reference(20, 99), "orphan").data(70)),
             (46, Builder::extension_of(reference(47, 1)).large_data(0, 12288, 10_000)),
@@ -771,8 +792,8 @@ mod tests {
         assert!(sent);
         // Not $Extend's tree, NTFS's metafiles, the junction or the orphan. The hardlink counts once,
         // in the first of its folders. The symlink counts nothing and doesn't make its folder newer;
-        // the dehydrated placeholder (sparse, nothing on the disk) counts nothing but, like the empty
-        // file, does. The big file's sizes come from its extension record, not a stale one.
+        // the dehydrated placeholders (one with nothing on the disk, one partly downloaded) count
+        // nothing but, like the empty file, do. The big file's sizes come from its extension record, not a stale one.
         assert_eq!(
             folders(&events),
             vec![

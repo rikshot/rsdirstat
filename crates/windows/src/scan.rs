@@ -11,10 +11,10 @@ use anyhow::{Context, Result};
 use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOptions, cpu_count, node_id, run_scan};
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE, MAX_PATH};
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FileIdBothDirectoryInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetVolumeInformationByHandleW, OPEN_EXISTING,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdBothDirectoryInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, OPEN_EXISTING,
 };
 
 // Reparse tags for cloud placeholders created by the Cloud Files API (OneDrive, and other providers
@@ -199,15 +199,18 @@ pub(crate) fn classify(attrs: u32, reparse_tag: u32, end_of_file: i64, allocatio
         return EntryKind::Directory;
     }
 
-    // An online-only (unmaterialized) cloud placeholder occupies 0 bytes on disk — AllocationSize 0
-    // — even though EndOfFile still reports its full "online" length; count it as 0. On-disk
-    // allocation is a provider- and hydration-policy-agnostic signal, unlike the assorted
-    // FILE_ATTRIBUTE_RECALL_ON_* flags different providers set. A materialized placeholder — and any
-    // other file, including a sparse, deduplicated, compressed or tiered one — counts at its logical
-    // size, matching the rest of the tree and the macOS dataless-placeholder handling.
-    let unmaterialized_cloud = is_reparse && is_cloud_reparse_tag(reparse_tag) && allocation_size == 0;
+    // A file whose data isn't all on this disk counts 0, though EndOfFile still reports its full
+    // "online" length: an online-only cloud placeholder, or a file tiered off by Azure File Sync.
+    // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS says so, like macOS's SF_DATALESS; a partly downloaded
+    // file has it too. It's what folder listings leave to go by: to a program that hasn't asked to
+    // see placeholders, Windows lists them as plain files, without their reparse point (Dropbox's,
+    // on the test box). A cloud placeholder listed with nothing allocated counts 0 as well. Any
+    // other file, including a materialized placeholder or a sparse, deduplicated or compressed
+    // file, counts at its logical size, matching the rest of the tree.
+    let not_here = attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0
+        || (is_reparse && is_cloud_reparse_tag(reparse_tag) && allocation_size == 0);
     EntryKind::File {
-        size: if unmaterialized_cloud { 0 } else { end_of_file as u64 },
+        size: if not_here { 0 } else { end_of_file as u64 },
     }
 }
 
@@ -327,6 +330,8 @@ fn read_dir(
 mod tests {
     use super::*;
 
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_UNPINNED};
+
     const DIR: u32 = FILE_ATTRIBUTE_DIRECTORY;
     const REPARSE: u32 = FILE_ATTRIBUTE_REPARSE_POINT;
     // A cloud tag with a non-zero provider index in the CLOUD_MASK nibble, to prove masking works.
@@ -361,6 +366,24 @@ mod tests {
         // Dehydrated placeholder: cloud reparse tag, full online length in EndOfFile, 0 on disk.
         let entry = classify(REPARSE, IO_REPARSE_TAG_CLOUD, 10_000_000, 0);
         assert_eq!(entry, EntryKind::File { size: 0 });
+    }
+
+    #[test]
+    fn a_file_whose_data_is_not_here_counts_zero() {
+        // Dropbox's online-only file as a folder listing shows it: a plain file (its reparse point
+        // hidden), unpinned, with the Cloud Files API's recall flag.
+        let attrs = FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_UNPINNED | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+        assert_eq!(classify(attrs, 0xE0, 6_653_604, 0), EntryKind::File { size: 0 });
+        // Partly downloaded, or tiered off by Azure File Sync: not all here either.
+        let attrs = REPARSE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+        assert_eq!(
+            classify(attrs, CLOUD_TAG_3, 68_515_244, 4096),
+            EntryKind::File { size: 0 }
+        );
+        assert_eq!(
+            classify(attrs, STORAGE_SYNC_TAG, 1_000_000, 0),
+            EntryKind::File { size: 0 }
+        );
     }
 
     #[test]
