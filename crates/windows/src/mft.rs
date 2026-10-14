@@ -29,8 +29,9 @@ use crate::scan::reparse_tag_by_id;
 
 /// How much of the MFT one read takes.
 const CHUNK: usize = 4 << 20;
-/// Reads in flight at most: an NVMe drive needs several at once to reach its speed.
-const MAX_READERS: usize = 8;
+/// Reads in flight at most: an NVMe drive needs several at once to reach its speed. On the test
+/// box's, one reader was ~20% slower than two, and four as fast as eight.
+const MAX_READERS: usize = 4;
 /// Unbuffered reads need a buffer aligned to the disk's sectors; a page covers any sector size.
 const ALIGNMENT: usize = 4096;
 /// How many times a read is made while it has a record caught being rewritten.
@@ -57,29 +58,14 @@ pub(crate) fn scan(
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(&volume)
     };
-    // The MFT on the disk lags what Windows has cached by a few seconds; flushing the volume, which
-    // takes opening it for writing, brings it up to date, so files made or deleted just before the
-    // scan are seen as they are. A volume that can't be written is read as it is.
-    let device = match open(GENERIC_READ | GENERIC_WRITE) {
-        Ok(device) => {
-            unsafe { FlushFileBuffers(device.as_raw_handle()) };
-            device
-        }
-        Err(_) => open(GENERIC_READ).context("opening the volume (needs administrator rights)")?,
+    // Opened for writing too, where it can be, to flush it below.
+    let (device, writable) = match open(GENERIC_READ | GENERIC_WRITE) {
+        Ok(device) => (device, true),
+        Err(_) => (
+            open(GENERIC_READ).context("opening the volume (needs administrator rights)")?,
+            false,
+        ),
     };
-    let mut data: NTFS_VOLUME_DATA_BUFFER = unsafe { std::mem::zeroed() };
-    let data_bytes =
-        unsafe { std::slice::from_raw_parts_mut(&mut data as *mut _ as *mut u8, size_of::<NTFS_VOLUME_DATA_BUFFER>()) };
-    ioctl(&device, FSCTL_GET_NTFS_VOLUME_DATA, &[], data_bytes).context("not an NTFS volume")?;
-    drop(device);
-
-    let cluster = data.BytesPerCluster as usize;
-    let record_size = data.BytesPerFileRecordSegment as usize;
-    if record_size == 0 || cluster == 0 || !cluster.is_multiple_of(record_size) || !CHUNK.is_multiple_of(cluster) {
-        bail!("unexpected NTFS geometry: {cluster}-byte clusters, {record_size}-byte records");
-    }
-    let record_count = data.MftValidDataLength as usize / record_size;
-    let reads = mft_reads(&volume, cluster, data.MftValidDataLength as usize)?;
     // The volume can be read: the scan has started, though nothing is known until it's all read.
     let _ = tx.send(ScanEvent::ScanStart {
         root: plain_path(path).into_owned(),
@@ -93,6 +79,30 @@ pub(crate) fn scan(
         );
         e
     };
+
+    // The MFT on the disk lags what Windows has cached by a few seconds; flushing the volume brings
+    // it up to date, so files made or deleted just before the scan are seen as they are. A volume
+    // that can't be written is read as it is.
+    if writable {
+        unsafe { FlushFileBuffers(device.as_raw_handle()) };
+    }
+    let mut data: NTFS_VOLUME_DATA_BUFFER = unsafe { std::mem::zeroed() };
+    let data_bytes =
+        unsafe { std::slice::from_raw_parts_mut(&mut data as *mut _ as *mut u8, size_of::<NTFS_VOLUME_DATA_BUFFER>()) };
+    ioctl(&device, FSCTL_GET_NTFS_VOLUME_DATA, &[], data_bytes)
+        .context("not an NTFS volume")
+        .map_err(fall_back)?;
+    drop(device);
+
+    let cluster = data.BytesPerCluster as usize;
+    let record_size = data.BytesPerFileRecordSegment as usize;
+    if record_size == 0 || cluster == 0 || !cluster.is_multiple_of(record_size) || !CHUNK.is_multiple_of(cluster) {
+        return Err(fall_back(anyhow!(
+            "unexpected NTFS geometry: {cluster}-byte clusters, {record_size}-byte records"
+        )));
+    }
+    let record_count = data.MftValidDataLength as usize / record_size;
+    let reads = mft_reads(&volume, cluster, data.MftValidDataLength as usize).map_err(fall_back)?;
 
     // Each reader takes the next read, parses its records and hands them over; this thread gathers
     // them as they come. An error ends the gathering, which stops the readers.
