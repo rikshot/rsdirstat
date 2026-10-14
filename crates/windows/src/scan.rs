@@ -12,9 +12,11 @@ use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOptions, cpu_count, n
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE, MAX_PATH};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdBothDirectoryInfo, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, OPEN_EXISTING,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_ID_BOTH_DIR_INFO, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, FileIdBothDirectoryInfo, FileIdType,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetVolumeInformationByHandleW, OPEN_EXISTING,
+    OpenFileById,
 };
 
 // Reparse tags for cloud placeholders created by the Cloud Files API (OneDrive, and other providers
@@ -28,6 +30,9 @@ const IO_REPARSE_TAG_CLOUD_MASK: u32 = 0x0000_F000;
 /// The reparse tag bit marking a name surrogate: an entry that stands for another file or directory
 /// (a symlink, a junction, a volume mount point), as the SDK's `IsReparseTagNameSurrogate` tests.
 const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+
+/// The reparse tag bit Microsoft's own tags have, as the SDK's `IsReparseTagMicrosoft` tests.
+const REPARSE_TAG_MICROSOFT: u32 = 0x8000_0000;
 
 // Convert Windows FILETIME (100ns since 1601-01-01) to Unix epoch seconds
 pub(crate) fn filetime_to_unix(ft: i64) -> i64 {
@@ -214,6 +219,49 @@ pub(crate) fn classify(attrs: u32, reparse_tag: u32, end_of_file: i64, allocatio
     }
 }
 
+/// Whether what a folder listing gives as a reparse point's tag may instead be the size of its
+/// extended attributes. NTFS's folder index has room for one or the other, and a reparse point with
+/// extended attributes (as Linux's NTFS driver gives the symlinks it makes) keeps their size there.
+/// A size looks like a tag without the Microsoft bit: one of those, rare as it is, is asked about too.
+fn may_be_ea_size(listed_tag: u32) -> bool {
+    listed_tag & REPARSE_TAG_MICROSOFT == 0
+}
+
+/// The reparse tag of the file with id `file_id` on `volume`'s volume, asked of the file itself:
+/// opened by id, since Windows can't open every name (Linux allows `:` in them), and as itself rather
+/// than what it points to, only to read its attributes, so a cloud file isn't downloaded.
+pub(crate) fn reparse_tag_by_id(volume: &OwnedHandle, file_id: i64) -> Option<u32> {
+    let id = FILE_ID_DESCRIPTOR {
+        dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
+        Type: FileIdType,
+        Anonymous: FILE_ID_DESCRIPTOR_0 { FileId: file_id },
+    };
+    let handle = unsafe {
+        OpenFileById(
+            volume.as_raw_handle(),
+            &id,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle(),
+            FileAttributeTagInfo,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    (ok != 0).then_some(info.ReparseTag)
+}
+
 /// Read one directory with `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`, which returns
 /// entries with their sizes, times and attributes in batches.
 fn read_dir(
@@ -266,8 +314,16 @@ fn read_dir(
             let name = String::from_utf16_lossy(name_slice);
 
             if name != "." && name != ".." {
-                // When the reparse bit is set, the enumeration overlays the reparse tag onto EaSize.
-                match classify(info.FileAttributes, info.EaSize, info.EndOfFile, info.AllocationSize) {
+                // When the reparse bit is set, the enumeration overlays the reparse tag onto EaSize,
+                // unless it holds the size of the entry's extended attributes: then the file says.
+                let mut reparse_tag = info.EaSize;
+                if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                    && may_be_ea_size(reparse_tag)
+                    && dir.handle.unique_file_ids
+                {
+                    reparse_tag = reparse_tag_by_id(&dir.handle.handle, info.FileId).unwrap_or(reparse_tag);
+                }
+                match classify(info.FileAttributes, reparse_tag, info.EndOfFile, info.AllocationSize) {
                     EntryKind::Directory => {
                         let path = sink.child_path(&name);
                         if let Some(child) = open_dir(&wide(&path)) {
@@ -415,6 +471,15 @@ mod tests {
                 EntryKind::File { size: 1_000_000 },
                 "{tag:#x}"
             );
+        }
+    }
+
+    #[test]
+    fn a_listed_tag_without_the_microsoft_bit_may_be_an_ea_size() {
+        // A Linux-made symlink's listing: 0x2D bytes of extended attributes where its tag would be.
+        assert!(may_be_ea_size(0x2D));
+        for tag in [SYMLINK_TAG, MOUNT_POINT_TAG, LX_SYMLINK_TAG, CLOUD_TAG_3, WOF_TAG] {
+            assert!(!may_be_ea_size(tag), "{tag:#x}");
         }
     }
 

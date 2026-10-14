@@ -25,6 +25,7 @@ use windows_sys::Win32::System::Ioctl::{
 };
 
 use crate::ntfs::{Mft, Record, is_torn, parse_record, u32_at, u64_at};
+use crate::scan::reparse_tag_by_id;
 
 /// How much of the MFT one read takes.
 const CHUNK: usize = 4 << 20;
@@ -121,7 +122,9 @@ pub(crate) fn scan(
 
     let outcome = if cancel.load(Ordering::Relaxed) {
         ScanOutcome::Cancelled
-    } else if mft.send_scan(path, root_reference, volume_serial as u64, tx) {
+    } else if mft.send_scan(path, root_reference, volume_serial as u64, tx, |file| {
+        reparse_tag_by_id(root, file as i64)
+    }) {
         ScanOutcome::Complete
     } else {
         return Err(fall_back(anyhow!("the scan root isn't in its volume's MFT")));

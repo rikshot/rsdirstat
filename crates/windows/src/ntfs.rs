@@ -23,7 +23,6 @@ const STANDARD_INFORMATION: u32 = 0x10;
 const FILE_NAME: u32 = 0x30;
 const DATA: u32 = 0x80;
 const REPARSE_POINT: u32 = 0xC0;
-const EA_INFORMATION: u32 = 0xD0;
 const END_OF_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 /// `$FILE_NAME`'s namespace for a DOS 8.3 short name that has a long one besides.
 const DOS_NAMESPACE: u8 = 2;
@@ -66,6 +65,7 @@ pub struct FileRecord {
     pub mtime: i64,
     /// Its attributes, as `$STANDARD_INFORMATION` keeps them up to date.
     pub attributes: u32,
+    /// Its reparse tag, if its records hold it: see `Mft::send_scan`.
     pub reparse_tag: u32,
     /// Each name with its parent folder's reference; DOS short names with a long one are left out.
     pub names: Vec<(u64, Box<str>)>,
@@ -155,10 +155,6 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
     };
     let base = u64_at(record, 0x20);
     let used = (u32_at(record, 0x18) as usize).min(record.len());
-    // A reparse point's tag, as its names record it, for when `$REPARSE_POINT` isn't in the record.
-    // A name holds the size of the file's extended attributes there instead, if it has any.
-    let mut name_reparse_tag = 0;
-    let mut has_eas = false;
 
     let mut offset = u16_at(record, 0x14) as usize;
     while offset + 16 <= used {
@@ -208,9 +204,6 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
                 // Most files have one name, and a first push would make room for four.
                 file.names.reserve_exact(1);
                 file.names.push((u64_at(value, 0), name.into_boxed_str()));
-                if u32_at(value, 0x38) & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                    name_reparse_tag = u32_at(value, 0x3C);
-                }
             }
             DATA if unnamed && resident => {
                 file.has_data = true;
@@ -229,7 +222,6 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
                 };
                 file.size = u64_at(attribute, 0x30);
             }
-            EA_INFORMATION => has_eas = true,
             REPARSE_POINT if resident => {
                 let value = value();
                 if value.len() >= 4 {
@@ -238,11 +230,6 @@ pub fn parse_record(record: &mut [u8]) -> Option<Record> {
             }
             _ => {}
         }
-    }
-    // A name keeps the tag it was given when it was made or renamed, so only while the file is
-    // still a reparse point, as `$STANDARD_INFORMATION` keeps up to date.
-    if file.reparse_tag == 0 && file.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && !has_eas {
-        file.reparse_tag = name_reparse_tag;
     }
     Some(if base == 0 {
         Record::Base(file)
@@ -283,7 +270,19 @@ impl Mft {
     /// on the volume with serial number `volume`, between its `ScanStart` and `ScanDone`: a `Dir` per
     /// folder under it, parent first. Node ids are those the folder walk gives. Sends nothing, and
     /// returns false, if the root isn't a folder in this MFT. The names sent are taken out of it.
-    pub fn send_scan(&mut self, root: &Path, root_reference: u64, volume: u64, tx: &Sender<ScanEvent>) -> bool {
+    ///
+    /// A reparse point's tag is in its `$REPARSE_POINT`, unless that's too big to fit in its records
+    /// (a symlink to a long path, say): then `tag_of` gives it, by the file's reference, or `None`
+    /// if it can't. (Its names don't: they hold the tag they were made with, or in its place, the
+    /// size of the file's extended attributes, as symlinks Linux makes have.)
+    pub fn send_scan(
+        &mut self,
+        root: &Path,
+        root_reference: u64,
+        volume: u64,
+        tx: &Sender<ScanEvent>,
+        mut tag_of: impl FnMut(u64) -> Option<u32>,
+    ) -> bool {
         let mut extensions = std::mem::take(&mut self.extensions);
         // In record order, so a file's names come in the same order on every scan.
         extensions.sort_unstable_by_key(|&(number, ..)| number);
@@ -304,6 +303,14 @@ impl Mft {
             }
             if attributes.reparse_tag != 0 {
                 file.reparse_tag = attributes.reparse_tag;
+            }
+        }
+        for (number, file) in self.records.iter_mut().enumerate().skip(FIRST_USER_RECORD) {
+            if let Some(file) = file
+                && file.reparse_tag == 0
+                && file.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                file.reparse_tag = tag_of(reference(number, file.sequence)).unwrap_or(0);
             }
         }
         let records = &self.records;
@@ -492,23 +499,14 @@ mod tests {
             self.resident(STANDARD_INFORMATION, "", &value)
         }
 
-        /// A `$FILE_NAME`; a reparse point's records its `reparse_tag`.
-        fn file_name(self, parent: u64, name: &str, namespace: u8, reparse_tag: u32) -> Self {
+        fn name_in(self, parent: u64, name: &str, namespace: u8) -> Self {
             let units: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
             let mut value = vec![0u8; 0x42 + units.len()];
             value[0..8].copy_from_slice(&parent.to_le_bytes());
-            if reparse_tag != 0 {
-                value[0x38..0x3C].copy_from_slice(&FILE_ATTRIBUTE_REPARSE_POINT.to_le_bytes());
-                value[0x3C..0x40].copy_from_slice(&reparse_tag.to_le_bytes());
-            }
             value[0x40] = (units.len() / 2) as u8;
             value[0x41] = namespace;
             value[0x42..].copy_from_slice(&units);
             self.resident(FILE_NAME, "", &value)
-        }
-
-        fn name_in(self, parent: u64, name: &str, namespace: u8) -> Self {
-            self.file_name(parent, name, namespace, 0)
         }
 
         fn name(self, parent: u64, name: &str) -> Self {
@@ -651,27 +649,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_name_gives_the_reparse_tag_only_while_the_file_is_a_reparse_point() {
-        let parent = reference(ROOT_FOLDER, 5);
-        // `$REPARSE_POINT` isn't in the record (it's too big, say), so the tag comes from the name.
-        let junction = Builder::folder(1)
-            .information(0, FILE_ATTRIBUTE_REPARSE_POINT)
-            .file_name(parent, "j", 1, JUNCTION_TAG);
-        assert_eq!(base(junction).reparse_tag, JUNCTION_TAG);
-        // Its reparse point removed since, it's a plain folder; the name still has the old tag.
-        let former = Builder::folder(1)
-            .information(0, 0)
-            .file_name(parent, "j", 1, JUNCTION_TAG);
-        assert_eq!(base(former).reparse_tag, 0);
-        // With extended attributes, what a name has there is their size, not a tag.
-        let with_eas = Builder::file(1)
-            .information(0, FILE_ATTRIBUTE_REPARSE_POINT)
-            .file_name(parent, "s", 1, 0x2D)
-            .resident(EA_INFORMATION, "", &[0u8; 8]);
-        assert_eq!(base(with_eas).reparse_tag, 0);
-    }
-
     /// The MFT from these records, numbered as given.
     fn mft(records: Vec<(usize, Builder)>) -> Mft {
         let mut mft = Mft::new(64);
@@ -751,7 +728,7 @@ mod tests {
     /// What `send_scan` sends for the folder `root_number`.
     fn scan(mut mft: Mft, root: &Path, root_number: usize, root_sequence: u16) -> (bool, Vec<ScanEvent>) {
         let (tx, rx) = mpsc::channel();
-        let sent = mft.send_scan(root, reference(root_number, root_sequence), VOLUME, &tx);
+        let sent = mft.send_scan(root, reference(root_number, root_sequence), VOLUME, &tx, |_| None);
         drop(tx);
         (sent, rx.iter().collect())
     }
@@ -877,6 +854,51 @@ mod tests {
                 ),
                 (id(21, 1), id(ROOT_FOLDER, 5), "b".to_owned(), 0, vec![]),
             ]
+        );
+    }
+
+    #[test]
+    fn a_reparse_point_whose_tag_is_not_in_its_records_is_asked_for_it() {
+        let root = PathBuf::from(r"C:\");
+        let volume = reference(ROOT_FOLDER, 5);
+        // Reparse points whose `$REPARSE_POINT` didn't fit in their records: a symlink, as asking
+        // tells, and one whose tag can't be had, which counts as the plain file it seems.
+        let records = vec![
+            (ROOT_FOLDER, Builder::folder(5).name(volume, ".")),
+            (
+                30,
+                Builder::file(1)
+                    .information(3000, FILE_ATTRIBUTE_REPARSE_POINT)
+                    .name(volume, "link"),
+            ),
+            (
+                31,
+                Builder::file(1)
+                    .information(1000, FILE_ATTRIBUTE_REPARSE_POINT)
+                    .name(volume, "unknown")
+                    .data(5),
+            ),
+            (32, Builder::file(1).name(volume, "plain").data(7)),
+        ];
+        let mut mft = mft(records);
+        let (tx, rx) = mpsc::channel();
+        let mut asked = Vec::new();
+        let sent = mft.send_scan(&root, volume, VOLUME, &tx, |file| {
+            asked.push(file);
+            (file == reference(30, 1)).then_some(SYMLINK_TAG)
+        });
+        drop(tx);
+        assert!(sent);
+        assert_eq!(asked, vec![reference(30, 1), reference(31, 1)]);
+        assert_eq!(
+            folders(&rx.iter().collect::<Vec<_>>()),
+            vec![(
+                id(ROOT_FOLDER, 5),
+                0,
+                root_name(&root),
+                1000,
+                vec![("unknown".to_owned(), 5), ("plain".to_owned(), 7)]
+            )]
         );
     }
 
