@@ -2,5 +2,7 @@
 //! each OS's build of `rsdirstat` picks its own scanner.
 #![cfg(windows)]
 
+mod mft;
+mod ntfs;
 pub mod scan;
 pub mod volumes;

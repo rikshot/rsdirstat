@@ -48,6 +48,11 @@ struct Args {
     #[arg(long)]
     threads: Option<NonZeroUsize>,
 
+    /// On Windows, walk a whole drive's folders even as administrator, instead of reading NTFS's
+    /// file index
+    #[arg(long)]
+    no_mft: bool,
+
     /// Port for the GUI server (0 = random)
     #[arg(long, default_value_t = 0)]
     port: u16,
@@ -182,6 +187,7 @@ async fn run_server(args: Args) -> Result<()> {
         path,
         all: cross_filesystems,
         threads,
+        no_mft,
         port,
         no_open,
         wait,
@@ -200,6 +206,7 @@ async fn run_server(args: Args) -> Result<()> {
     let options = ScanOptions {
         cross_filesystems,
         threads,
+        no_mft,
     };
     let state = Arc::new(AppState::new(phase, scan_root, options));
 
