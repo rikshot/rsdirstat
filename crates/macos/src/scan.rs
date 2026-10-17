@@ -26,9 +26,23 @@ const VDIR: u32 = 2;
 // surfaced via ATTR_CMN_FLAGS; reading attributes never triggers a download.
 const SF_DATALESS: u32 = 0x4000_0000;
 
+/// st_flags bit (from <sys/stat.h>, not exposed by libc) marking a firmlink: a directory of the
+/// read-only system volume that leads to one of the data volume, `/Users` to
+/// `/System/Volumes/Data/Users`. Only its attributes carry it; `stat` goes through to the target.
+const SF_FIRMLINK: u32 = 0x0080_0000;
+
 /// `ATTR_DIR_MOUNTSTATUS` bit (from <sys/attr.h>, not exposed by libc) marking a directory that
 /// mounts something when looked into: an autofs trigger.
 const DIR_MNTSTATUS_TRIGGER: u32 = 0x2;
+
+// <sys/resource.h>; libc binds neither these nor setiopolicy_np (libSystem, macOS 10.15+ for this
+// policy).
+const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: libc::c_int = 3;
+const IOPOL_SCOPE_PROCESS: libc::c_int = 0;
+const IOPOL_MATERIALIZE_DATALESS_FILES_OFF: libc::c_int = 1;
+unsafe extern "C" {
+    fn setiopolicy_np(iotype: libc::c_int, scope: libc::c_int, policy: libc::c_int) -> libc::c_int;
+}
 
 static SCAN_ATTRS: libc::attrlist = libc::attrlist {
     bitmapcount: libc::ATTR_BIT_MAP_COUNT,
@@ -60,11 +74,26 @@ pub fn scan(
     tx: std::sync::mpsc::Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
-    let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
-    let meta = std::fs::metadata(&path).context("failed to stat root path")?;
-    let fd = open_root(&path).context("failed to open root directory")?;
-    let id = node_id(meta.dev(), meta.ino());
+    // Listing a dataless folder (a cloud folder never fetched, or evicted) would have its File
+    // Provider fetch it from the network, then each folder in it in turn: slow, and a change to what
+    // the user keeps synced. With that off, the listing fails with EDEADLK instead, and the folder
+    // reads as what it holds on this disk: nothing.
+    if unsafe {
+        setiopolicy_np(
+            IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+            IOPOL_SCOPE_PROCESS,
+            IOPOL_MATERIALIZE_DATALESS_FILES_OFF,
+        )
+    } != 0
+    {
+        eprintln!("setiopolicy_np failed: {}", std::io::Error::last_os_error());
+    }
+    let path = std::fs::canonicalize(root).with_context(|| format!("can't scan {}", root.display()))?;
+    let meta = std::fs::metadata(&path).with_context(|| format!("can't stat {}", path.display()))?;
+    let fd = open_root(&path).with_context(|| format!("can't open {}", path.display()))?;
     let root_dev = meta.dev() as i32;
+    // The device as listings give it (`as u32`): `MetadataExt::dev` sign-extends the i32 `dev_t`.
+    let id = node_id(root_dev as u32 as u64, meta.ino());
     let root = UnixDir::Root(Arc::new(fd));
     let threads = options
         .threads
@@ -81,7 +110,7 @@ pub fn scan(
 }
 
 /// Read one directory with `getattrlistbulk`, which returns entries and their attributes in
-/// batches, so files need no further syscalls. False if it can't be opened.
+/// batches, so files need no further syscalls. False if it can't be opened, or searched.
 fn read_dir(
     dir: &DirJob<UnixDir>,
     buffer: &mut [u8],
@@ -90,6 +119,7 @@ fn read_dir(
     cross_filesystems: bool,
 ) -> bool {
     let Some(fd) = dir.open(sink) else { return false };
+    let mut first = true;
     loop {
         let count = unsafe {
             libc::getattrlistbulk(
@@ -102,16 +132,21 @@ fn read_dir(
         };
 
         if count < 0 {
-            eprintln!(
-                "getattrlistbulk failed for {}: {}",
-                dir.name,
-                std::io::Error::last_os_error()
-            );
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                // A cloud folder not fetched (see `scan`): it holds nothing on this disk.
+                Some(libc::EDEADLK) => {}
+                // A folder that opens but can't be searched (`r--`), as these attributes need: left
+                // out, like one that can't be opened. Not the root, which the scan shows.
+                Some(libc::EACCES | libc::EPERM) if first && !dir.is_root() => return false,
+                _ => sink.read_failed(format_args!("getattrlistbulk: {error}")),
+            }
             break;
         }
         if count == 0 {
             break;
         }
+        first = false;
 
         let mut offset = 0usize;
         for _ in 0..count {
@@ -132,12 +167,7 @@ fn read_dir(
                 let id = || node_id(parsed.dev_id as u32 as u64, parsed.file_id);
                 match parsed.obj_type {
                     VDIR => {
-                        let id = if parsed.mount_status == 0 {
-                            Some(id())
-                        } else {
-                            mount_point_id(&fd, &parsed, root_dev, cross_filesystems)
-                        };
-                        if let Some(id) = id {
+                        if let Some(id) = dir_id(&fd, &parsed, root_dev, cross_filesystems) {
                             let child = UnixDir::Child(Arc::clone(&fd), parsed.c_name.to_owned());
                             sink.dir(id, &parsed.name, child);
                         }
@@ -162,6 +192,22 @@ fn read_dir(
     true
 }
 
+/// The node id of the subdirectory `entry` in the directory `dir`, or `None` if the scan leaves it
+/// out.
+fn dir_id(dir: &OwnedFd, entry: &ParsedEntry, root_dev: i32, cross_filesystems: bool) -> Option<u64> {
+    if entry.mount_status != 0 {
+        mount_point_id(dir, entry, root_dev, cross_filesystems)
+    } else if entry.firmlink {
+        // A firmlink's FILEID is its own, not that of the directory it leads to, which the scan can
+        // also reach under `/System/Volumes/Data`: `fstatat` reports that one, so both names get
+        // one id and the directory is read once.
+        let (dev, ino) = stat_at(dir, entry).map_or((entry.dev_id, entry.file_id), |stat| (stat.st_dev, stat.st_ino));
+        Some(node_id(dev as u32 as u64, ino))
+    } else {
+        Some(node_id(entry.dev_id as u32 as u64, entry.file_id))
+    }
+}
+
 /// The node id of the mount point `entry` in the directory `dir`, or `None` if the scan leaves it
 /// out: when not crossing filesystems, one of another filesystem than the root's (a volume, `/dev`),
 /// and an automount trigger, which looking at would mount. The root's own filesystem can be mounted
@@ -171,6 +217,13 @@ fn mount_point_id(dir: &OwnedFd, entry: &ParsedEntry, root_dev: i32, cross_files
         return None;
     }
     // The entry's own attributes are the covered directory's; `fstatat` reports the mount's root.
+    let stat = stat_at(dir, entry)?;
+    (cross_filesystems || stat.st_dev == root_dev).then(|| node_id(stat.st_dev as u32 as u64, stat.st_ino))
+}
+
+/// `fstatat` of `entry` in `dir`, which unlike its attributes goes through to what is mounted on it,
+/// or what it leads to if it's a firmlink.
+fn stat_at(dir: &OwnedFd, entry: &ParsedEntry) -> Option<libc::stat> {
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     let ok = unsafe {
         libc::fstatat(
@@ -180,7 +233,7 @@ fn mount_point_id(dir: &OwnedFd, entry: &ParsedEntry, root_dev: i32, cross_files
             libc::AT_SYMLINK_NOFOLLOW,
         )
     };
-    (ok == 0 && (cross_filesystems || stat.st_dev == root_dev)).then(|| node_id(stat.st_dev as u32 as u64, stat.st_ino))
+    (ok == 0).then_some(stat)
 }
 
 struct ParsedEntry<'a> {
@@ -195,6 +248,8 @@ struct ParsedEntry<'a> {
     nlink: u32,
     mtime: i64,
     dataless: bool,
+    /// A firmlink (`SF_FIRMLINK`), whose FILEID isn't that of the directory it leads to.
+    firmlink: bool,
     /// A directory's `ATTR_DIR_MOUNTSTATUS`: 0 unless something is (or would be) mounted on it.
     mount_status: u32,
 }
@@ -263,7 +318,8 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
         mtime = i64::from_ne_bytes(entry[pos..pos + 8].try_into().ok()?);
     });
     // ATTR_CMN_FLAGS (bit 0x40000) precedes FILEID (bit 0x2000000) in ascending-bit order. Returns
-    // st_flags as a u32; we only inspect SF_DATALESS to spot unmaterialized cloud placeholders.
+    // st_flags as a u32; we only inspect SF_DATALESS to spot unmaterialized cloud placeholders, and
+    // SF_FIRMLINK.
     field!(returned_common & libc::ATTR_CMN_FLAGS != 0, 4, {
         flags = u32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
     });
@@ -275,7 +331,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
         mount_status = u32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
     });
     // File attributes only appear for files, so these bits are naturally clear for directories.
-    // LINKCOUNT (bit 0x400) precedes DATALENGTH (bit 0x2000) in ascending-bit order.
+    // LINKCOUNT (bit 0x1) precedes DATALENGTH (bit 0x200) in ascending-bit order.
     field!(returned_file & libc::ATTR_FILE_LINKCOUNT != 0, 4, {
         nlink = u32::from_ne_bytes(entry[pos..pos + 4].try_into().ok()?);
     });
@@ -293,6 +349,7 @@ fn parse_entry(entry: &[u8]) -> Option<ParsedEntry<'_>> {
         nlink,
         mtime,
         dataless: flags & SF_DATALESS != 0,
+        firmlink: flags & SF_FIRMLINK != 0,
         mount_status,
     })
 }
@@ -304,7 +361,7 @@ mod tests {
     /// What a synthetic entry holds besides its common attributes.
     enum Kind {
         File { flags: u32, size: u64 },
-        Dir { mount_status: u32 },
+        Dir { flags: u32, mount_status: u32 },
     }
 
     /// Build one synthetic `getattrlistbulk` entry mirroring `parse_entry`'s expected layout: a
@@ -323,7 +380,7 @@ mod tests {
             | libc::ATTR_CMN_FILEID;
         let (obj_type, flags, returned_dir, returned_file) = match kind {
             Kind::File { flags, .. } => (VREG, flags, 0, libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_DATALENGTH),
-            Kind::Dir { .. } => (VDIR, 0, libc::ATTR_DIR_MOUNTSTATUS, 0),
+            Kind::Dir { flags, .. } => (VDIR, flags, libc::ATTR_DIR_MOUNTSTATUS, 0),
         };
         e.extend_from_slice(&returned_common.to_ne_bytes());
         e.extend_from_slice(&0u32.to_ne_bytes()); // vol
@@ -346,7 +403,7 @@ mod tests {
                 e.extend_from_slice(&1u32.to_ne_bytes()); // LINKCOUNT
                 e.extend_from_slice(&size.to_ne_bytes()); // DATALENGTH
             }
-            Kind::Dir { mount_status } => e.extend_from_slice(&mount_status.to_ne_bytes()),
+            Kind::Dir { mount_status, .. } => e.extend_from_slice(&mount_status.to_ne_bytes()),
         }
 
         let name_pos = e.len();
@@ -367,11 +424,80 @@ mod tests {
     #[test]
     fn mount_status_is_read_for_directories() {
         for mount_status in [0, libc::DIR_MNTSTATUS_MNTPOINT, DIR_MNTSTATUS_TRIGGER] {
-            let entry = build_entry("Volumes", Kind::Dir { mount_status });
+            let entry = build_entry("Volumes", Kind::Dir { flags: 0, mount_status });
             let parsed = parse_entry(&entry).expect("entry should parse");
             assert_eq!((parsed.obj_type, &*parsed.name), (VDIR, "Volumes"));
             assert_eq!(parsed.mount_status, mount_status);
         }
+    }
+
+    #[test]
+    fn firmlink_is_flagged() {
+        // What `/` lists for `Users`: SF_NOUNLINK | SF_FIRMLINK.
+        let entry = build_entry(
+            "Users",
+            Kind::Dir {
+                flags: 0x0090_0000,
+                mount_status: 0,
+            },
+        );
+        assert!(parse_entry(&entry).expect("entry should parse").firmlink);
+        let entry = build_entry(
+            "Users",
+            Kind::Dir {
+                flags: 0x0010_0000,
+                mount_status: 0,
+            },
+        );
+        assert!(!parse_entry(&entry).expect("entry should parse").firmlink);
+    }
+
+    /// The firmlink flag and the id `read_dir` gives each subdirectory of `path`, by name.
+    fn subdir_ids(path: &str) -> std::collections::HashMap<String, (bool, Option<u64>)> {
+        let fd = open_root(Path::new(path)).expect("open");
+        let dev = std::fs::metadata(path).expect("stat").dev() as i32;
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut ids = std::collections::HashMap::new();
+        loop {
+            let count = unsafe {
+                libc::getattrlistbulk(
+                    fd.as_raw_fd(),
+                    &SCAN_ATTRS as *const libc::attrlist as *mut libc::c_void,
+                    buffer.as_mut_ptr() as *mut libc::c_void,
+                    buffer.len(),
+                    libc::FSOPT_NOFOLLOW as u64,
+                )
+            };
+            assert!(
+                count >= 0,
+                "getattrlistbulk {path}: {}",
+                std::io::Error::last_os_error()
+            );
+            if count == 0 {
+                return ids;
+            }
+            let mut offset = 0;
+            for _ in 0..count {
+                let length = u32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+                let parsed = parse_entry(&buffer[offset..offset + length]).expect("entry should parse");
+                if parsed.obj_type == VDIR {
+                    let id = dir_id(&fd, &parsed, dev, false);
+                    ids.insert(parsed.name.to_string(), (parsed.firmlink, id));
+                }
+                offset += length;
+            }
+        }
+    }
+
+    #[test]
+    fn a_firmlink_and_the_directory_it_leads_to_get_one_id() {
+        // Every macOS since 10.15 firmlinks /System/Library/Caches to the data volume's, which a
+        // scan of / or /System also reaches under /System/Volumes/Data.
+        let (firmlink, id) = subdir_ids("/System/Library")["Caches"];
+        assert!(firmlink, "/System/Library/Caches should be a firmlink");
+        let (_, data_id) = subdir_ids("/System/Volumes/Data/System/Library")["Caches"];
+        assert!(id.is_some());
+        assert_eq!(id, data_id);
     }
 
     #[test]
