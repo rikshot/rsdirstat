@@ -1,6 +1,7 @@
+use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use rsdirstat_core::volume::VolumeInfo;
@@ -9,13 +10,26 @@ use rsdirstat_core::volume::VolumeInfo;
 /// server is gone can take minutes to fail, or never on a hard mount, and would hold up the list.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The filesystems of this machine's own disks, whose sizes are asked for inline: their `statvfs`
+/// answers without waiting on anyone. Any other (a network share; FUSE, whose daemon answers) may
+/// not, so it is asked on a thread of its own.
+const LOCAL_FILESYSTEMS: [&str; 19] = [
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "bcachefs", "zfs", "f2fs", "jfs", "reiserfs", "vfat", "exfat", "ntfs3",
+    "hfsplus", "iso9660", "udf", "squashfs", "erofs", "overlay",
+];
+
+/// The mount points whose probe hasn't returned yet. Another would only be one more thread stuck on
+/// the same dead mount, every time the picker is shown.
+static PROBING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
 pub fn list_volumes() -> Vec<VolumeInfo> {
     let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
         return Vec::new();
     };
 
-    // Every mount's size is asked for at once, each on a thread of its own, so a stuck one holds up
-    // neither the others nor the list: it is left out, and its thread left to the syscall.
+    // A mount that may not answer is asked on a thread of its own, all of them at once, so a stuck one
+    // holds up neither the others nor the list: it is left out, and its thread left to the syscall.
+    // One still stuck from an earlier list is left out at once.
     let probes: Vec<_> = mounts
         .lines()
         .filter_map(|line| {
@@ -29,17 +43,17 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
             }
             let mount_point = unescape_octal(raw_mount);
 
-            let c_path = CString::new(mount_point.as_str()).ok()?;
             let (tx, rx) = mpsc::channel();
-            let path = mount_point.clone();
-            std::thread::spawn(move || {
-                // Not a file bind-mounted from another filesystem (a container's /etc/hosts).
-                let usage = std::fs::metadata(&path)
-                    .is_ok_and(|meta| meta.is_dir())
-                    .then(|| statvfs_usage(&c_path))
-                    .flatten();
-                let _ = tx.send(usage);
-            });
+            if LOCAL_FILESYSTEMS.contains(&fs_type) {
+                let _ = tx.send(usage(&mount_point));
+            } else if PROBING.lock().unwrap().insert(mount_point.clone()) {
+                let path = mount_point.clone();
+                std::thread::spawn(move || {
+                    let usage = usage(&path);
+                    PROBING.lock().unwrap().remove(&path);
+                    let _ = tx.send(usage);
+                });
+            }
             Some((mount_point, fs_type.to_string(), rx))
         })
         .collect();
@@ -103,12 +117,17 @@ fn unescape_octal(s: &str) -> String {
 
 /// Total and free bytes of the filesystem mounted at `path`, via `statvfs`. Free counts the blocks
 /// reserved for the superuser too (5% of an ext4 volume by default), which are no one's data: the
-/// used bytes left are what `df` shows as used.
+/// used bytes left are what `df` shows as used. None for a file bind-mounted from another
+/// filesystem (a container's /etc/hosts).
 // The field widths vary by platform (u32 on 32-bit Linux, u64 elsewhere).
 #[allow(clippy::useless_conversion)]
-fn statvfs_usage(path: &std::ffi::CStr) -> Option<(u64, u64)> {
+fn usage(path: &str) -> Option<(u64, u64)> {
+    let c_path = CString::new(path).ok()?;
+    if !std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        return None;
+    }
     let mut stat = libc::statvfs::default();
-    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
         return None;
     }
     let block_size = u64::from(stat.f_frsize);
