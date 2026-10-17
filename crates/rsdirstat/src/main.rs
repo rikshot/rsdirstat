@@ -117,7 +117,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// than `Running`.
 enum ScanPhase {
     /// No path to scan: the volume picker is up. At startup without a path, and after a scan
-    /// couldn't start.
+    /// couldn't start or ended without reading its root.
     AwaitingPath,
     /// The scan of `root` waits for the page's Start button (`--wait`).
     AwaitingStart { root: PathBuf },
@@ -128,8 +128,9 @@ enum ScanPhase {
         cancel: Arc<AtomicBool>,
         started: Instant,
     },
-    /// The last scan, of `root`, has ended (complete, or cut short by a cancel or stall), after
-    /// running for `took`.
+    /// The last scan, of `root`, has ended (complete, or cut short by a cancel or stall) with its
+    /// root read, after running for `took`. One that ended without has nothing to show: the phase
+    /// goes back to `AwaitingPath` instead.
     Done { root: PathBuf, took: Duration },
 }
 
@@ -187,6 +188,11 @@ impl AppState {
 /// in a syscall on a dead network mount.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a scan may take to open its root (canonicalize, stat, open) before the page goes back
+/// to the picker. A dead network mount can block those calls for good, before the scan's own stall
+/// detection starts. As long as that detection's timeout, for a disk that is only waking up.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let rt = tokio::runtime::Runtime::new()?;
@@ -207,20 +213,19 @@ async fn run_server(args: Args) -> Result<()> {
         no_open,
         wait,
     } = args;
-    // Canonicalize once, here at the boundary, and fail fast: a mistyped path is an error on the
-    // command line, not a browser tab that opens on the volume picker.
+    // Canonicalize once, here at the boundary, and fail fast: a path that can't be scanned is an
+    // error on the command line, not a browser tab that opens on the volume picker. A file, or a
+    // folder that can't be listed, canonicalizes fine, so the root must open as a folder too.
     let phase = match path {
         None => ScanPhase::AwaitingPath,
         Some(path) => ScanPhase::AwaitingStart {
-            root: std::fs::canonicalize(&path).with_context(|| format!("can't scan {}", path.display()))?,
+            root: std::fs::canonicalize(&path)
+                .and_then(|root| std::fs::read_dir(&root).map(|_| root))
+                .with_context(|| format!("can't scan {}", path.display()))?,
         },
     };
 
     let state = Arc::new(AppState::new(phase, scan.into()));
-
-    if !wait {
-        start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart { .. }));
-    }
 
     if Assets::get("index.html").is_none() {
         eprintln!("Warning: frontend bundle not embedded — run `trunk build` before building; the GUI will not load.");
@@ -243,6 +248,11 @@ async fn run_server(args: Args) -> Result<()> {
     // connections from other hosts on the network.
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let actual_port = listener.local_addr()?.port();
+
+    // Once there is a server to show it: a port that can't be had fails the start before any scan.
+    if !wait {
+        start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart { .. }));
+    }
     eprintln!("Listening on http://localhost:{actual_port}");
 
     // Without waiting for the browser: a launcher can take a while to return (xdg-open, `start`),
@@ -284,13 +294,15 @@ async fn serve_until_stopped(
 /// tab's first viewport, or before a scan's root arrives. Nor when it would show what the tab's last
 /// layout did.
 fn update_tab(state: &AppState, view: &mut ViewConfig) -> (Option<Bytes>, Option<Bytes>) {
+    let tree = state.scan.tree.read();
+    // The phase too under the tree's lock, under which the relay ends a scan: so a layout of the
+    // final tree is never one marked as still running.
     let (scan_done, scan_time) = match *state.scan.phase.lock() {
         ScanPhase::Running { started, .. } => (false, started.elapsed()),
         ScanPhase::Done { took, .. } => (true, took),
         ScanPhase::AwaitingPath | ScanPhase::AwaitingStart { .. } => return (None, None),
     };
 
-    let tree = state.scan.tree.read();
     // Checked under the lock the layout is computed under, so a page always hears of a new scan
     // before it gets a layout of it (`ScanStart` clears the page).
     let scan_start = (view.scan != tree.scans).then(|| {
@@ -400,7 +412,7 @@ fn start_scan(state: &Arc<AppState>, root: Option<PathBuf>, allowed: impl FnOnce
     let (tx, rx) = std::sync::mpsc::channel::<ScanEvent>();
     let relay_state = Arc::clone(state);
     let relay_cancel = Arc::clone(&cancel);
-    tokio::task::spawn_blocking(move || relay_scan(&relay_state, &rx, &relay_cancel));
+    tokio::task::spawn_blocking(move || relay_scan(&relay_state, &rx, &relay_cancel, OPEN_TIMEOUT));
 
     let options = state.scan.options;
     tokio::task::spawn_blocking(move || {
@@ -412,9 +424,15 @@ fn start_scan(state: &Arc<AppState>, root: Option<PathBuf>, allowed: impl FnOnce
 }
 
 /// Apply one scan's events to the shared tree until it ends, then end its phase: `Done` at
-/// `ScanDone`, or, if the scanner stops without one, back to the picker when it never started (it
-/// couldn't open the root) and `Done` with what it found when it did (it panicked).
-fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cancel: &Arc<AtomicBool>) {
+/// `ScanDone`, or, if the scanner stops without one, `Done` with what it found (it panicked). A scan
+/// that ends without its root read has nothing to show, and goes back to the picker: one that
+/// couldn't open the root, took longer than `open_timeout` to, or stalled reading it.
+fn relay_scan(
+    state: &AppState,
+    rx: &std::sync::mpsc::Receiver<ScanEvent>,
+    cancel: &Arc<AtomicBool>,
+    open_timeout: Duration,
+) {
     // Only this scan's relay may end its phase. `next` gets its root and how long it ran.
     let end_phase = |next: fn(PathBuf, Duration) -> ScanPhase| {
         let mut phase = state.scan.phase.lock();
@@ -433,20 +451,54 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
         true
     };
     let ended = |root, took| ScanPhase::Done { root, took };
+    let to_picker = || {
+        if end_phase(|_, _| ScanPhase::AwaitingPath) {
+            state.picker.send_replace(());
+        }
+    };
+
+    // The scanner's first event, or its failure, once it has opened the root. A root it is still
+    // opening after `open_timeout` is given up on: whatever the scanner sends if it ever gets going
+    // goes nowhere, and the cancel stops it.
+    let first = match rx.recv_timeout(open_timeout) {
+        Ok(event) => event,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "Gave up on a scan still opening its root after {}s",
+                open_timeout.as_secs()
+            );
+            cancel.store(true, Ordering::Relaxed);
+            return to_picker();
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return to_picker(),
+    };
 
     // Reused across iterations so the per-batch drain doesn't reallocate each wakeup.
     let mut events = Vec::new();
     let mut started = false;
-    while let Ok(event) = rx.recv() {
+    let mut next = Some(first);
+    while let Some(event) = next.take().or_else(|| rx.recv().ok()) {
         events.push(event);
         events.extend(rx.try_iter());
 
         let mut tree = state.scan.tree.write();
+        // A new scan's `ScanStart` replaces the tree: the old one's nodes are freed after the lock is
+        // released, as millions of names take tens of milliseconds to free.
+        let mut replaced = Vec::new();
         for event in events.drain(..) {
-            started |= matches!(event, ScanEvent::ScanStart { .. });
+            if matches!(event, ScanEvent::ScanStart { .. }) {
+                started = true;
+                replaced.push(std::mem::take(&mut tree.nodes));
+            }
             let done = matches!(event, ScanEvent::ScanDone { .. });
             tree.apply(event);
             if done {
+                // A scan that stalled on its root has nothing to show: back to the picker, as for
+                // one that couldn't open it.
+                if tree.root_id.is_none() {
+                    drop(tree);
+                    return to_picker();
+                }
                 // Under the tree lock, so no tab lays out the final tree still marked as running.
                 end_phase(ended);
                 drop(tree);
@@ -455,17 +507,19 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
             }
         }
         drop(tree);
+        drop(replaced);
         state.tree_changed();
     }
 
     // The scanner stopped without `ScanDone`, so the tree isn't marked complete: the page says so.
-    if started {
+    // `started` too: before this scan's `ScanStart`, the root is the previous scan's.
+    if started && state.scan.tree.read().root_id.is_some() {
         state.scan.tree.write().recompute_totals();
         if end_phase(ended) {
             state.tree_changed();
         }
-    } else if end_phase(|_, _| ScanPhase::AwaitingPath) {
-        state.picker.send_replace(());
+    } else {
+        to_picker();
     }
 }
 
@@ -660,9 +714,18 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    // A tab that joins during or after a scan is shown it without being told it started.
+    // A tab that joins during or after a scan is shown it without being told it started, once there
+    // is something to show. One that joins before the scan's root has arrived (a Windows drive's MFT
+    // takes seconds to read) is told, so it shows the scan running instead of a blank page.
     let mut view = ViewConfig {
-        scan: state.scan.tree.read().scans,
+        scan: {
+            let tree = state.scan.tree.read();
+            if tree.root_id.is_some() {
+                tree.scans
+            } else {
+                tree.scans.wrapping_sub(1)
+            }
+        },
         ..ViewConfig::default()
     };
     // Whether the tree or the view changed since the last layout sent.
@@ -841,7 +904,7 @@ mod tests {
             tx.send(event).unwrap();
         }
         drop(tx);
-        relay_scan(&state, &rx, &cancel);
+        relay_scan(&state, &rx, &cancel, OPEN_TIMEOUT);
         state
     }
 
@@ -960,6 +1023,56 @@ mod tests {
         assert!((5_000..6_000).contains(&took), "{took}ms");
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(first_layout(&state).scan_ms, took, "a later tab sees the same time");
+    }
+
+    /// A scan that ends before reading its root (it stalled on it, or the scanner stopped) has
+    /// nothing to show, so every tab goes back to the picker, where a new tab starts too.
+    #[test]
+    fn a_scan_that_ends_without_its_root_goes_back_to_the_picker() {
+        for ending in [Some(ScanOutcome::Stalled), None] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let running = ScanPhase::Running {
+                root: "/root".into(),
+                cancel: Arc::clone(&cancel),
+                started: Instant::now(),
+            };
+            let state = AppState::new(running, ScanOptions::default());
+            let picker = state.picker.subscribe();
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(ScanEvent::ScanStart { root: "/root".into() }).unwrap();
+            if let Some(outcome) = ending {
+                tx.send(ScanEvent::ScanDone { outcome }).unwrap();
+            }
+            drop(tx);
+            relay_scan(&state, &rx, &cancel, OPEN_TIMEOUT);
+            assert!(
+                matches!(*state.scan.phase.lock(), ScanPhase::AwaitingPath),
+                "{ending:?}"
+            );
+            assert!(picker.has_changed().unwrap(), "{ending:?}");
+        }
+    }
+
+    /// A scanner stuck opening its root (a dead network mount) is given up on, so another path can
+    /// be scanned.
+    #[test]
+    fn a_scan_stuck_opening_its_root_goes_back_to_the_picker() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let running = ScanPhase::Running {
+            root: "/dead".into(),
+            cancel: Arc::clone(&cancel),
+            started: Instant::now(),
+        };
+        let state = AppState::new(running, ScanOptions::default());
+        let picker = state.picker.subscribe();
+        let (_stuck, rx) = std::sync::mpsc::channel();
+        relay_scan(&state, &rx, &cancel, Duration::from_millis(100));
+        assert!(matches!(*state.scan.phase.lock(), ScanPhase::AwaitingPath));
+        assert!(picker.has_changed().unwrap());
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the stuck scanner stops if it ever gets going"
+        );
     }
 
     /// Shutdown doesn't wait for ever on a request stuck in a syscall.

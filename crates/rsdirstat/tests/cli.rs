@@ -95,26 +95,65 @@ fn version_flags_print_name_and_version() {
     }
 }
 
-/// A path that can't be scanned is an error on the command line, not a server that starts and
-/// sends the browser to the volume picker.
-#[test]
-fn gui_rejects_an_unscannable_path_before_starting() {
+/// Assert that the GUI server rejects `path` on the command line instead of starting and sending
+/// the browser to the volume picker.
+fn assert_gui_rejects(path: &Path) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rsdirstat"))
-        .args(["--no-open", "--port", "0", "/nonexistent/rsdirstat-cli-test"])
+        .args(["--no-open", "--port", "0"])
+        .arg(path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     let Some(status) = common::wait_for_exit(&mut child, Duration::from_secs(10)) else {
         let _ = child.kill();
-        panic!("the server started instead of rejecting the path");
+        panic!("the server started instead of rejecting {}", path.display());
     };
     assert!(!status.success());
     let mut stderr = String::new();
     std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
     assert!(
-        stderr.contains("can't scan /nonexistent/rsdirstat-cli-test"),
+        stderr.contains(&format!("can't scan {}", path.display())),
         "stderr: {stderr}"
     );
     assert!(!stderr.contains("Listening on"), "stderr: {stderr}");
+}
+
+/// A path that can't be scanned is an error on the command line, not a server that starts and
+/// sends the browser to the volume picker.
+#[test]
+fn gui_rejects_an_unscannable_path_before_starting() {
+    assert_gui_rejects(Path::new("/nonexistent/rsdirstat-cli-test"));
+}
+
+/// A file canonicalizes like any path, but isn't a folder to scan.
+#[test]
+fn gui_rejects_a_file_before_starting() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("notes.txt");
+    fs::write(&file, "hello").unwrap();
+    assert_gui_rejects(&file);
+}
+
+/// Nor is a folder that can't be listed.
+#[cfg(unix)]
+#[test]
+fn gui_rejects_an_unreadable_folder_before_starting() {
+    use std::os::unix::fs::PermissionsExt;
+    /// Lists `locked` again, even when the test fails, so its temporary folder can be removed.
+    struct Unlock<'a>(&'a Path);
+    impl Drop for Unlock<'_> {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let _unlock = Unlock(&locked);
+    // Root lists it anyway.
+    if fs::read_dir(&locked).is_err() {
+        assert_gui_rejects(&locked);
+    }
 }
