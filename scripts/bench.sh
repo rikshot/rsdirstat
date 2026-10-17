@@ -63,14 +63,16 @@ cp target/release/rsdirstat-cli "$out/"
     echo "date: $(date -u +%FT%TZ)"
     echo "system: $(uname -srm)"
     echo "cpus: $cpus"
-    echo "cache: ${cold:+cold}${cold:-warm}"
+    echo "cache: $([[ -n $cold ]] && echo cold || echo warm)"
 } >"$out/env.txt"
 
 # Without a shell (-N), hyperfine splits commands into words itself, like a POSIX shell would.
-quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+# With sed rather than ${1//...}, whose quote handling differs in macOS's bash 3.2.
+quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 for dir in "$@"; do
     name=$(printf '%s' "$dir" | tr -c 'A-Za-z0-9._-' _)
-    hyperfine -N "${warm[@]}" "${runs[@]}" \
+    # `${runs[@]+...}`: bash before 4.4 calls an empty array unbound under `set -u`.
+    hyperfine -N "${warm[@]}" ${runs[@]+"${runs[@]}"} \
         --parameter-list threads "$threads" \
         --command-name "{threads} threads" \
         --export-json "$out/$name.json" \

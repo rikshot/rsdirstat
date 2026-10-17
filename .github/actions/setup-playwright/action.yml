@@ -8,16 +8,19 @@ runs:
   using: composite
   steps:
     # Each playwright-rs release bundles one driver build, so its version (read from the lockfile,
-    # never repeated here) keys the browser cache and pins the CLI below.
+    # never repeated here) keys the browser cache and pins the CLI below. So does the runner image
+    # (ImageOS, e.g. ubuntu24): browsers built for an older one, restored onto a newer one, count as
+    # installed and then fail to launch on the libraries it no longer has.
     - id: version
       shell: bash
       run: |
         version=$(tr -d '\r' < Cargo.lock | grep -A1 '^name = "playwright-rs"$' | sed -n 's/^version = "\(.*\)"$/\1/p')
         test -n "$version"
         echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "image=${ImageOS:-unknown}" >> "$GITHUB_OUTPUT"
     - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        key: playwright-rs-${{ steps.version.outputs.version }}-${{ runner.os }}
+        key: playwright-rs-${{ steps.version.outputs.version }}-${{ runner.os }}-${{ steps.version.outputs.image }}
         path: |
           ~/.cache/ms-playwright
           ~/Library/Caches/ms-playwright

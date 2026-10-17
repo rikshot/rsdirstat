@@ -295,7 +295,7 @@ async fn breadcrumb_click_navigates_back(page: &playwright_rs::Page) {
 
     let back_text = text(page, "#crumbs").await;
     assert!(
-        back_text.len() <= deep_text.len(),
+        back_text.len() < deep_text.len(),
         "breadcrumb back: deep={deep_text}, back={back_text}"
     );
 }
@@ -303,12 +303,16 @@ async fn breadcrumb_click_navigates_back(page: &playwright_rs::Page) {
 async fn picker_volume_click_starts_scan(page: &playwright_rs::Page) {
     page.locator(".volume-card:first-child").click(None).await.unwrap();
 
-    // Just wait for the treemap view to appear (the scan's `ScanStart` shows it at once, before
-    // the scan produces anything — safe for CI whatever the disk's size).
-    page.locator("#treemap-view")
-        .wait_for(visible())
-        .await
-        .expect("treemap view did not appear after clicking volume");
+    // The page shows the treemap view as soon as a card is clicked, so wait for what only the
+    // server's `ScanStart` brings: the scan's running time in the status bar (or, for a quick scan,
+    // its summary). It comes before the scan produces anything, so this is safe for CI whatever the
+    // disk's size.
+    page.wait_for_function(
+        "() => /Scanning|dirs/.test(document.querySelector('#status')?.textContent ?? '')",
+        WaitForFunctionOptions::default().timeout(10_000.0),
+    )
+    .await
+    .expect("clicking a volume should start a scan");
 }
 
 async fn picker_has_volume_details(page: &playwright_rs::Page) {

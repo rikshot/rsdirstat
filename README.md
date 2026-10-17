@@ -72,8 +72,8 @@ embedded — a single self-contained binary, no extra files needed) and **`rsdir
 ```sh
 rsdirstat                 # no path: pick a volume in the browser, then scan
 rsdirstat [path]          # scan a path, opens the treemap in your browser
-rsdirstat --all [path]    # cross filesystem boundaries
-rsdirstat --threads 16 [path]  # scan with 16 threads (default: one per CPU; two on Linux; 4 on macOS)
+rsdirstat --all [path]    # cross filesystem boundaries (not into /proc or /sys; on Windows, not into volumes mounted in folders)
+rsdirstat --threads 16 [path]  # scan with 16 threads (default: one per CPU; two per CPU on Linux; at most 4 on macOS)
 rsdirstat --no-mft [path]      # Windows: walk the folders even as administrator
 rsdirstat --port 8080 [path]   # fixed port (default: random)
 rsdirstat --no-open [path]     # don't auto-open the browser
@@ -119,8 +119,8 @@ draw are grouped into one *(other files)* block per folder.
 rsdirstat-cli [path]          # top 10 directories by size
 rsdirstat-cli --files [path]  # top 10 files by size
 rsdirstat-cli --top 20 [path] # show more results
-rsdirstat-cli --all [path]    # cross filesystem boundaries
-rsdirstat-cli --threads 16 [path] # scan with 16 threads (default: one per CPU; two on Linux; 4 on macOS)
+rsdirstat-cli --all [path]    # cross filesystem boundaries (not into /proc or /sys; on Windows, not into volumes mounted in folders)
+rsdirstat-cli --threads 16 [path] # scan with 16 threads (default: one per CPU; two per CPU on Linux; at most 4 on macOS)
 rsdirstat-cli --no-mft [path]     # Windows: walk the folders even as administrator
 ```
 
@@ -159,7 +159,7 @@ The test suite runs with [cargo-nextest](https://nexte.st). The browser tests (`
 
 ```sh
 cargo install --locked cargo-nextest trunk
-cargo install --locked playwright-rs@0.19.0 --features cli   # the version in Cargo.lock
+cargo install --locked playwright-rs@0.20.1 --features cli   # the version in Cargo.lock
 playwright-rs install chromium firefox webkit   # add --with-deps on Linux
 
 cargo nextest run   # the browser tests build the frontend first if it's missing or stale

@@ -81,9 +81,16 @@ fn frontend_is_fresh(root: &Path) -> bool {
     else {
         return false;
     };
-    ["crates/wasm", "crates/protocol/src", "Trunk.toml", "Cargo.lock"]
-        .iter()
-        .all(|input| newest_mtime(&root.join(input)) <= built)
+    [
+        "crates/wasm",
+        "crates/protocol/src",
+        "crates/protocol/Cargo.toml",
+        "Cargo.toml",
+        "Trunk.toml",
+        "Cargo.lock",
+    ]
+    .iter()
+    .all(|input| newest_mtime(&root.join(input)) <= built)
 }
 
 fn newest_mtime(path: &Path) -> SystemTime {
@@ -146,10 +153,16 @@ impl TestServer {
             }
         });
 
-        let url = rx
+        // The guard first, so a server that never prints its URL is stopped (its `Drop`) rather
+        // than left running: a `Child` dropped on its own keeps the process alive.
+        let mut server = TestServer {
+            child,
+            url: String::new(),
+        };
+        server.url = rx
             .recv_timeout(Duration::from_secs(10))
             .expect("server did not print its URL within 10s");
-        TestServer { child, url }
+        server
     }
 
     pub fn is_running(&mut self) -> bool {
@@ -294,9 +307,10 @@ pub async fn assert_no_layout_after(page: &playwright_rs::Page, after: u64, mess
     assert!(arrived.is_err(), "{message}");
 }
 
-/// Directory where Playwright failure traces are written. Only tests that fail
-/// populate it; CI uploads it as an artifact so a red cross-OS browser run is
-/// debuggable postmortem (DOM snapshots + screenshots + console/network timeline).
+/// Directory where Playwright failure traces are written. Only failed attempts
+/// populate it, including ones a nextest retry then passed; CI uploads it as an
+/// artifact so a red or flaky cross-OS browser run is debuggable postmortem
+/// (DOM snapshots + screenshots + console/network timeline).
 pub fn trace_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/traces")
 }
@@ -316,8 +330,10 @@ pub fn trace_label(browser: &str, name: &str) -> String {
 /// Run `body` with Playwright tracing active on `page`'s context, saving the
 /// trace to `tests/traces/<label>.zip` only if the body fails — either by
 /// panicking (an assertion) or by returning `Err`. On success the trace is
-/// discarded. Panics are re-raised afterwards so the test still fails as usual.
-/// This mirrors Playwright's own `retain-on-failure` trace policy.
+/// discarded, but a zip an earlier failed attempt saved is kept: a test that
+/// fails and then passes on a retry is the flake whose trace is worth having.
+/// Panics are re-raised afterwards so the test still fails as usual. This
+/// mirrors Playwright's own `retain-on-failure` trace policy.
 ///
 /// Tracing is best-effort: if it can't be started (e.g. an unexpected driver
 /// state) the body still runs untraced, so tracing never turns a green test red.
@@ -367,10 +383,9 @@ async fn trace_stop(tracing: Option<playwright_rs::Tracing>, label: &str, failed
     let Some(tracing) = tracing else { return };
     let path = trace_dir().join(format!("{label}.zip"));
     if !failed {
-        let _ = tracing.stop(None).await; // discard in-memory trace
-        // Under `nextest` retries a flaky test can fail then pass; drop any zip an
-        // earlier failed attempt left behind so a passed test never ships a trace.
-        let _ = std::fs::remove_file(&path);
+        // Discard the in-memory trace. A zip an earlier attempt of this case left is kept: under
+        // nextest's retries that is a flaky test's failure, which CI uploads (see ci.yml).
+        let _ = tracing.stop(None).await;
         return;
     }
     let _ = std::fs::create_dir_all(trace_dir());

@@ -4,7 +4,6 @@ slow-timeout = { period = "30s", terminate-after = 3 }
 [[profile.default.overrides]]
 filter = 'test(/^visual/)'
 slow-timeout = { period = "120s", terminate-after = 2 }
-threads-required = 1
 
 # Retries are for the browser tests only: they drive three real browsers on shared CI runners.
 # Everything else must pass first time, so a flaky unit or scanner test fails CI instead of
@@ -13,11 +12,13 @@ threads-required = 1
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 # The default profile's overrides apply here too, after these, so the visual tests keep their
-# timeout and their thread to themselves.
+# timeout.
 [[profile.ci.overrides]]
 filter = 'test(/^visual/)'
 retries = 1
 
+# Not the e2e binary's tests that drive the server without a browser: stopping it, its automatic
+# shutdown and the requests it refuses must pass first time like any other.
 [[profile.ci.overrides]]
-filter = 'test(/^e2e/)'
+filter = 'test(/^e2e/) - test(/^e2e_(stop_mid_scan_exits_promptly|server_exits_after_its_last_tab_closes|requests_for_another_host_are_refused|cross_site_api_requests_are_refused)$/)'
 retries = 2

@@ -21,10 +21,16 @@ if [[ -z $run ]]; then
     fi
 fi
 
+# All three first, so a download that fails leaves the committed baselines as they were.
+downloads=$(mktemp -d)
+trap 'rm -rf "$downloads"' EXIT
+for os in linux macos windows; do
+    gh run download "$run" --name "visual-baselines-$os" --dir "$downloads/$os"
+done
 for os in linux macos windows; do
     dir=crates/rsdirstat/tests/snapshots/$os
     rm -f "$dir"/*.png
-    gh run download "$run" --name "visual-baselines-$os" --dir "$dir"
+    cp "$downloads/$os"/*.png "$dir"/
 done
 
 echo "Downloaded the baselines from run $run. Review them before committing:"
