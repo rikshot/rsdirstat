@@ -299,7 +299,7 @@ pub struct DirJob<H> {
     pub name: String,
     id: u64,
     parent_id: u64,
-    /// Full path, for opening children by path (Windows) and for reporting a stuck directory.
+    /// Full path, for reporting a directory that is stuck or can't be read.
     path: String,
 }
 
@@ -349,9 +349,8 @@ where
         name: root_name(&root),
         id,
         parent_id: 0,
-        // On Windows children are opened by path, built from this one. It keeps its
-        // extended-length (\\?\) prefix: without it CreateFileW fails for paths over MAX_PATH
-        // (260), silently dropping deep subtrees.
+        // For reports of a directory that is stuck or can't be read; the platforms open
+        // directories through their own handles.
         path: root.display().to_string(),
     };
     let shared = Arc::new(Shared {

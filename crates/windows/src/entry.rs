@@ -41,7 +41,8 @@ pub enum EntryKind {
     /// A file contributing `size` bytes — 0 for an online-only (dehydrated) cloud placeholder.
     File { size: u64 },
     /// A symlink / junction / mount point (a name surrogate): neither counted nor traversed, to
-    /// avoid double-counting and traversal loops.
+    /// avoid double-counting and traversal loops. A volume mounted in a folder carries the junction's
+    /// tag, so it is skipped too, even with `--all`.
     Skip,
 }
 

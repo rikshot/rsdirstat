@@ -3,7 +3,9 @@
 //! the whole volume without opening a single folder. On Windows that is several times faster than the
 //! folder walk, whose cost is Windows' own work per folder; it needs administrator rights to read the
 //! volume. This module parses the records `mft` reads and turns them into the scan's events,
-//! counting what the folder walk counts.
+//! counting what the folder walk counts. Except where the walk can't look: the MFT has every folder,
+//! including ones only the system may open (`System Volume Information`, which holds the shadow
+//! copies), so a drive read this way can total more than its walk.
 
 use std::path::Path;
 use std::sync::mpsc::Sender;
@@ -346,18 +348,24 @@ impl Mft {
             (folder_place != u32::MAX && references[folder_place as usize] == parent).then_some(folder_place as usize)
         };
 
-        // Each file goes in the first folder that has it under the root: a hardlink counts once.
+        // Each file goes in the first folder that has it under the root: a hardlink counts once. Its
+        // other folders under the root are as new as it, as in the folder walk.
         let mut files = vec![DirFiles::default(); order.len()];
         for file in self.records.iter_mut().skip(FIRST_USER_RECORD).flatten() {
             let EntryKind::File { size } = file.kind() else {
                 continue;
             };
-            let found = file
-                .names
-                .iter_mut()
-                .find_map(|(parent, name)| Some((placed(*parent)?, name)));
-            let Some((folder_place, name)) = found else { continue };
-            files[folder_place].add(std::mem::take(name), size, file.mtime);
+            let mut counted = false;
+            for (parent, name) in &mut file.names {
+                let Some(folder_place) = placed(*parent) else { continue };
+                let folder = &mut files[folder_place];
+                if counted {
+                    folder.mtime = folder.mtime.max(file.mtime);
+                } else {
+                    folder.add(std::mem::take(name), size, file.mtime);
+                    counted = true;
+                }
+            }
         }
 
         for (folder_place, (&number, DirFiles { mtime, files })) in order.iter().zip(files).enumerate() {

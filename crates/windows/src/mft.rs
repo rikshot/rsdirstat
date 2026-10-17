@@ -109,13 +109,14 @@ impl Volume {
         // Each reader takes the next read, parses its records and hands them over; this thread
         // gathers them as they come. An error ends the gathering, which stops the readers.
         let next = AtomicUsize::new(0);
+        let torn = AtomicUsize::new(0);
         let (records_tx, records_rx) = mpsc::channel::<Result<Vec<(usize, Record)>>>();
         let mut mft = std::thread::scope(|scope| -> Result<Mft> {
             for _ in 0..threads.clamp(1, MAX_READERS) {
                 let records_tx = records_tx.clone();
-                let (volume, reads, next) = (&volume, &reads, &next);
+                let (volume, reads, next, torn) = (&volume, &reads, &next, &torn);
                 scope.spawn(move || {
-                    if let Err(e) = read_records(volume, reads, next, record_size, cancel, &records_tx) {
+                    if let Err(e) = read_records(volume, reads, next, record_size, cancel, torn, &records_tx) {
                         let _ = records_tx.send(Err(e));
                     }
                 });
@@ -136,7 +137,16 @@ impl Volume {
         } else if mft.send_scan(scan.root(), root_reference, volume_serial as u64, scan.tx(), |file| {
             reparse_tag_by_id(root, file as i64)
         }) {
-            ScanOutcome::Complete
+            match torn.load(Ordering::Relaxed) {
+                0 => ScanOutcome::Complete,
+                // What a folder's record held, and so everything under it, is missing.
+                torn => {
+                    eprintln!(
+                        "{torn} records of the MFT were being rewritten each time they were read, and are left out"
+                    );
+                    ScanOutcome::Incomplete
+                }
+            }
         } else {
             bail!("the scan root isn't in its volume's MFT");
         };
@@ -168,8 +178,8 @@ fn volume_path(handle: &OwnedHandle) -> Result<String> {
     }
 }
 
-/// Where the MFT's first `valid` bytes lie on `volume`, as reads of up to `CHUNK` bytes: (the first
-/// record they hold, where on the disk, how many bytes). Each read is whole clusters.
+/// Where the MFT's first `valid` bytes lie on `volume`, as reads of up to `CHUNK` bytes: (where in
+/// the MFT they start, in bytes; where on the disk; how many bytes). Each read is whole clusters.
 fn mft_reads(volume: &str, cluster: usize, valid: usize) -> Result<Vec<(usize, u64, usize)>> {
     let mft = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
@@ -205,14 +215,16 @@ fn mft_reads(volume: &str, cluster: usize, valid: usize) -> Result<Vec<(usize, u
 }
 
 /// One reader: take reads from `reads` until none are left, the scan is cancelled or the records stop
-/// being gathered, and send each read's parsed records. Its own handle to `volume`, unbuffered, so
-/// the reads run side by side and don't fill Windows' cache.
+/// being gathered, and send each read's parsed records, counting in `torn` those it had to leave
+/// out. Its own handle to `volume`, unbuffered, so the reads run side by side and don't fill
+/// Windows' cache.
 fn read_records(
     volume: &str,
     reads: &[(usize, u64, usize)],
     next: &AtomicUsize,
     record_size: usize,
     cancel: &AtomicBool,
+    torn: &AtomicUsize,
     records_tx: &Sender<Result<Vec<(usize, Record)>>>,
 ) -> Result<()> {
     let mut device = OpenOptions::new()
@@ -238,6 +250,11 @@ fn read_records(
                 break;
             }
         }
+        let still_torn = buffer[..length]
+            .chunks_exact(record_size)
+            .filter(|record| is_torn(record))
+            .count();
+        torn.fetch_add(still_torn, Ordering::Relaxed);
         let first = mft_offset / record_size;
         let records = buffer[..length]
             .chunks_exact_mut(record_size)
