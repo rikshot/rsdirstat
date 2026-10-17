@@ -119,22 +119,30 @@ pub enum ColorMode {
 /// `bytes` for people to read, in binary units to three significant figures: "512 B", "1.00 KiB",
 /// "15.0 KiB", "500 KiB". The page and `rsdirstat-cli` both show sizes this way.
 pub fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
     let mut value = bytes as f64;
-    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut index = 0usize;
-    while value >= 1024.0 && index < units.len() - 1 {
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
         value /= 1024.0;
-        index += 1;
+        unit += 1;
     }
-    if index == 0 {
-        format!("{value:.0} {}", units[index])
-    } else if value < 10.0 {
-        format!("{value:.2} {}", units[index])
-    } else if value < 100.0 {
-        format!("{value:.1} {}", units[index])
+    // By the value as it will be rounded: 1023.7 KiB is "1.00 MiB", not "1024 KiB", and 9.996 KiB
+    // is "10.0 KiB", not "10.00 KiB".
+    if value.round() >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    let decimals = if (value * 100.0).round() < 1000.0 {
+        2
+    } else if (value * 10.0).round() < 1000.0 {
+        1
     } else {
-        format!("{value:.0} {}", units[index])
-    }
+        0
+    };
+    format!("{value:.decimals$} {}", UNITS[unit])
 }
 
 /// A mounted volume, as the `/volumes` endpoint lists them (`encode_list`).
@@ -530,9 +538,22 @@ mod tests {
     #[test]
     fn format_size_units() {
         assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(1023), "1023 B");
         assert_eq!(format_size(1024 * 1024), "1.00 MiB");
         assert_eq!(format_size(15 * 1024), "15.0 KiB");
         assert_eq!(format_size(500 * 1024), "500 KiB");
+        assert_eq!(format_size(1 << 50), "1.00 PiB");
+    }
+
+    /// Three significant figures of the value as rounded, so rounding up crosses into the next
+    /// decade or unit instead of printing a fourth figure.
+    #[test]
+    fn format_size_rounds_into_the_next_decade_or_unit() {
+        assert_eq!(format_size(10_235), "10.0 KiB");
+        assert_eq!(format_size(102_350), "100 KiB");
+        assert_eq!(format_size(1_048_575), "1.00 MiB");
+        assert_eq!(format_size(1_073_717_248), "1.00 GiB");
+        assert_eq!(format_size(10_189), "9.95 KiB");
     }
 
     #[test]

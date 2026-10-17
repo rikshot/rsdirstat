@@ -3,6 +3,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -100,17 +101,15 @@ fn main() -> Result<()> {
                 .into_sorted_vec()
                 .into_iter()
                 .map(|Reverse((size, parent, name))| (tree.full_path(parent).unwrap_or_default().join(name), size)),
-        );
+        )
     } else {
         let mut dirs: Vec<(u64, u64)> = tree.nodes.iter().map(|(&id, node)| (id, node.size)).collect();
         top_n(&mut dirs, top, |&(_, size)| size);
         print_entries(
             dirs.iter()
                 .map(|&(id, size)| (tree.full_path(id).unwrap_or_default(), size)),
-        );
+        )
     }
-
-    Ok(())
 }
 
 /// Keep only the `n` entries with the largest `key`, sorted largest first.
@@ -125,10 +124,18 @@ fn top_n<T>(items: &mut Vec<T>, n: usize, key: impl Fn(&T) -> u64) {
     items.sort_unstable_by_key(|item| Reverse(key(item)));
 }
 
-fn print_entries(entries: impl Iterator<Item = (PathBuf, u64)>) {
+/// Print `entries`, stopping without complaint once whatever reads the output has stopped reading
+/// it (`rsdirstat-cli | head`): `println!` would panic there.
+fn print_entries(entries: impl Iterator<Item = (PathBuf, u64)>) -> Result<()> {
     let rows: Vec<(String, PathBuf)> = entries.map(|(path, size)| (format_size(size), path)).collect();
     let width = rows.iter().map(|(size, _)| size.len()).max().unwrap_or(0);
-    for (size, path) in &rows {
-        println!("{size:>width$}  {}", path.display());
+    let mut out = std::io::stdout().lock();
+    let written = rows
+        .iter()
+        .try_for_each(|(size, path)| writeln!(out, "{size:>width$}  {}", path.display()))
+        .and_then(|()| out.flush());
+    match written {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        written => Ok(written?),
     }
 }
