@@ -220,7 +220,9 @@ pub fn cpu_count() -> usize {
 /// What the user chose about a scan.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScanOptions {
-    /// Descend into other filesystems mounted inside the scanned tree.
+    /// Descend into other filesystems mounted inside the scanned tree. Not into the Linux kernel's
+    /// pseudo filesystems (/proc, /sys, ...), whose files hold nothing on any disk; and on Windows,
+    /// where a volume mounted in a folder is a reparse point like a junction, not into those either.
     pub cross_filesystems: bool,
     /// How many worker threads to scan with, instead of the platform's default.
     pub threads: Option<NonZeroUsize>,
