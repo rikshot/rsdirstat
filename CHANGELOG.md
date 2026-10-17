@@ -75,8 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - macOS no longer fetches a cloud folder's contents from the network to list it.
 - The volume picker:
   - On macOS it lists only real volumes, sized correctly past 16 TiB.
-  - On Linux it keeps ZFS datasets and composefs roots, and a dead network mount no longer holds
-    up the list.
+  - On Linux it keeps ZFS datasets and composefs roots, leaves out bind mounts of a folder (such
+    as the Firefox snap's `host-hunspell` on Ubuntu), and a dead network mount no longer holds up
+    the list.
   - Windows no longer shows a "There is no disk in the drive" box for an empty card reader.
   - Used space no longer counts the blocks a file system reserves for the superuser.
 - Right-click reveal on Windows works for paths given on the command line, and for paths with

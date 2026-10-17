@@ -15,6 +15,8 @@ use rsdirstat_core::scan::{
     DirJob, DirSink, ScanEvent, ScanOptions, Started, UnixDir, cpu_count, node_id, open_root, run_scan,
 };
 
+use crate::mountinfo::Mount;
+
 /// What a file's entry needs: its size, its mtime, and its link count and inode (for hardlink
 /// dedup).
 const FILE_STATX_MASK: u32 = STATX_SIZE | STATX_MTIME | STATX_NLINK | STATX_INO;
@@ -114,33 +116,16 @@ struct PseudoMounts {
 }
 
 impl PseudoMounts {
-    /// The pseudo filesystems mounted now, from /proc/self/mountinfo: by name, so asking costs no
-    /// call into any mounted filesystem, which on a network share whose server is gone would block.
+    /// The pseudo filesystems mounted now (see `mountinfo`).
     fn mounted() -> Self {
         let mut mounts = Self::default();
         let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
             return mounts;
         };
-        for line in table.lines() {
-            // `36 35 0:5 / /proc rw,nosuid shared:13 - proc proc rw`: the id, the parent's, the
-            // device, ..., optional fields, then `-` and the filesystem type.
-            let fields: Vec<&str> = line.split(' ').collect();
-            let Some(dash) = fields.iter().position(|&field| field == "-") else {
-                continue;
-            };
-            if !fields
-                .get(dash + 1)
-                .is_some_and(|kind| PSEUDO_FILESYSTEMS.contains(kind))
-            {
-                continue;
-            }
-            if let Some(id) = fields.first().and_then(|id| id.parse().ok()) {
-                mounts.ids.insert(id);
-            }
-            if let Some((major, minor)) = fields.get(2).and_then(|device| device.split_once(':'))
-                && let (Ok(major), Ok(minor)) = (major.parse(), minor.parse())
-            {
-                mounts.devices.insert(libc::makedev(major, minor));
+        for mount in table.lines().filter_map(Mount::parse) {
+            if PSEUDO_FILESYSTEMS.contains(&mount.fs_type) {
+                mounts.ids.insert(mount.id);
+                mounts.devices.insert(libc::makedev(mount.device.0, mount.device.1));
             }
         }
         mounts

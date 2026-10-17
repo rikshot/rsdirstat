@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use rsdirstat_core::volume::VolumeInfo;
 
+use crate::mountinfo::Mount;
+
 /// How long the picker waits for the mounts to report their sizes. One of a network share whose
 /// server is gone can take minutes to fail, or never on a hard mount, and would hold up the list.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -23,7 +25,7 @@ const LOCAL_FILESYSTEMS: [&str; 19] = [
 static PROBING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 pub fn list_volumes() -> Vec<VolumeInfo> {
-    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return Vec::new();
     };
 
@@ -33,15 +35,12 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
     let probes: Vec<_> = mounts
         .lines()
         .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let device = parts.next()?;
-            let raw_mount = parts.next()?;
-            let fs_type = parts.next().unwrap_or("");
-
-            if !is_volume(device, raw_mount, fs_type) {
+            let mount = Mount::parse(line)?;
+            if !is_volume(&mount) {
                 return None;
             }
-            let mount_point = unescape_octal(raw_mount);
+            let mount_point = unescape_octal(mount.mount_point);
+            let fs_type = mount.fs_type;
 
             let (tx, rx) = mpsc::channel();
             if LOCAL_FILESYSTEMS.contains(&fs_type) {
@@ -82,18 +81,28 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
     volumes
 }
 
-/// Whether the /proc/mounts line of `device` mounted at `mount_point` (as escaped there) with
-/// `fs_type` is a volume to offer. Not a pseudo-filesystem (proc, sysfs, tmpfs, cgroup2, ...), whose
-/// source isn't a device path. Some real filesystems have none either: the root filesystem whatever
-/// backs it (composefs's overlay on Fedora Atomic, a container's overlay; not the `rootfs` old
-/// kernels list besides the real root), and ZFS datasets (`pool/dataset`). Nor a snap's loopback
-/// mount.
-fn is_volume(device: &str, mount_point: &str, fs_type: &str) -> bool {
-    (device.starts_with('/') || (mount_point == "/" && fs_type != "rootfs") || fs_type == "zfs")
+/// Whether `mount` is a volume to offer. Not a pseudo-filesystem (proc, sysfs, tmpfs, cgroup2, ...),
+/// whose source isn't a device path. Some real filesystems have none either: the root filesystem
+/// whatever backs it (composefs's overlay on Fedora Atomic, a container's overlay; not the `rootfs`
+/// old kernels list besides the real root), and ZFS datasets (`pool/dataset`). Nor a snap's loopback
+/// mount, nor a bind mount of a folder of a filesystem (the Firefox snap's `host-hunspell`, a
+/// container's files), which shows part of a volume offered already. A btrfs subvolume mounts a
+/// folder of its filesystem too, but is a volume of its own (Fedora's `/` and `/home`).
+fn is_volume(mount: &Mount) -> bool {
+    let Mount {
+        root,
+        mount_point,
+        fs_type,
+        source,
+        ..
+    } = *mount;
+    (source.starts_with('/') || (mount_point == "/" && fs_type != "rootfs") || fs_type == "zfs")
+        && (root == "/" || fs_type == "btrfs")
         && !mount_point.starts_with("/snap/")
 }
 
-/// /proc/mounts escapes a space, tab, newline or backslash in a mount point as octal (`\040`).
+/// /proc/self/mountinfo escapes a space, tab, newline or backslash in a mount point as octal
+/// (`\040`).
 fn unescape_octal(s: &str) -> String {
     let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -142,27 +151,28 @@ mod tests {
 
     #[test]
     fn volumes_are_real_filesystems() {
-        let volume = |line: &str| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            is_volume(parts[0], parts[1], parts[2])
-        };
+        let volume = |line: &str| is_volume(&Mount::parse(line).unwrap());
         for line in [
-            "/dev/nvme0n1p2 / ext4 rw,relatime 0 0",
-            "rpool/ROOT/ubuntu_e8yh0v / zfs rw,relatime,xattr,posixacl 0 0",
-            "rpool/USERDATA/home_x /home zfs rw,relatime 0 0",
-            "composefs / overlay ro,relatime 0 0",
-            "/dev/sda1 /mnt/My\\040Disk ext4 rw 0 0",
-            "//nas.lan/share /mnt/share cifs rw 0 0",
+            "29 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw",
+            "26 1 0:24 / / rw,relatime shared:1 - zfs rpool/ROOT/ubuntu_e8yh0v rw,xattr,posixacl",
+            "31 26 0:42 / /home rw,relatime shared:2 - zfs rpool/USERDATA/home_x rw",
+            "27 1 0:25 / / ro,relatime shared:1 - overlay composefs ro,lowerdir+=/run/ostree",
+            "40 29 8:1 / /mnt/My\\040Disk rw - ext4 /dev/sda1 rw",
+            "41 29 0:50 / /mnt/share rw - cifs //nas.lan/share rw",
+            // Fedora: both are subvolumes of one btrfs filesystem.
+            "60 1 0:33 /root / rw,relatime shared:1 - btrfs /dev/nvme0n1p3 rw,subvol=/root",
+            "61 60 0:33 /home /home rw,relatime shared:2 - btrfs /dev/nvme0n1p3 rw,subvol=/home",
         ] {
             assert!(volume(line), "{line}");
         }
         for line in [
-            "proc /proc proc rw 0 0",
-            "tmpfs /run tmpfs rw 0 0",
-            "cgroup2 /sys/fs/cgroup cgroup2 rw 0 0",
-            "rootfs / rootfs rw 0 0",
-            "/dev/loop3 /snap/core22/1380 squashfs ro 0 0",
-            "overlay /var/lib/docker/overlay2/x/merged overlay rw 0 0",
+            "22 29 0:21 / /proc rw - proc proc rw",
+            "25 29 0:23 / /run rw - tmpfs tmpfs rw",
+            "30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw",
+            "1 1 0:1 / / rw - rootfs rootfs rw",
+            "50 29 7:3 / /snap/core22/1380 ro - squashfs /dev/loop3 ro",
+            "70 29 0:60 / /var/lib/docker/overlay2/x/merged rw - overlay overlay rw",
+            "345 33 259:5 /usr/share/hunspell /var/snap/firefox/common/host-hunspell ro,noexec shared:1 - ext4 /dev/nvme0n1p5 rw",
         ] {
             assert!(!volume(line), "{line}");
         }

@@ -2,6 +2,7 @@
 //! each OS's build of `rsdirstat` picks its own scanner.
 #![cfg(target_os = "linux")]
 
+mod mountinfo;
 pub mod reveal;
 pub mod scan;
 pub mod volumes;
