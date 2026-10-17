@@ -110,7 +110,7 @@ fn read_dir(
     root_filesystem: u64,
     cross_filesystems: bool,
 ) -> bool {
-    let Some(fd) = dir.open() else { return false };
+    let Some(fd) = dir.open(sink) else { return false };
     let dir_fd = fd.as_raw_fd();
     loop {
         let nread = unsafe {

@@ -90,7 +90,7 @@ fn main() -> Result<()> {
         tree.recompute_totals();
     }
     if !tree.complete {
-        eprintln!("The scan stopped early, so these results are incomplete.");
+        eprintln!("Some folders couldn't be read (see above), so these results are incomplete.");
     }
 
     if list_files {

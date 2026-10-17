@@ -113,7 +113,8 @@ pub struct DirTree {
     /// How many scanner events have been applied, so an unchanged count means an unchanged tree.
     pub changes: u64,
     /// Whether the scan read everything: set by a `ScanDone` for a complete scan, so false while it
-    /// runs, and after one that stopped early (a stall) or never reported how it ended.
+    /// runs, and after one that left something out (a stall, a read that failed) or never reported how
+    /// it ended.
     pub complete: bool,
     hue_cache: HashMap<Box<str>, u16>,
 }
@@ -542,6 +543,7 @@ mod tests {
             (ScanOutcome::Complete, true),
             (ScanOutcome::Stalled, false),
             (ScanOutcome::Cancelled, false),
+            (ScanOutcome::Incomplete, false),
         ] {
             tree.apply(ScanEvent::ScanStart { root: "/root".into() });
             assert!(!tree.complete, "a running scan isn't complete");

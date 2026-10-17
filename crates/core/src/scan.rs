@@ -155,9 +155,11 @@ pub enum UnixDir {
 
 #[cfg(unix)]
 impl DirJob<UnixDir> {
-    /// Open the directory, or `None` if it can't be opened. Failures other than a lack of
-    /// permission, or the directory having gone, are reported.
-    pub fn open(&self) -> Option<Arc<std::os::fd::OwnedFd>> {
+    /// Open the directory, or `None` if it can't be opened. A lack of permission, the directory
+    /// having gone or been replaced (by a file, or a symlink: it isn't followed out of the tree),
+    /// or a macOS cloud folder not yet fetched leave it out quietly; any other failure is reported
+    /// to `sink`, and makes the scan incomplete.
+    pub fn open(&self, sink: &DirSink<'_, UnixDir>) -> Option<Arc<std::os::fd::OwnedFd>> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         let (parent, name) = match &self.handle {
             UnixDir::Root(fd) => return Some(Arc::clone(fd)),
@@ -167,7 +169,7 @@ impl DirJob<UnixDir> {
             libc::openat(
                 parent.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
         if fd >= 0 {
@@ -176,9 +178,9 @@ impl DirJob<UnixDir> {
         let error = std::io::Error::last_os_error();
         if !matches!(
             error.raw_os_error(),
-            Some(libc::EACCES | libc::EPERM | libc::ENOENT | libc::ENOTDIR)
+            Some(libc::EACCES | libc::EPERM | libc::ENOENT | libc::ENOTDIR | libc::ELOOP | libc::EDEADLK)
         ) {
-            eprintln!("Can't open {}: {error}", self.path);
+            sink.read_failed(format_args!("can't open it: {error}"));
         }
         None
     }
@@ -297,6 +299,14 @@ pub struct DirJob<H> {
     path: String,
 }
 
+impl<H> DirJob<H> {
+    /// Whether this is the scan's root, which a platform must not leave out quietly: a scan without
+    /// it has nothing to show.
+    pub fn is_root(&self) -> bool {
+        self.parent_id == 0
+    }
+}
+
 /// How a scan ended, as `ScanDone` reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanOutcome {
@@ -307,6 +317,9 @@ pub enum ScanOutcome {
     /// No progress for [`STALL_TIMEOUT`]; the stuck directories were reported and the results are
     /// partial.
     Stalled,
+    /// Every reachable directory was visited, but some couldn't be read in full (an I/O error, a
+    /// network share dropping mid-listing): the errors were reported, and the results are partial.
+    Incomplete,
 }
 
 /// Walk the tree under the root of `scan`, already opened as `handle` and identified as `id`, on
@@ -342,6 +355,7 @@ where
         tx: RwLock::new(Some(tx)),
         visited_dirs: DashSet::from_iter([root.id]),
         visited_files: DashSet::new(),
+        failed: AtomicBool::new(false),
     });
     shared.queue.push(vec![root]);
 
@@ -355,7 +369,7 @@ where
         thread::spawn(move || run_worker(&shared, &*read_dir, &active[worker_index]));
     }
 
-    let outcome = shared.queue.wait(STALL_TIMEOUT, || {
+    let outcome = match shared.queue.wait(STALL_TIMEOUT, || {
         eprintln!("Stuck directories:");
         for path in active.iter() {
             let path = path.lock().unwrap();
@@ -363,7 +377,11 @@ where
                 eprintln!("  {}", plain_path(Path::new(&*path)).display());
             }
         }
-    });
+    }) {
+        // Read from after the last `finish_one`, which a worker calls after reporting a failure.
+        ScanOutcome::Complete if shared.failed.load(Ordering::Relaxed) => ScanOutcome::Incomplete,
+        outcome => outcome,
+    };
     // Taken under the write lock, so no worker is still sending once `ScanDone` goes out, and none
     // can send after it.
     if let Some(tx) = shared.tx.write().unwrap().take() {
@@ -384,6 +402,8 @@ struct Shared<H> {
     visited_dirs: DashSet<u64>,
     /// Files with several names (hardlinks), counted under the first name seen.
     visited_files: DashSet<u64>,
+    /// Whether a directory couldn't be read in full (see `DirSink::read_failed`).
+    failed: AtomicBool,
 }
 
 fn run_worker<H, F>(shared: &Shared<H>, read_dir: &F, active: &Mutex<String>)
@@ -479,6 +499,14 @@ impl<H> DirSink<'_, H> {
             return;
         }
         self.files.add(name, size, mtime);
+    }
+
+    /// Report that the directory couldn't be read in full, or one of its subdirectories opened, for
+    /// a reason other than those a platform leaves out quietly (no permission, gone): the error goes
+    /// to stderr with the directory's path, and the scan ends [`ScanOutcome::Incomplete`].
+    pub fn read_failed(&self, what: impl std::fmt::Display) {
+        eprintln!("Can't read {}: {what}", plain_path(Path::new(self.dir_path)).display());
+        self.shared.failed.store(true, Ordering::Relaxed);
     }
 
     /// Call after each read from the OS. Records progress for stall detection, and returns false
@@ -984,6 +1012,38 @@ mod tests {
         assert!(files.contains(&"a.txt") && files.contains(&"b"));
     }
 
+    /// A directory the platform couldn't read in full makes the scan incomplete, though every
+    /// directory was visited.
+    #[test]
+    fn a_read_that_failed_makes_the_scan_incomplete() {
+        let (tx, rx) = mpsc::channel();
+        run_scan(
+            Started::new("/root".into(), tx),
+            (),
+            1,
+            Arc::default(),
+            2,
+            |_: &DirJob<()>, _: &mut [u8], sink: &mut DirSink<'_, ()>| {
+                sink.file("a", 10, 0, None);
+                sink.read_failed("I/O error");
+                true
+            },
+        );
+        let events: Vec<_> = rx.iter().collect();
+        assert!(matches!(
+            events.last(),
+            Some(ScanEvent::ScanDone {
+                outcome: ScanOutcome::Incomplete
+            })
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ScanEvent::Dir { files, .. } if files.len() == 1)),
+            "what was read is still sent"
+        );
+    }
+
     #[test]
     fn run_scan_stops_promptly_when_cancelled() {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1028,6 +1088,7 @@ mod tests {
             tx: RwLock::new(None),
             visited_dirs: DashSet::new(),
             visited_files: DashSet::new(),
+            failed: AtomicBool::new(false),
         }
     }
 

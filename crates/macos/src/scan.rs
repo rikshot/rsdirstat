@@ -89,7 +89,7 @@ fn read_dir(
     root_dev: i32,
     cross_filesystems: bool,
 ) -> bool {
-    let Some(fd) = dir.open() else { return false };
+    let Some(fd) = dir.open(sink) else { return false };
     loop {
         let count = unsafe {
             libc::getattrlistbulk(

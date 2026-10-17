@@ -15,11 +15,12 @@ pub(crate) fn percent(part: u64, whole: u64) -> f64 {
 }
 
 /// The status line for a finished scan: how many directories it found and how long it took, the
-/// size of the view, and whether the scan stopped before reading everything.
+/// size of the view, and whether the scan left out folders it couldn't read (stuck on one, or a
+/// read that failed).
 pub(crate) fn scan_summary(dir_count: u32, seconds: f64, root_size: u64, partial: bool) -> String {
     let mut summary = format!("{dir_count} dirs in {seconds:.1}s — {}", format_size(root_size));
     if partial {
-        summary.push_str(" — incomplete: the scan got stuck (see the terminal)");
+        summary.push_str(" — incomplete: some folders couldn't be read (see the terminal)");
     }
     summary
 }
@@ -397,7 +398,7 @@ mod tests {
         assert_eq!(scan_summary(12, 3.25, 2048, false), "12 dirs in 3.2s — 2.00 KiB");
         assert_eq!(
             scan_summary(12, 3.25, 2048, true),
-            "12 dirs in 3.2s — 2.00 KiB — incomplete: the scan got stuck (see the terminal)"
+            "12 dirs in 3.2s — 2.00 KiB — incomplete: some folders couldn't be read (see the terminal)"
         );
     }
 

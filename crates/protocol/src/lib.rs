@@ -84,8 +84,8 @@ pub struct LayoutPayload {
     pub root_size: u64,
     pub dir_count: u32,
     pub scan_done: bool,
-    /// The scan stopped before reading everything (it stalled on a stuck directory), so the tree is
-    /// missing whatever it hadn't reached. Only once `scan_done`.
+    /// The scan left out folders it couldn't read (it stalled on a stuck one, or a read failed), so
+    /// the tree is missing whatever was in them. Only once `scan_done`.
     pub partial: bool,
     /// How long the scan has been running, or took once done, in milliseconds. From the server, so a
     /// tab that joins mid-scan, or after it, shows the scan's own time.
