@@ -173,12 +173,8 @@ pub fn scan(
     let fd = open_root(&path).with_context(|| format!("can't open {}", path.display()))?;
     let sx = statx_fd(fd.as_raw_fd(), DIR_STATX_MASK).with_context(|| format!("can't statx {}", path.display()))?;
     let root_filesystem = filesystem(&sx);
-    // Only crossing into other filesystems can lead into one.
-    let pseudo = if options.cross_filesystems {
-        PseudoMounts::mounted()
-    } else {
-        PseudoMounts::default()
-    };
+    // Crossing into other filesystems, the pseudo ones it doesn't enter.
+    let crossing = options.cross_filesystems.then(PseudoMounts::mounted);
     let root = UnixDir::Root(Arc::new(fd));
     run_scan(
         Started::new(path, tx),
@@ -188,20 +184,20 @@ pub fn scan(
         options
             .threads
             .map_or_else(|| cpu_count() * THREADS_PER_CPU, NonZeroUsize::get),
-        move |dir, buffer, sink| read_dir(dir, buffer, sink, root_filesystem, options.cross_filesystems, &pseudo),
+        move |dir, buffer, sink| read_dir(dir, buffer, sink, root_filesystem, crossing.as_ref()),
     );
     Ok(())
 }
 
 /// Read one directory with raw `getdents64`, then `statx` each file for its size and mtime, and
-/// each subdirectory for its identity and mount. False if it can't be opened.
+/// each subdirectory for its identity and mount. False if it can't be opened. `crossing` is set when
+/// the scan descends into other filesystems, with the pseudo ones it leaves out.
 fn read_dir(
     dir: &DirJob<UnixDir>,
     buffer: &mut [u8],
     sink: &mut DirSink<'_, UnixDir>,
     root_filesystem: u64,
-    cross_filesystems: bool,
-    pseudo: &PseudoMounts,
+    crossing: Option<&PseudoMounts>,
 ) -> bool {
     let Some(fd) = dir.open(sink) else { return false };
     let dir_fd = fd.as_raw_fd();
@@ -303,12 +299,13 @@ fn read_dir(
                             continue;
                         }
                     };
-                    if cross_filesystems {
+                    let foreign = filesystem(&sx) != root_filesystem;
+                    let left_out = match crossing {
                         // Even across filesystems, not into the kernel's pseudo ones (/proc, /sys, ...).
-                        if filesystem(&sx) != root_filesystem && pseudo.holds(&sx) {
-                            continue;
-                        }
-                    } else if filesystem(&sx) != root_filesystem || is_automount_point(&sx) {
+                        Some(pseudo) => foreign && pseudo.holds(&sx),
+                        None => foreign || is_automount_point(&sx),
+                    };
+                    if left_out {
                         continue;
                     }
                     let child = UnixDir::Child(Arc::clone(&fd), name.to_owned());

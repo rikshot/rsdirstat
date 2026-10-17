@@ -313,6 +313,9 @@ canvas {
     font-size: 12px;
     line-height: 1.5;
     display: none;
+    /* Its content's width up to the max, not the room left at its position: near the window's
+       right edge it would shrink to that and wrap, and measure smaller than it is shown. */
+    width: max-content;
     max-width: 350px;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
 

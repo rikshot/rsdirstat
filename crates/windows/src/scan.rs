@@ -94,10 +94,8 @@ fn path_id(path: &[u16]) -> u64 {
 /// Without that, every folder of a volume whose file ids are all 0 (sshfs-win, some redirectors)
 /// would share one id, and all but the first would be left out as already read.
 fn folder_id(volume: u32, file_id: u64, unique_file_ids: bool, path: &[u16]) -> u64 {
-    match usable_file_id(file_id).filter(|_| unique_file_ids) {
-        Some(file_id) => node_id(volume as u64, file_id),
-        None => node_id(volume as u64, path_id(path)),
-    }
+    let id = usable_file_id(file_id).filter(|_| unique_file_ids);
+    node_id(volume as u64, id.unwrap_or_else(|| path_id(path)))
 }
 
 fn get_volume_and_id(handle: &OwnedHandle) -> Option<(u32, u64)> {
@@ -135,16 +133,14 @@ pub fn scan(
     };
     let id = folder_id(volume_serial, file_id, root.unique_file_ids, &root.path);
     let threads = options.threads.map_or_else(cpu_count, NonZeroUsize::get);
-    // Opened before the scan starts: a volume that can't be read fails the scan before anything is
-    // sent, as an unopenable root does.
-    let required = match options.mft {
-        Mft::Require => Some(mft::Volume::open(&root.handle)?),
-        _ => None,
-    };
-    let scan = Started::new(path, tx);
-    if let Some(volume) = required {
+    if options.mft == Mft::Require {
+        // Opened before the scan starts: a volume that can't be read fails the scan before anything
+        // is sent, as an unopenable root does.
+        let volume = mft::Volume::open(&root.handle)?;
+        let scan = Started::new(path, tx);
         return volume.scan(&scan, &root.handle, file_id, volume_serial, threads, &cancel);
     }
+    let scan = Started::new(path, tx);
     if options.mft == Mft::Auto
         && root.unique_file_ids
         && ntfs::is_volume_root(file_id)

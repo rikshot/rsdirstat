@@ -13,9 +13,7 @@ impl TreemapApp {
     }
 
     pub(super) fn clear_hover(&mut self) -> Result<(), JsValue> {
-        self.view.hover = None;
-        self.show_hover_path();
-        self.chrome.tooltip_element.style().set_property("display", "none")
+        self.set_hover(None)
     }
 
     /// The hovered rect's path and size in the path bar, or nothing.
@@ -84,22 +82,19 @@ impl TreemapApp {
 
         // Even with nothing hovered, so a tooltip a new layout shows under a resting pointer is
         // already by it.
-        {
-            let (tooltip_width, tooltip_height) = self.view.tooltip_size;
-            let mut tip_x = event.client_x() as f64 + 14.0;
-            let mut tip_y = event.client_y() as f64 + 14.0;
-            let (inner_width, inner_height) = window_inner_size(&self.window)?;
-            if tip_x + tooltip_width > inner_width - 8.0 {
-                tip_x = event.client_x() as f64 - tooltip_width - 8.0;
-            }
-            if tip_y + tooltip_height > inner_height - 8.0 {
-                tip_y = event.client_y() as f64 - tooltip_height - 8.0;
-            }
-            let style = self.chrome.tooltip_element.style();
-            style.set_property("left", &format!("{tip_x}px"))?;
-            style.set_property("top", &format!("{tip_y}px"))?;
+        let (tooltip_width, tooltip_height) = self.view.tooltip_size;
+        let mut tip_x = event.client_x() as f64 + 14.0;
+        let mut tip_y = event.client_y() as f64 + 14.0;
+        let (inner_width, inner_height) = window_inner_size(&self.window)?;
+        if tip_x + tooltip_width > inner_width - 8.0 {
+            tip_x = event.client_x() as f64 - tooltip_width - 8.0;
         }
-        Ok(())
+        if tip_y + tooltip_height > inner_height - 8.0 {
+            tip_y = event.client_y() as f64 - tooltip_height - 8.0;
+        }
+        let style = self.chrome.tooltip_element.style();
+        style.set_property("left", &format!("{tip_x}px"))?;
+        style.set_property("top", &format!("{tip_y}px"))
     }
 
     /// Show the hovered rect's details in the tooltip and measure it, or hide it.
@@ -129,13 +124,9 @@ impl TreemapApp {
             String::new()
         };
         self.chrome.tooltip_mtime.set_text_content(Some(&mtime));
-        // Measured at the left edge, then put back: where it last was, near the window's right edge,
-        // its width would shrink to the room left there, and the new content would measure wrapped.
-        let style = tooltip.style();
-        let left = style.get_property_value("left")?;
-        style.set_property("left", "0px")?;
+        // Its width is its content's, whatever its position (main.css), so it measures the same here
+        // as where it will be shown.
         self.view.tooltip_size = (tooltip.offset_width() as f64, tooltip.offset_height() as f64);
-        style.set_property("left", &left)?;
         Ok(())
     }
 

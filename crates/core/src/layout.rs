@@ -76,7 +76,7 @@ pub fn compute_layout(
         w: canvas_w,
         h: canvas_h,
     };
-    let size = ctx.size(view_root, root);
+    let size = ctx.total(view_root, root).size;
     ctx.layout_node(view_root, root, size, canvas, 0.0, 0);
     Layout { size, rects: ctx.out }
 }
@@ -105,15 +105,15 @@ enum ItemKind<'a> {
     /// A folder, with its node id.
     Dir(u64, &'a DirNode),
     File(&'a FileEntry),
-    /// Files too small to draw individually, summed into one "(other files)" rect, with the newest
-    /// of their modification times.
-    Aggregate {
-        mtime: i64,
-    },
+    /// Files too small to draw individually, summed into one "(other files)" rect.
+    Aggregate,
 }
 
 struct LayoutItem<'a> {
     size: u64,
+    /// The newest modification time of what it shows: with a filter active, of the files it
+    /// matches, as the size counts only those.
+    mtime: i64,
     kind: ItemKind<'a>,
 }
 
@@ -130,19 +130,15 @@ struct LayoutCtx<'a> {
 }
 
 impl<'a> LayoutCtx<'a> {
-    fn size(&self, id: u64, node: &DirNode) -> u64 {
+    /// The size and newest modification time of what the view shows under `node`: with a filter
+    /// active, of the files it matches.
+    fn total(&self, id: u64, node: &DirNode) -> FilteredTotal {
         match self.filtered_sizes {
-            Some(totals) => totals.get(&id).map_or(0, |total| total.size),
-            None => node.size,
-        }
-    }
-
-    /// The newest modification time of what the view shows under `node`: with a filter active, of
-    /// the files it matches, as the size counts only those.
-    fn mtime(&self, id: u64, node: &DirNode) -> i64 {
-        match self.filtered_sizes {
-            Some(totals) => totals.get(&id).map_or(0, |total| total.mtime),
-            None => node.mtime,
+            Some(totals) => totals.get(&id).copied().unwrap_or_default(),
+            None => FilteredTotal {
+                size: node.size,
+                mtime: node.mtime,
+            },
         }
     }
 
@@ -170,11 +166,12 @@ impl<'a> LayoutCtx<'a> {
         let mut items: Vec<LayoutItem<'a>> = Vec::new();
         for &id in &node.children {
             if let Some(child) = self.tree.nodes.get(&id)
-                && let size = self.size(id, child)
-                && size > 0
+                && let total = self.total(id, child)
+                && total.size > 0
             {
                 items.push(LayoutItem {
-                    size,
+                    size: total.size,
+                    mtime: total.mtime,
                     kind: ItemKind::Dir(id, child),
                 });
             }
@@ -187,8 +184,7 @@ impl<'a> LayoutCtx<'a> {
         } else {
             f64::MAX
         };
-        let mut residual: u64 = 0;
-        let mut residual_mtime: i64 = 0;
+        let mut residual = FilteredTotal::default();
         for file in &node.files {
             if file.size == 0 || (self.filtered_sizes.is_some() && !self.matcher.matches(&file.name, file.size)) {
                 continue;
@@ -196,17 +192,18 @@ impl<'a> LayoutCtx<'a> {
             if (file.size as f64) >= min_file_size {
                 items.push(LayoutItem {
                     size: file.size,
+                    mtime: file.mtime,
                     kind: ItemKind::File(file),
                 });
             } else {
-                residual += file.size;
-                residual_mtime = residual_mtime.max(file.mtime);
+                residual = residual.add(file.size, file.mtime);
             }
         }
-        if residual > 0 {
+        if residual.size > 0 {
             items.push(LayoutItem {
-                size: residual,
-                kind: ItemKind::Aggregate { mtime: residual_mtime },
+                size: residual.size,
+                mtime: residual.mtime,
+                kind: ItemKind::Aggregate,
             });
         }
 
@@ -220,8 +217,8 @@ impl<'a> LayoutCtx<'a> {
         let mut rects = Vec::with_capacity(items.len());
         squarify(&items, content, &mut rects);
 
-        // The zip relies on squarify emitting exactly one rect per item, in input order.
-        debug_assert_eq!(rects.len(), items.len(), "squarify must emit one rect per item");
+        // The zip relies on squarify emitting one rect per item of a prefix, in input order.
+        debug_assert!(rects.len() <= items.len(), "squarify emits at most one rect per item");
         for (r, item) in rects.into_iter().zip(&items) {
             // Skip any rect the client won't draw (`MIN_DRAWN_SIDE`) before it is
             // serialized + deflated into the payload sent ~20×/sec during a scan. This pays off
@@ -244,13 +241,11 @@ impl<'a> LayoutCtx<'a> {
                 ..LayoutRect::default()
             };
             let mut nest = None;
-            match item.kind {
+            rect.mtime = item.mtime;
+            let hue = match item.kind {
                 ItemKind::Dir(id, child) => {
-                    let mtime = self.mtime(id, child);
                     rect.id = id;
                     rect.name = child.name.to_string();
-                    rect.hue = self.hue(child.hue, mtime);
-                    rect.mtime = mtime;
                     // `max_depth` is the number of levels shown: this rect sits on level `depth + 1`,
                     // so opening it puts its contents on `depth + 2`. Any folder with room opens up,
                     // including one holding only files, which would otherwise stay a solid block at
@@ -259,20 +254,20 @@ impl<'a> LayoutCtx<'a> {
                         rect.kind = RectKind::Container;
                         nest = Some((id, child));
                     }
+                    child.hue
                 }
                 ItemKind::File(file) => {
                     rect.name = file.name.to_string();
-                    rect.hue = self.hue(file.hue, file.mtime);
-                    rect.mtime = file.mtime;
                     rect.kind = RectKind::File;
+                    file.hue
                 }
-                ItemKind::Aggregate { mtime } => {
+                ItemKind::Aggregate => {
                     rect.name = "(other files)".to_string();
-                    rect.hue = self.hue(hash_id_to_hue(node_id), mtime);
-                    rect.mtime = mtime;
                     rect.kind = RectKind::OtherFiles;
+                    hash_id_to_hue(node_id)
                 }
-            }
+            };
+            rect.hue = self.hue(hue, item.mtime);
             // From the rect's f32 size, exactly as the client computes it, so the contents start
             // right below the header it draws.
             let header = f64::from(rect.header_height());
@@ -291,9 +286,10 @@ impl<'a> LayoutCtx<'a> {
     }
 }
 
-/// Squarified treemap: split `bounds` among `items` (sorted by descending size) and push exactly
-/// one rect per item, in input order. Items left when the space or the remaining size runs out get
-/// a zero-size rect each, for the caller to cull.
+/// Squarified treemap: split `bounds` among `items` (sorted by descending size) and push one rect
+/// per item, in input order. Items left when the space or the remaining size runs out get none:
+/// only a level of 2^53 bytes or more (an exabyte sparse file beside small ones) has any, as f64 can
+/// no longer tell its sizes apart, and they would be sub-pixel anyway.
 fn squarify(items: &[LayoutItem], mut bounds: Rect, out: &mut Vec<Rect>) {
     let size = |item: &LayoutItem| item.size as f64;
     let mut area_left: f64 = items.iter().map(size).sum();
@@ -374,13 +370,6 @@ fn squarify(items: &[LayoutItem], mut bounds: Rect, out: &mut Vec<Rect>) {
         area_left -= row_area;
         lo = split;
     }
-    // Only a level of 2^53 bytes or more (an exabyte sparse file beside small ones) gets here with
-    // items left: f64 can no longer tell its sizes apart, and what's left would be sub-pixel anyway.
-    out.extend((lo..hi).map(|_| Rect {
-        w: 0.0,
-        h: 0.0,
-        ..bounds
-    }));
 }
 
 #[cfg(test)]

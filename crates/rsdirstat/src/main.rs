@@ -190,6 +190,7 @@ impl AppState {
 /// machines out, and the checks of `Host`, `Origin` and `Sec-Fetch-Site` other websites, but neither
 /// stops another user of this machine, or another program, from connecting to the port.
 struct Session {
+    port: u16,
     token: String,
     /// The cookie's name, with the port in it: browsers send a host's cookies to all its ports, and
     /// two servers running at once mustn't overwrite each other's.
@@ -202,14 +203,15 @@ impl Session {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("can't make a session token: {e}"))?;
         Ok(Self {
+            port,
             token: bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
             cookie: format!("rsdirstat-{port}"),
         })
     }
 
     /// The address that starts the session in a browser.
-    fn url(&self, port: u16) -> String {
-        format!("http://localhost:{port}/?token={}", self.token)
+    fn url(&self) -> String {
+        format!("http://localhost:{}/?token={}", self.port, self.token)
     }
 
     /// Whether `token` is this session's, compared in constant time.
@@ -261,7 +263,7 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// How long a scan may take to open its root (canonicalize, stat, open) before the page goes back
 /// to the picker. A dead network mount can block those calls for good, before the scan's own stall
 /// detection starts. As long as that detection's timeout, for a disk that is only waking up.
-const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+const OPEN_TIMEOUT: Duration = rsdirstat_core::scan::STALL_TIMEOUT;
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -311,10 +313,9 @@ async fn run_server(args: Args) -> Result<()> {
         .route("/start", get(start_handler))
         .route("/volumes", get(volumes_handler))
         // The API only, not the frontend bundle the fallback serves.
-        .route_layer(axum::middleware::from_fn(require_own_page))
         .route_layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
-            require_session,
+            require_own_page,
         ))
         .fallback(static_handler)
         .with_state(Arc::clone(&state))
@@ -326,7 +327,7 @@ async fn run_server(args: Args) -> Result<()> {
     if !wait {
         start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart { .. }));
     }
-    let url = state.session.url(actual_port);
+    let url = state.session.url();
     eprintln!("Listening on {url}");
 
     // Kept until the server exits, then deleted.
@@ -572,54 +573,55 @@ fn relay_scan(
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return to_picker(),
     };
 
+    // The first is the scan's `ScanStart` (`Started::new`), so the tree is this scan's from here on.
+    let mut incoming = std::iter::once(first).chain(rx.iter());
     // Reused across iterations so the per-batch drain doesn't reallocate each wakeup.
     let mut events = Vec::new();
-    let mut started = false;
-    let mut next = Some(first);
-    while let Some(event) = next.take().or_else(|| rx.recv().ok()) {
+    // Until `ScanDone`, or until the scanner stops without one.
+    let (mut tree, done) = loop {
+        let Some(event) = incoming.next() else {
+            break (state.scan.tree.write(), false);
+        };
         events.push(event);
         events.extend(rx.try_iter());
 
         let mut tree = state.scan.tree.write();
-        // A new scan's `ScanStart` replaces the tree: the old one's nodes are freed after the lock is
-        // released, as millions of names take tens of milliseconds to free.
-        let mut replaced = Vec::new();
+        // A new scan's `ScanStart` replaces the tree: the old one's nodes are freed once the lock is
+        // released and the tabs told, as millions of names take tens of milliseconds to free.
+        let mut replaced = None;
+        let mut done = false;
         for event in events.drain(..) {
             if matches!(event, ScanEvent::ScanStart { .. }) {
-                started = true;
-                replaced.push(std::mem::take(&mut tree.nodes));
+                replaced = Some(std::mem::take(&mut tree.nodes));
             }
-            let done = matches!(event, ScanEvent::ScanDone { .. });
+            done = matches!(event, ScanEvent::ScanDone { .. });
             tree.apply(event);
             if done {
-                // A scan that stalled on its root has nothing to show: back to the picker, as for
-                // one that couldn't open it.
-                if tree.root_id.is_none() {
-                    drop(tree);
-                    return to_picker();
-                }
-                // Under the tree lock, so no tab lays out the final tree still marked as running.
-                end_phase(ended);
-                drop(tree);
-                state.tree_changed();
-                return;
+                break;
             }
         }
-        drop(tree);
-        drop(replaced);
-        state.tree_changed();
-    }
-
-    // The scanner stopped without `ScanDone`, so the tree isn't marked complete: the page says so.
-    // `started` too: before this scan's `ScanStart`, the root is the previous scan's.
-    if started && state.scan.tree.read().root_id.is_some() {
-        state.scan.tree.write().recompute_totals();
-        if end_phase(ended) {
-            state.tree_changed();
+        if done {
+            break (tree, true);
         }
-    } else {
-        to_picker();
+        drop(tree);
+        state.tree_changed();
+        drop(replaced);
+    };
+
+    // Ended under the tree lock, so no tab lays out the final tree still marked as running. A scan
+    // that never read its root (it stalled on it, or the scanner stopped) has nothing to show: back
+    // to the picker, as for one that couldn't open it.
+    if tree.root_id.is_none() {
+        drop(tree);
+        return to_picker();
     }
+    // Without `ScanDone` the tree isn't marked complete, and the page says so.
+    if !done {
+        tree.recompute_totals();
+    }
+    end_phase(ended);
+    drop(tree);
+    state.tree_changed();
 }
 
 /// The trunk-built frontend bundle (`index.html`, wasm, js, css), baked into the binary at
@@ -646,31 +648,24 @@ async fn static_handler(
         "" => "index.html",
         p => p,
     };
-    let set_cookie = if path == "index.html" {
-        let session = &state.session;
-        if session.in_query(&uri) {
-            Some(session.set_cookie())
-        } else if session.admits(&headers) {
-            None
-        } else {
+    let session = &state.session;
+    let set_cookie = match path {
+        "index.html" if session.in_query(&uri) => Some(session.set_cookie()),
+        "index.html" if !session.admits(&headers) => {
             return (
                 StatusCode::FORBIDDEN,
                 "Open the address rsdirstat printed when it started (with its ?token=), or start it again.",
             )
                 .into_response();
         }
-    } else {
-        None
+        _ => None,
     };
     match Assets::get(path) {
         Some(content) => {
             // Content-type is baked in at compile time by rust-embed's `mime-guess` feature.
             let mime = content.metadata.mimetype().to_owned();
-            let mut response = ([(header::CONTENT_TYPE, mime)], content.data).into_response();
-            if let Some(cookie) = set_cookie {
-                response.headers_mut().insert(header::SET_COOKIE, cookie);
-            }
-            response
+            let cookie = set_cookie.map(|cookie| [(header::SET_COOKIE, cookie)]);
+            (cookie, [(header::CONTENT_TYPE, mime)], content.data).into_response()
         }
         None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
@@ -715,23 +710,16 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
-/// Refuse an API request without the session's cookie (see `Session`).
-async fn require_session(
+/// Refuse an API request without the session's cookie (see `Session`), or from another site's page,
+/// which could otherwise drive the server from the user's own browser: connect to ws://127.0.0.1,
+/// or start a scan. Such a page's requests don't carry the cookie (`SameSite=Strict`) either; the
+/// check of where they come from holds for a browser that would send it.
+async fn require_own_page(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if !state.session.admits(request.headers()) {
-        return (StatusCode::FORBIDDEN, "request refused: not from this app's own page").into_response();
-    }
-    next.run(request).await
-}
-
-/// Refuse an API request from another site's page, which could otherwise drive the server from the
-/// user's own browser: connect to ws://127.0.0.1, or start a scan. Its requests don't carry the
-/// session's cookie (`SameSite=Strict`) either, so this holds for a browser that would send it.
-async fn require_own_page(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    if !api_request_allowed(request.headers()) {
+    if !api_request_allowed(request.headers()) || !state.session.admits(request.headers()) {
         return (StatusCode::FORBIDDEN, "request refused: not from this app's own page").into_response();
     }
     next.run(request).await
@@ -838,12 +826,20 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     let picker_mode = || Message::Binary(wire::ServerMessage::PickerMode.encode().into());
 
     // A new tab starts on the picker while the server waits for a path, and on the Start button
-    // while it waits for that. Otherwise its first layout follows the viewport it sends on
-    // connecting.
-    let waiting = match *state.scan.phase.lock() {
-        ScanPhase::AwaitingPath => Some(picker_mode()),
-        ScanPhase::AwaitingStart { .. } => Some(Message::Binary(wire::ServerMessage::AwaitingStart.encode().into())),
-        ScanPhase::Running { .. } | ScanPhase::Done { .. } => None,
+    // while it waits for that. One that joins a scan whose root hasn't arrived yet (a Windows
+    // drive's MFT takes seconds to read) is told it started, so it shows it running instead of a
+    // blank page. Otherwise its first layout follows the viewport it sends on connecting, and shows
+    // the scan without being told it started.
+    let (waiting, scan) = {
+        let tree = state.scan.tree.read();
+        let message = |message: wire::ServerMessage| Some(Message::Binary(message.encode().into()));
+        let waiting = match *state.scan.phase.lock() {
+            ScanPhase::AwaitingPath => Some(picker_mode()),
+            ScanPhase::AwaitingStart { .. } => message(wire::ServerMessage::AwaitingStart),
+            ScanPhase::Running { .. } if tree.root_id.is_none() => message(wire::ServerMessage::ScanStart),
+            ScanPhase::Running { .. } | ScanPhase::Done { .. } => None,
+        };
+        (waiting, tree.scans)
     };
     if let Some(message) = waiting
         && socket.send(message).await.is_err()
@@ -851,18 +847,8 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    // A tab that joins during or after a scan is shown it without being told it started, once there
-    // is something to show. One that joins before the scan's root has arrived (a Windows drive's MFT
-    // takes seconds to read) is told, so it shows the scan running instead of a blank page.
     let mut view = ViewConfig {
-        scan: {
-            let tree = state.scan.tree.read();
-            if tree.root_id.is_some() {
-                tree.scans
-            } else {
-                tree.scans.wrapping_sub(1)
-            }
-        },
+        scan,
         ..ViewConfig::default()
     };
     // Whether the tree or the view changed since the last layout sent.
@@ -1013,6 +999,17 @@ mod tests {
         Session::new(4242).unwrap()
     }
 
+    /// A server scanning `root` since `started`, and the scan's cancel flag.
+    fn running(root: &str, started: Instant) -> (AppState, Arc<AtomicBool>) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let phase = ScanPhase::Running {
+            root: root.into(),
+            cancel: Arc::clone(&cancel),
+            started,
+        };
+        (AppState::new(phase, ScanOptions::default(), session()), cancel)
+    }
+
     /// Only the session's cookie admits a request, and only the session's token starts it.
     #[test]
     fn a_session_admits_only_its_own_token() {
@@ -1040,7 +1037,7 @@ mod tests {
         assert!(session.in_query(&uri(&format!("wait&token={token}"))));
         assert!(!session.in_query(&uri("token=nope")));
         assert!(!session.in_query(&"/".parse().unwrap()));
-        assert!(session.url(4242).ends_with(&format!(":4242/?token={token}")));
+        assert!(session.url().ends_with(&format!(":4242/?token={token}")));
         let cookie = session.set_cookie();
         let cookie = cookie.to_str().unwrap();
         assert!(cookie.starts_with(&format!("rsdirstat-4242={token};")), "{cookie}");
@@ -1053,13 +1050,7 @@ mod tests {
     /// The state after relaying a scan that ran for `ran_for` and ended with `ending`, or without
     /// a `ScanDone` at all, having found one 10-byte file.
     fn finished_scan(ending: Option<ScanOutcome>, ran_for: Duration) -> AppState {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let running = ScanPhase::Running {
-            root: "/root".into(),
-            cancel: Arc::clone(&cancel),
-            started: Instant::now() - ran_for,
-        };
-        let state = AppState::new(running, ScanOptions::default(), session());
+        let (state, cancel) = running("/root", Instant::now() - ran_for);
         let (tx, rx) = std::sync::mpsc::channel();
         let file = ScannedFile {
             name: "a".into(),
@@ -1141,12 +1132,7 @@ mod tests {
     /// grows, and one as soon as something under its folder changes.
     #[test]
     fn a_view_is_laid_out_again_only_when_its_folder_changes() {
-        let running = ScanPhase::Running {
-            root: "/root".into(),
-            cancel: Arc::default(),
-            started: Instant::now(),
-        };
-        let state = AppState::new(running, ScanOptions::default(), session());
+        let (state, _) = running("/root", Instant::now());
         let dir = |id, parent, size| ScanEvent::Dir {
             id,
             parent,
@@ -1208,13 +1194,7 @@ mod tests {
     #[test]
     fn a_scan_that_ends_without_its_root_goes_back_to_the_picker() {
         for ending in [Some(ScanOutcome::Stalled), None] {
-            let cancel = Arc::new(AtomicBool::new(false));
-            let running = ScanPhase::Running {
-                root: "/root".into(),
-                cancel: Arc::clone(&cancel),
-                started: Instant::now(),
-            };
-            let state = AppState::new(running, ScanOptions::default(), session());
+            let (state, cancel) = running("/root", Instant::now());
             let picker = state.picker.subscribe();
             let (tx, rx) = std::sync::mpsc::channel();
             tx.send(ScanEvent::ScanStart { root: "/root".into() }).unwrap();
@@ -1235,13 +1215,7 @@ mod tests {
     /// be scanned.
     #[test]
     fn a_scan_stuck_opening_its_root_goes_back_to_the_picker() {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let running = ScanPhase::Running {
-            root: "/dead".into(),
-            cancel: Arc::clone(&cancel),
-            started: Instant::now(),
-        };
-        let state = AppState::new(running, ScanOptions::default(), session());
+        let (state, cancel) = running("/dead", Instant::now());
         let picker = state.picker.subscribe();
         let (_stuck, rx) = std::sync::mpsc::channel();
         relay_scan(&state, &rx, &cancel, Duration::from_millis(100));

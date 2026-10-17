@@ -243,17 +243,18 @@ fn read_records(
         let (mft_offset, disk_offset, length) = reads[index];
         // A record NTFS is rewriting can be caught half written; read again, it won't be. One that
         // stays torn is left out.
+        let mut still_torn = 0;
         for _ in 0..READ_ATTEMPTS {
             device.seek(SeekFrom::Start(disk_offset))?;
             device.read_exact(&mut buffer[..length])?;
-            if !buffer[..length].chunks_exact(record_size).any(is_torn) {
+            still_torn = buffer[..length]
+                .chunks_exact(record_size)
+                .filter(|record| is_torn(record))
+                .count();
+            if still_torn == 0 {
                 break;
             }
         }
-        let still_torn = buffer[..length]
-            .chunks_exact(record_size)
-            .filter(|record| is_torn(record))
-            .count();
         torn.fetch_add(still_torn, Ordering::Relaxed);
         let first = mft_offset / record_size;
         let records = buffer[..length]

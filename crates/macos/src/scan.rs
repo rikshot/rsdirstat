@@ -92,8 +92,7 @@ pub fn scan(
     let meta = std::fs::metadata(&path).with_context(|| format!("can't stat {}", path.display()))?;
     let fd = open_root(&path).with_context(|| format!("can't open {}", path.display()))?;
     let root_dev = meta.dev() as i32;
-    // The device as listings give it (`as u32`): `MetadataExt::dev` sign-extends the i32 `dev_t`.
-    let id = node_id(root_dev as u32 as u64, meta.ino());
+    let id = mac_node_id(root_dev, meta.ino());
     let root = UnixDir::Root(Arc::new(fd));
     let threads = options
         .threads
@@ -164,7 +163,7 @@ fn read_dir(
                 && !matches!(parsed.c_name.to_bytes(), b"." | b"..")
                 && (cross_filesystems || parsed.dev_id == root_dev)
             {
-                let id = || node_id(parsed.dev_id as u32 as u64, parsed.file_id);
+                let id = || mac_node_id(parsed.dev_id, parsed.file_id);
                 match parsed.obj_type {
                     VDIR => {
                         if let Some(id) = dir_id(&fd, &parsed, root_dev, cross_filesystems) {
@@ -197,15 +196,20 @@ fn read_dir(
 fn dir_id(dir: &OwnedFd, entry: &ParsedEntry, root_dev: i32, cross_filesystems: bool) -> Option<u64> {
     if entry.mount_status != 0 {
         mount_point_id(dir, entry, root_dev, cross_filesystems)
-    } else if entry.firmlink {
+    } else {
         // A firmlink's FILEID is its own, not that of the directory it leads to, which the scan can
         // also reach under `/System/Volumes/Data`: `fstatat` reports that one, so both names get
         // one id and the directory is read once.
-        let (dev, ino) = stat_at(dir, entry).map_or((entry.dev_id, entry.file_id), |stat| (stat.st_dev, stat.st_ino));
-        Some(node_id(dev as u32 as u64, ino))
-    } else {
-        Some(node_id(entry.dev_id as u32 as u64, entry.file_id))
+        let target = entry.firmlink.then(|| stat_at(dir, entry)).flatten();
+        let (dev, ino) = target.map_or((entry.dev_id, entry.file_id), |stat| (stat.st_dev, stat.st_ino));
+        Some(mac_node_id(dev, ino))
     }
+}
+
+/// The node id of the file `ino` on device `dev`, an i32 `dev_t` taken as unsigned, as listings give
+/// it: `MetadataExt::dev` sign-extends it, which would give the root another id than its listing's.
+fn mac_node_id(dev: i32, ino: u64) -> u64 {
+    node_id(dev as u32 as u64, ino)
 }
 
 /// The node id of the mount point `entry` in the directory `dir`, or `None` if the scan leaves it
@@ -218,7 +222,7 @@ fn mount_point_id(dir: &OwnedFd, entry: &ParsedEntry, root_dev: i32, cross_files
     }
     // The entry's own attributes are the covered directory's; `fstatat` reports the mount's root.
     let stat = stat_at(dir, entry)?;
-    (cross_filesystems || stat.st_dev == root_dev).then(|| node_id(stat.st_dev as u32 as u64, stat.st_ino))
+    (cross_filesystems || stat.st_dev == root_dev).then(|| mac_node_id(stat.st_dev, stat.st_ino))
 }
 
 /// `fstatat` of `entry` in `dir`, which unlike its attributes goes through to what is mounted on it,

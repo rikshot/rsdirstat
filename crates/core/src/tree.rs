@@ -70,7 +70,7 @@ pub struct FilteredTotal {
 }
 
 impl FilteredTotal {
-    fn add(self, size: u64, mtime: i64) -> Self {
+    pub(crate) fn add(self, size: u64, mtime: i64) -> Self {
         Self {
             size: self.size.saturating_add(size),
             mtime: self.mtime.max(mtime),
@@ -111,35 +111,36 @@ pub struct FileMatcher<'a> {
 }
 
 impl FileMatcher<'_> {
+    /// The cheap checks first: the name's case-insensitive search is most of the cost.
     pub fn matches(&self, name: &str, size: u64) -> bool {
         let filter = self.filter;
-        if size < filter.min_size {
-            return false;
-        }
-        if !self.name_matches(name) {
-            return false;
-        }
-        if !filter.extensions.is_empty() && !filter.extensions.iter().any(|extension| has_extension(name, extension)) {
-            return false;
-        }
-        true
+        size >= filter.min_size
+            && (filter.extensions.is_empty()
+                || filter.extensions.iter().any(|extension| has_extension(name, extension)))
+            && self.name_matches(name)
     }
 
     /// Whether `name` contains the pattern, ignoring case: byte by byte for an ASCII pattern, the
     /// usual kind, and by Unicode lower case otherwise, so `kesä` finds `KESÄ.jpg`.
     fn name_matches(&self, name: &str) -> bool {
-        let pattern = &self.filter.name_pattern;
-        if let Some(lowercase) = &self.lowercase_pattern {
-            name.to_lowercase().contains(lowercase.as_str())
-        } else if pattern.is_empty() {
-            true
-        } else {
-            let pattern = pattern.as_bytes();
-            name.as_bytes()
-                .windows(pattern.len())
-                .any(|window| window.eq_ignore_ascii_case(pattern))
+        match &self.lowercase_pattern {
+            // An ASCII name's lower case is ASCII too, so it holds the pattern's only if that is
+            // ASCII (as the Kelvin sign's `k` is), and then byte by byte, without lower-casing it.
+            Some(lowercase) if name.is_ascii() => lowercase.is_ascii() && contains_ignoring_ascii_case(name, lowercase),
+            Some(lowercase) => name.to_lowercase().contains(lowercase.as_str()),
+            None => contains_ignoring_ascii_case(name, &self.filter.name_pattern),
         }
     }
+}
+
+/// Whether `text` contains `pattern`, ignoring ASCII case.
+fn contains_ignoring_ascii_case(text: &str, pattern: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    pattern.is_empty()
+        || text
+            .as_bytes()
+            .windows(pattern.len())
+            .any(|window| window.eq_ignore_ascii_case(pattern))
 }
 
 /// Whether `name` ends in `.` and `extension`, ignoring ASCII case. An extension can have dots of

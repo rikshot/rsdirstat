@@ -209,26 +209,15 @@ fn scanner_unicode_filenames() {
 #[cfg(unix)]
 #[test]
 fn scanner_leaves_out_unreadable_directories() {
-    use std::os::unix::fs::PermissionsExt;
-
     if unsafe { libc::geteuid() } == 0 {
         eprintln!("skipped: root can open any directory");
         return;
     }
-    /// Opens `locked` again, even when the test fails, so its temporary folder can be removed.
-    struct Unlock<'a>(&'a std::path::Path);
-    impl Drop for Unlock<'_> {
-        fn drop(&mut self) {
-            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
-        }
-    }
-
     let dir = create_test_dir();
     let locked = dir.path().join("locked");
     fs::create_dir(&locked).unwrap();
     fs::write(locked.join("secret.bin"), vec![0u8; 100]).unwrap();
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-    let _unlock = Unlock(&locked);
+    let _unlock = common::lock(&locked);
 
     let tree = scan_to_tree(dir.path());
 

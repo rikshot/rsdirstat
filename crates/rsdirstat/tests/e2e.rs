@@ -11,7 +11,7 @@ use common::{
 use futures_util::future::LocalBoxFuture;
 use futures_util::{FutureExt, StreamExt};
 use playwright_rs::expect;
-use playwright_rs::protocol::{HoverOptions, Position, WaitForFunctionOptions, WaitForOptions};
+use playwright_rs::protocol::{HoverOptions, Position, WaitForOptions};
 
 /// Run `f` on a new page in Chromium, traced under `chromium-<case>`; `f` navigates it.
 async fn in_chromium(case: &str, f: impl AsyncFnOnce(&playwright_rs::Page)) {
@@ -304,15 +304,8 @@ async fn picker_volume_click_starts_scan(page: &playwright_rs::Page) {
     page.locator(".volume-card:first-child").click(None).await.unwrap();
 
     // The page shows the treemap view as soon as a card is clicked, so wait for what only the
-    // server's `ScanStart` brings: the scan's running time in the status bar (or, for a quick scan,
-    // its summary). It comes before the scan produces anything, so this is safe for CI whatever the
-    // disk's size.
-    page.wait_for_function(
-        "() => /Scanning|dirs/.test(document.querySelector('#status')?.textContent ?? '')",
-        WaitForFunctionOptions::default().timeout(10_000.0),
-    )
-    .await
-    .expect("clicking a volume should start a scan");
+    // server's `ScanStart` brings.
+    common::wait_for_scan_start(page, "clicking a volume should start a scan").await;
 }
 
 async fn picker_has_volume_details(page: &playwright_rs::Page) {
@@ -538,12 +531,7 @@ async fn unopenable_root_falls_back_to_picker(page: &playwright_rs::Page) {
         .expect("a new tab should start on the volume picker");
 
     page.locator(".volume-card").first().click(None).await.unwrap();
-    page.wait_for_function(
-        "() => /Scanning|dirs/.test(document.querySelector('#status')?.textContent ?? '')",
-        WaitForFunctionOptions::default().timeout(10_000.0),
-    )
-    .await
-    .expect("picking a volume should start a scan");
+    common::wait_for_scan_start(page, "picking a volume should start a scan").await;
 }
 
 #[tokio::test]
@@ -610,7 +598,7 @@ async fn e2e_wait_mode_start_button_starts_scan() {
 // uncancelled whole-disk scan kept the process alive until it finished (60–100s on CI runners). And
 // it must be a clean exit, not a kill, or the server's coverage data is lost.
 #[test]
-fn e2e_stop_mid_scan_exits_promptly() {
+fn server_stops_promptly_mid_scan() {
     let mut server = TestServer::start(std::path::Path::new("/"));
     std::thread::sleep(Duration::from_millis(500));
     let started = Instant::now();
@@ -652,7 +640,7 @@ fn open_tab(server: &TestServer) -> TcpStream {
 /// The server exits a few seconds after its last tab closes, but not when a tab reloads: that
 /// closes its connection and opens a new one within the grace period.
 #[test]
-fn e2e_server_exits_after_its_last_tab_closes() {
+fn server_exits_after_its_last_tab_closes() {
     let mut server = TestServer::start_picker();
     drop(open_tab(&server));
     let first_closed = Instant::now();
@@ -715,7 +703,7 @@ fn http_response(server: &TestServer, path: &str, host: Option<&str>, headers: &
 /// A DNS-rebinding page sees this server as same-origin under the attacker's hostname; only its
 /// `Host` header gives it away, so every request must name this machine.
 #[test]
-fn e2e_requests_for_another_host_are_refused() {
+fn server_refuses_requests_for_another_host() {
     let server = TestServer::start_picker();
     // Nor shown in another site's frame.
     let page = http_response(&server, "/", None, &[]).to_ascii_lowercase();
@@ -739,9 +727,9 @@ fn e2e_requests_for_another_host_are_refused() {
 /// Another program, or another user of the machine, can connect to the port, but has no session:
 /// the API and the page refuse it. The address the server printed gives a browser the cookie.
 #[test]
-fn e2e_requests_without_the_session_are_refused() {
+fn server_refuses_requests_without_the_session() {
     let server = TestServer::start_picker();
-    let token = server.url.rsplit_once("token=").unwrap().1;
+    let token = server.token();
     let wrong = format!("rsdirstat-{}={}", server.port(), "0".repeat(token.len()));
     for cookie in ["", wrong.as_str()] {
         for path in ["/volumes", "/start", "/ws", "/"] {
@@ -774,7 +762,7 @@ fn e2e_requests_without_the_session_are_refused() {
 /// send them a request (an `<img src=…/start>` carries no `Origin`), but the browser labels it
 /// cross-site.
 #[test]
-fn e2e_cross_site_api_requests_are_refused() {
+fn server_refuses_cross_site_api_requests() {
     let server = TestServer::start_picker();
     for site in ["same-origin", "none"] {
         assert_eq!(

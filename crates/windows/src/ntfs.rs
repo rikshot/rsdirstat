@@ -355,16 +355,14 @@ impl Mft {
             let EntryKind::File { size } = file.kind() else {
                 continue;
             };
-            let mut counted = false;
-            for (parent, name) in &mut file.names {
-                let Some(folder_place) = placed(*parent) else { continue };
-                let folder = &mut files[folder_place];
-                if counted {
-                    folder.mtime = folder.mtime.max(file.mtime);
-                } else {
-                    folder.add(std::mem::take(name), size, file.mtime);
-                    counted = true;
-                }
+            let mut places = file
+                .names
+                .iter_mut()
+                .filter_map(|(parent, name)| Some((placed(*parent)?, name)));
+            let Some((first, name)) = places.next() else { continue };
+            files[first].add(std::mem::take(name), size, file.mtime);
+            for (other, _) in places {
+                files[other].date(file.mtime);
             }
         }
 

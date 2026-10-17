@@ -129,7 +129,8 @@ fn top_n<T>(items: &mut Vec<T>, n: usize, key: impl Fn(&T) -> u64) {
 fn print_entries(entries: impl Iterator<Item = (PathBuf, u64)>) -> Result<()> {
     let rows: Vec<(String, PathBuf)> = entries.map(|(path, size)| (format_size(size), path)).collect();
     let width = rows.iter().map(|(size, _)| size.len()).max().unwrap_or(0);
-    let mut out = std::io::stdout().lock();
+    // Buffered: stdout writes each line on its own otherwise, a syscall per row.
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     let written = rows
         .iter()
         .try_for_each(|(size, path)| writeln!(out, "{size:>width$}  {}", path.display()))

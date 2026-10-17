@@ -139,19 +139,10 @@ fn gui_rejects_a_file_before_starting() {
 #[cfg(unix)]
 #[test]
 fn gui_rejects_an_unreadable_folder_before_starting() {
-    use std::os::unix::fs::PermissionsExt;
-    /// Lists `locked` again, even when the test fails, so its temporary folder can be removed.
-    struct Unlock<'a>(&'a Path);
-    impl Drop for Unlock<'_> {
-        fn drop(&mut self) {
-            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
-        }
-    }
     let dir = tempfile::tempdir().unwrap();
     let locked = dir.path().join("locked");
     fs::create_dir(&locked).unwrap();
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-    let _unlock = Unlock(&locked);
+    let _unlock = common::lock(&locked);
     // Root lists it anyway.
     if fs::read_dir(&locked).is_err() {
         assert_gui_rejects(&locked);

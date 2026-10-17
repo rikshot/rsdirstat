@@ -177,11 +177,15 @@ impl TestServer {
         self.authority().rsplit_once(':').unwrap().1.parse().unwrap()
     }
 
+    /// The session's token, from the address.
+    pub fn token(&self) -> &str {
+        self.url.rsplit_once("token=").expect("the URL carries a token").1
+    }
+
     /// The cookie a browser gets for the session, as a `Cookie` header's value, for requests made
     /// without one.
     pub fn cookie(&self) -> String {
-        let token = self.url.rsplit_once("token=").expect("the URL carries a token").1;
-        format!("rsdirstat-{}={token}", self.port())
+        format!("rsdirstat-{}={}", self.port(), self.token())
     }
 
     pub fn is_running(&mut self) -> bool {
@@ -280,6 +284,39 @@ pub async fn new_page(browser: &playwright_rs::Browser, width: u32, height: u32)
         .await
         .unwrap();
     page
+}
+
+/// Wait for the server's `ScanStart` to reach the page, which then shows the scan's running time in
+/// the status bar (or, for a quick scan, its summary). It comes before the scan finds anything, so
+/// this is quick whatever the disk's size.
+pub async fn wait_for_scan_start(page: &playwright_rs::Page, what: &str) {
+    page.wait_for_function(
+        "() => /Scanning|dirs/.test(document.querySelector('#status')?.textContent ?? '')",
+        WaitForFunctionOptions::default().timeout(10_000.0),
+    )
+    .await
+    .expect(what);
+}
+
+/// Take every permission from `path` until the guard is dropped, which gives them back even when the
+/// test fails, so its temporary folder can still be removed.
+#[cfg(unix)]
+pub fn lock(path: &Path) -> Unlock {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    Unlock(path.to_path_buf())
+}
+
+/// See `lock`.
+#[cfg(unix)]
+pub struct Unlock(PathBuf);
+
+#[cfg(unix)]
+impl Drop for Unlock {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
 }
 
 /// Wait for the scan to finish and its last layout to be drawn, so callers can assert on or

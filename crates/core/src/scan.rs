@@ -60,7 +60,7 @@ pub struct DirFiles {
 impl DirFiles {
     /// A file of `size` bytes, modified at `mtime` (Unix seconds).
     pub fn add(&mut self, name: impl Into<String>, size: u64, mtime: i64) {
-        self.mtime = self.mtime.max(mtime);
+        self.date(mtime);
         if size > 0 {
             self.files.push(ScannedFile {
                 name: name.into(),
@@ -68,6 +68,12 @@ impl DirFiles {
                 mtime,
             });
         }
+    }
+
+    /// A file modified at `mtime` whose bytes count elsewhere: a hardlink's name after the first.
+    /// It is still a file of this directory, as new as it is.
+    pub fn date(&mut self, mtime: i64) {
+        self.mtime = self.mtime.max(mtime);
     }
 }
 
@@ -255,7 +261,7 @@ const READ_BUFFER_SIZE: usize = 64 * 1024;
 /// worker (a dead network mount, typically) trips it, not a merely slow or huge directory. Long
 /// enough for storage that is only waking up: a disk spinning up from standby, a NAS waking from
 /// hibernation, a network share reconnecting, which take seconds before the first read returns.
-const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many entries a worker reports between recordings of progress. A huge directory on slow
 /// storage takes a syscall per entry (a `statx`, or opening a subdirectory), so a read from the OS
@@ -471,7 +477,7 @@ pub struct DirSink<'a, H> {
 
 impl<H> DirSink<'_, H> {
     /// The full path of the entry `name` in this directory.
-    pub fn child_path(&self, name: &str) -> String {
+    fn child_path(&self, name: &str) -> String {
         format!(
             "{}{MAIN_SEPARATOR}{name}",
             self.dir_path.trim_end_matches(MAIN_SEPARATOR)
@@ -498,13 +504,12 @@ impl<H> DirSink<'_, H> {
     /// seen, as `du` does.
     pub fn file(&mut self, name: impl Into<String>, size: u64, mtime: i64, hardlink: Option<u64>) {
         self.count_entry();
+        // A second name counts under whichever of its directories a worker happened to reach first.
         if hardlink.is_some_and(|id| !self.shared.visited_files.insert(id)) {
-            // Its bytes count under its first name, but it is still a file of this directory, as new
-            // as it is (whichever of its directories a worker happened to reach first).
-            self.files.mtime = self.files.mtime.max(mtime);
-            return;
+            self.files.date(mtime);
+        } else {
+            self.files.add(name, size, mtime);
         }
-        self.files.add(name, size, mtime);
     }
 
     /// Report that the directory couldn't be read in full, or one of its subdirectories opened, for

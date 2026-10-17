@@ -125,13 +125,9 @@ pub fn format_size(bytes: u64) -> String {
     }
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
     // By the value as it will be rounded: 1023.7 KiB is "1.00 MiB", not "1024 KiB", and 9.996 KiB
     // is "10.0 KiB", not "10.00 KiB".
-    if value.round() >= 1024.0 && unit < UNITS.len() - 1 {
+    while value.round() >= 1024.0 && unit < UNITS.len() - 1 {
         value /= 1024.0;
         unit += 1;
     }
