@@ -103,6 +103,9 @@ pub const DEFAULT_DEPTH: u8 = 6;
 pub const MAX_DEPTH: u8 = 10;
 /// Largest viewport side the server lays out, in CSS pixels: past any real display.
 pub const MAX_VIEWPORT: f32 = 16_384.0;
+/// Smallest side, in CSS pixels, of a rect the page draws: the layout leaves smaller ones out rather
+/// than send what won't be seen.
+pub const MIN_DRAWN_SIDE: f64 = 1.0;
 /// What the treemap colours rects by.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorMode {
@@ -237,7 +240,8 @@ impl ClientMessage {
     }
 
     /// Canonicalize incoming values regardless of what a client sent: clamp the depth to its valid
-    /// range, and take extensions without the dot (or `*.`) people often type before them.
+    /// range, and take extensions without the spaces around them or the dot (or `*.`) people often
+    /// type before them.
     fn normalize(&mut self) {
         match self {
             ClientMessage::Viewport { width, height } => {
@@ -254,8 +258,9 @@ impl ClientMessage {
             ClientMessage::SetDepth { depth } => *depth = (*depth).clamp(1, MAX_DEPTH),
             ClientMessage::Filter { extensions, .. } => {
                 for extension in extensions.iter_mut() {
-                    if extension.starts_with(['*', '.']) {
-                        *extension = extension.trim_start_matches(['*', '.']).into();
+                    let bare = extension.trim().trim_start_matches(['*', '.']).trim_start();
+                    if bare.len() != extension.len() {
+                        *extension = bare.into();
                     }
                 }
                 extensions.retain(|extension| !extension.is_empty());
@@ -488,6 +493,9 @@ mod tests {
         ]);
         let expected = filter(vec!["mp4".into(), "MOV".into(), "rs".into(), "tar.gz".into()]);
         assert_eq!(client_roundtrip(msg), expected);
+        // Another client than the page may leave the spaces around them in.
+        let spaced = filter(vec![" rs".into(), " .mp4 ".into(), "  ".into()]);
+        assert_eq!(client_roundtrip(spaced), filter(vec!["rs".into(), "mp4".into()]));
     }
 
     /// A client's message is a few KB at most; one that would unpack to far more is refused rather

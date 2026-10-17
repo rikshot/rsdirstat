@@ -61,6 +61,23 @@ pub struct DirNode {
     pub changed: u64,
 }
 
+/// What a directory holds of the files a filter matches: their total size, and the newest of their
+/// modification times (0 with none), which Age mode colours a folder by while the filter is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FilteredTotal {
+    pub size: u64,
+    pub mtime: i64,
+}
+
+impl FilteredTotal {
+    fn add(self, size: u64, mtime: i64) -> Self {
+        Self {
+            size: self.size.saturating_add(size),
+            mtime: self.mtime.max(mtime),
+        }
+    }
+}
+
 #[derive(Clone, Default, PartialEq)]
 pub struct FilterConfig {
     pub extensions: Vec<Box<str>>,
@@ -74,31 +91,64 @@ impl FilterConfig {
     }
 
     pub fn matches_file(&self, name: &str, size: u64) -> bool {
-        if size < self.min_size {
+        self.matcher().matches(name, size)
+    }
+
+    /// `matches_file` with what it needs of the filter prepared once, for checking many files.
+    pub fn matcher(&self) -> FileMatcher<'_> {
+        FileMatcher {
+            filter: self,
+            lowercase_pattern: (!self.name_pattern.is_ascii()).then(|| self.name_pattern.to_lowercase()),
+        }
+    }
+}
+
+/// A `FilterConfig` ready to check files with (see `FilterConfig::matcher`).
+pub struct FileMatcher<'a> {
+    filter: &'a FilterConfig,
+    /// The name pattern in lower case, if it isn't ASCII; an ASCII one is compared byte by byte.
+    lowercase_pattern: Option<String>,
+}
+
+impl FileMatcher<'_> {
+    pub fn matches(&self, name: &str, size: u64) -> bool {
+        let filter = self.filter;
+        if size < filter.min_size {
             return false;
         }
-        if !self.name_pattern.is_empty() {
-            let pattern = self.name_pattern.as_bytes();
-            if !name
-                .as_bytes()
-                .windows(pattern.len())
-                .any(|window| window.eq_ignore_ascii_case(pattern))
-            {
-                return false;
-            }
+        if !self.name_matches(name) {
+            return false;
         }
-        if !self.extensions.is_empty() {
-            let extension = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-            if !self
-                .extensions
-                .iter()
-                .any(|e| e.as_ref().eq_ignore_ascii_case(extension))
-            {
-                return false;
-            }
+        if !filter.extensions.is_empty() && !filter.extensions.iter().any(|extension| has_extension(name, extension)) {
+            return false;
         }
         true
     }
+
+    /// Whether `name` contains the pattern, ignoring case: byte by byte for an ASCII pattern, the
+    /// usual kind, and by Unicode lower case otherwise, so `kesä` finds `KESÄ.jpg`.
+    fn name_matches(&self, name: &str) -> bool {
+        let pattern = &self.filter.name_pattern;
+        if let Some(lowercase) = &self.lowercase_pattern {
+            name.to_lowercase().contains(lowercase.as_str())
+        } else if pattern.is_empty() {
+            true
+        } else {
+            let pattern = pattern.as_bytes();
+            name.as_bytes()
+                .windows(pattern.len())
+                .any(|window| window.eq_ignore_ascii_case(pattern))
+        }
+    }
+}
+
+/// Whether `name` ends in `.` and `extension`, ignoring ASCII case. An extension can have dots of
+/// its own (`tar.gz`), which comparing it with the text after the name's last dot would never match.
+fn has_extension(name: &str, extension: &str) -> bool {
+    let (name, extension) = (name.as_bytes(), extension.as_bytes());
+    name.len() > extension.len()
+        && name[name.len() - extension.len() - 1] == b'.'
+        && name[name.len() - extension.len()..].eq_ignore_ascii_case(extension)
 }
 
 pub struct DirTree {
@@ -294,25 +344,28 @@ impl DirTree {
         }
     }
 
-    /// Sizes counting only the files `filter` matches, for the subtree under `root` (the layout
+    /// Totals counting only the files `filter` matches, for the subtree under `root` (the layout
     /// never looks outside the directory being viewed).
-    pub fn compute_filtered_sizes(&self, filter: &FilterConfig, root: u64) -> NodeMap<u64> {
+    pub fn compute_filtered_sizes(&self, filter: &FilterConfig, root: u64) -> NodeMap<FilteredTotal> {
         let order = self.subtree_order(root);
-        let mut sizes = NodeMap::with_capacity_and_hasher(order.len(), Default::default());
+        let matcher = filter.matcher();
+        let mut totals: NodeMap<FilteredTotal> = NodeMap::with_capacity_and_hasher(order.len(), Default::default());
         for &id in order.iter().rev() {
             if let Some(node) = self.nodes.get(&id) {
                 let own = node
                     .files
                     .iter()
-                    .filter(|file| filter.matches_file(&file.name, file.size))
-                    .fold(0u64, |total, file| total.saturating_add(file.size));
-                let size = node.children.iter().fold(own, |total, child| {
-                    total.saturating_add(sizes.get(child).copied().unwrap_or(0))
-                });
-                sizes.insert(id, size);
+                    .filter(|file| matcher.matches(&file.name, file.size))
+                    .fold(FilteredTotal::default(), |total, file| total.add(file.size, file.mtime));
+                let total = node
+                    .children
+                    .iter()
+                    .filter_map(|child| totals.get(child))
+                    .fold(own, |total, child| total.add(child.size, child.mtime));
+                totals.insert(id, total);
             }
         }
-        sizes
+        totals
     }
 
     pub fn breadcrumb(&self, view_root: u64) -> Vec<BreadcrumbEntry> {
@@ -479,6 +532,37 @@ mod tests {
             ..Default::default()
         };
         assert!(upper.matches_file("readme.md", 10), "either side's case");
+    }
+
+    #[test]
+    fn filter_name_pattern_ignores_case_beyond_ascii() {
+        let f = FilterConfig {
+            name_pattern: "kesä".into(),
+            ..Default::default()
+        };
+        assert!(f.matches_file("KESÄ_2024.jpg", 10));
+        assert!(f.matches_file("loma-kesä.png", 10));
+        assert!(!f.matches_file("kesa.png", 10));
+    }
+
+    /// An extension with dots of its own matches the end of the name, not just its last part.
+    #[test]
+    fn filter_extensions_with_dots() {
+        let f = FilterConfig {
+            extensions: vec!["tar.gz".into()],
+            ..Default::default()
+        };
+        assert!(f.matches_file("backup.tar.gz", 10));
+        assert!(f.matches_file("BACKUP.TAR.GZ", 10));
+        assert!(!f.matches_file("notes.gz", 10));
+        assert!(!f.matches_file("xtar.gz", 10), "only after a dot");
+        assert!(!f.matches_file("tar.gz", 10), "a name, not an extension");
+        let gz = FilterConfig {
+            extensions: vec!["gz".into()],
+            ..Default::default()
+        };
+        assert!(gz.matches_file("backup.tar.gz", 10));
+        assert!(gz.matches_file(".gz", 10), "a dotfile's name counts, as before");
     }
 
     #[test]
@@ -804,22 +888,23 @@ mod tests {
             2,
             1,
             "src",
-            &[("main.rs", 500, 100), ("lib.rs", 300, 100), ("notes.txt", 200, 100)],
+            &[("main.rs", 500, 100), ("lib.rs", 300, 200), ("notes.txt", 200, 900)],
         );
 
         let filter = FilterConfig {
             extensions: vec!["rs".into()],
             ..Default::default()
         };
+        let total = |size, mtime| FilteredTotal { size, mtime };
         let sizes = tree.compute_filtered_sizes(&filter, 1);
-        // src dir: main.rs(500) + lib.rs(300) = 800
-        assert_eq!(sizes[&2], 800);
+        // src dir: main.rs(500) + lib.rs(300) = 800, as new as lib.rs: notes.txt doesn't count.
+        assert_eq!(sizes[&2], total(800, 200));
         // root: sum of children = 800
-        assert_eq!(sizes[&1], 800);
+        assert_eq!(sizes[&1], total(800, 200));
 
         // Folding from a subtree covers just that subtree.
         let sizes = tree.compute_filtered_sizes(&filter, 2);
-        assert_eq!(sizes.get(&2), Some(&800));
+        assert_eq!(sizes.get(&2), Some(&total(800, 200)));
         assert_eq!(sizes.get(&1), None);
     }
 
@@ -830,6 +915,6 @@ mod tests {
 
         let filter = FilterConfig::default();
         let sizes = tree.compute_filtered_sizes(&filter, 1);
-        assert_eq!(sizes[&1], 300);
+        assert_eq!(sizes[&1].size, 300);
     }
 }

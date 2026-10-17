@@ -1,7 +1,7 @@
-use rsdirstat_protocol::{ColorMode, LayoutRect, RectKind};
+use rsdirstat_protocol::{ColorMode, LayoutRect, MIN_DRAWN_SIDE, RectKind};
 
 use crate::color::{age_hue, hash_id_to_hue};
-use crate::tree::{DirNode, DirTree, FileEntry, FilterConfig, NodeMap};
+use crate::tree::{DirNode, DirTree, FileEntry, FileMatcher, FilterConfig, FilteredTotal, NodeMap};
 
 const MIN_NEST_PX: f64 = 40.0;
 
@@ -29,11 +29,11 @@ pub struct Layout {
 pub struct FilteredSizes {
     /// What `sizes` were computed for: the view root, as of when it last `changed`, and the filter.
     key: Option<(u64, u64, FilterConfig)>,
-    sizes: NodeMap<u64>,
+    sizes: NodeMap<FilteredTotal>,
 }
 
 impl FilteredSizes {
-    fn get(&mut self, tree: &DirTree, filter: &FilterConfig, view_root: u64, changed: u64) -> &NodeMap<u64> {
+    fn get(&mut self, tree: &DirTree, filter: &FilterConfig, view_root: u64, changed: u64) -> &NodeMap<FilteredTotal> {
         let fresh = self
             .key
             .as_ref()
@@ -66,6 +66,7 @@ pub fn compute_layout(
     let mut ctx = LayoutCtx {
         tree,
         filtered_sizes,
+        matcher: config.filter.matcher(),
         config,
         out: Vec::new(),
     };
@@ -104,8 +105,11 @@ enum ItemKind<'a> {
     /// A folder, with its node id.
     Dir(u64, &'a DirNode),
     File(&'a FileEntry),
-    /// Files too small to draw individually, summed into one "(other files)" rect.
-    Aggregate,
+    /// Files too small to draw individually, summed into one "(other files)" rect, with the newest
+    /// of their modification times.
+    Aggregate {
+        mtime: i64,
+    },
 }
 
 struct LayoutItem<'a> {
@@ -116,9 +120,11 @@ struct LayoutItem<'a> {
 /// Per-call layout state: the inputs every level needs plus the output.
 struct LayoutCtx<'a> {
     tree: &'a DirTree,
-    /// With a filter active, sizes counting only the files it matches; otherwise each directory's
-    /// own `size` is used.
-    filtered_sizes: Option<&'a NodeMap<u64>>,
+    /// With a filter active, totals counting only the files it matches; otherwise each directory's
+    /// own `size` and `mtime` are used.
+    filtered_sizes: Option<&'a NodeMap<FilteredTotal>>,
+    /// The filter, prepared to check files with.
+    matcher: FileMatcher<'a>,
     config: &'a LayoutConfig<'a>,
     out: Vec<LayoutRect>,
 }
@@ -126,8 +132,17 @@ struct LayoutCtx<'a> {
 impl<'a> LayoutCtx<'a> {
     fn size(&self, id: u64, node: &DirNode) -> u64 {
         match self.filtered_sizes {
-            Some(sizes) => sizes.get(&id).copied().unwrap_or(0),
+            Some(totals) => totals.get(&id).map_or(0, |total| total.size),
             None => node.size,
+        }
+    }
+
+    /// The newest modification time of what the view shows under `node`: with a filter active, of
+    /// the files it matches, as the size counts only those.
+    fn mtime(&self, id: u64, node: &DirNode) -> i64 {
+        match self.filtered_sizes {
+            Some(totals) => totals.get(&id).map_or(0, |total| total.mtime),
+            None => node.mtime,
         }
     }
 
@@ -173,10 +188,9 @@ impl<'a> LayoutCtx<'a> {
             f64::MAX
         };
         let mut residual: u64 = 0;
+        let mut residual_mtime: i64 = 0;
         for file in &node.files {
-            if file.size == 0
-                || (self.filtered_sizes.is_some() && !self.config.filter.matches_file(&file.name, file.size))
-            {
+            if file.size == 0 || (self.filtered_sizes.is_some() && !self.matcher.matches(&file.name, file.size)) {
                 continue;
             }
             if (file.size as f64) >= min_file_size {
@@ -186,19 +200,22 @@ impl<'a> LayoutCtx<'a> {
                 });
             } else {
                 residual += file.size;
+                residual_mtime = residual_mtime.max(file.mtime);
             }
         }
         if residual > 0 {
             items.push(LayoutItem {
                 size: residual,
-                kind: ItemKind::Aggregate,
+                kind: ItemKind::Aggregate { mtime: residual_mtime },
             });
         }
 
         if items.is_empty() {
             return;
         }
-        items.sort_unstable_by_key(|item| std::cmp::Reverse(item.size));
+        // Stable, so siblings of equal size keep their order from one layout to the next instead of
+        // trading places as the scan streams in.
+        items.sort_by_key(|item| std::cmp::Reverse(item.size));
 
         let mut rects = Vec::with_capacity(items.len());
         squarify(&items, content, &mut rects);
@@ -206,13 +223,13 @@ impl<'a> LayoutCtx<'a> {
         // The zip relies on squarify emitting exactly one rect per item, in input order.
         debug_assert_eq!(rects.len(), items.len(), "squarify must emit one rect per item");
         for (r, item) in rects.into_iter().zip(&items) {
-            // Skip any rect the client won't draw (it filters `w >= 1 && h >= 1`) before it is
+            // Skip any rect the client won't draw (`MIN_DRAWN_SIDE`) before it is
             // serialized + deflated into the payload sent ~20×/sec during a scan. This pays off
             // because directories — unlike files, which aggregate below `min_file_size` — get a rect per
             // non-empty child with no size floor, so a high-fan-out dir (Windows WinSxS, the driver/
-            // component store) otherwise emits thousands of sub-pixel rects. A sub-pixel rect never
-            // satisfies `can_nest` (which needs >= MIN_NEST_PX), so culling here drops nothing nested.
-            if r.w < 1.0 || r.h < 1.0 {
+            // component store) otherwise emits thousands of sub-pixel rects. A sub-pixel rect is far
+            // below MIN_NEST_PX, so culling here drops nothing that would have been opened up.
+            if r.w < MIN_DRAWN_SIDE || r.h < MIN_DRAWN_SIDE {
                 continue;
             }
             // Files and "(other files)" keep id 0 (see `LayoutRect::id`).
@@ -229,10 +246,11 @@ impl<'a> LayoutCtx<'a> {
             let mut nest = None;
             match item.kind {
                 ItemKind::Dir(id, child) => {
+                    let mtime = self.mtime(id, child);
                     rect.id = id;
                     rect.name = child.name.to_string();
-                    rect.hue = self.hue(child.hue, child.mtime);
-                    rect.mtime = child.mtime;
+                    rect.hue = self.hue(child.hue, mtime);
+                    rect.mtime = mtime;
                     // `max_depth` is the number of levels shown: this rect sits on level `depth + 1`,
                     // so opening it puts its contents on `depth + 2`. Any folder with room opens up,
                     // including one holding only files, which would otherwise stay a solid block at
@@ -248,9 +266,10 @@ impl<'a> LayoutCtx<'a> {
                     rect.mtime = file.mtime;
                     rect.kind = RectKind::File;
                 }
-                ItemKind::Aggregate => {
+                ItemKind::Aggregate { mtime } => {
                     rect.name = "(other files)".to_string();
-                    rect.hue = hash_id_to_hue(node_id);
+                    rect.hue = self.hue(hash_id_to_hue(node_id), mtime);
+                    rect.mtime = mtime;
                     rect.kind = RectKind::OtherFiles;
                 }
             }
@@ -259,14 +278,22 @@ impl<'a> LayoutCtx<'a> {
             let header = f64::from(rect.header_height());
             self.out.push(rect);
             if let Some((id, child)) = nest {
+                let container = self.out.len() - 1;
                 self.layout_node(id, child, item.size, r, header, depth + 1);
+                // Everything inside was too small to draw (a folder of thousands of tiny subfolders,
+                // which don't fold into "(other files)" as files do): draw the folder as one block,
+                // not as an empty dark box.
+                if self.out.len() == container + 1 {
+                    self.out[container].kind = RectKind::Dir;
+                }
             }
         }
     }
 }
 
 /// Squarified treemap: split `bounds` among `items` (sorted by descending size) and push exactly
-/// one rect per item, in input order, until the space or the remaining size runs out.
+/// one rect per item, in input order. Items left when the space or the remaining size runs out get
+/// a zero-size rect each, for the caller to cull.
 fn squarify(items: &[LayoutItem], mut bounds: Rect, out: &mut Vec<Rect>) {
     let size = |item: &LayoutItem| item.size as f64;
     let mut area_left: f64 = items.iter().map(size).sum();
@@ -347,6 +374,13 @@ fn squarify(items: &[LayoutItem], mut bounds: Rect, out: &mut Vec<Rect>) {
         area_left -= row_area;
         lo = split;
     }
+    // Only a level of 2^53 bytes or more (an exabyte sparse file beside small ones) gets here with
+    // items left: f64 can no longer tell its sizes apart, and what's left would be sub-pixel anyway.
+    out.extend((lo..hi).map(|_| Rect {
+        w: 0.0,
+        h: 0.0,
+        ..bounds
+    }));
 }
 
 #[cfg(test)]
@@ -399,6 +433,143 @@ mod tests {
         let rect = |name: &str| rects.iter().find(|rect| rect.name == name).unwrap();
         assert_eq!((rect("old").hue, rect("old").mtime), (0, 1_000), "oldest: red");
         assert_eq!((rect("new").hue, rect("new").mtime), (120, 2_000), "newest: green");
+    }
+
+    /// Two folders, each with one big file and many tiny ones (folded into "(other files)"), the
+    /// first all at mtime 1000 and the second all at 2000.
+    fn folders_of_tiny_files() -> DirTree {
+        let mut tree = DirTree::new();
+        tree.add_dir(1, 0, "root", &[]);
+        for (id, mtime) in [(2, 1_000), (3, 2_000)] {
+            let names: Vec<String> = (0..2_000).map(|i| format!("f{i}")).collect();
+            let mut files: Vec<(&str, u64, i64)> = names.iter().map(|name| (name.as_str(), 500, mtime)).collect();
+            files.push(("big.bin", 100_000_000, mtime));
+            tree.add_dir(id, 1, &format!("d{id}"), &files);
+        }
+        tree
+    }
+
+    /// In Age mode "(other files)" takes the colour and date of the newest file in it, like any
+    /// other rect, not a hue from its folder's id.
+    #[test]
+    fn age_colours_other_files_by_their_newest() {
+        let tree = folders_of_tiny_files();
+        let other_files = |color_mode| {
+            let config = LayoutConfig {
+                max_depth: 6,
+                color_mode,
+                ..default_config()
+            };
+            let mut found: Vec<_> = layout(&tree, 1, 1280.0, 660.0, &config)
+                .into_iter()
+                .filter(|rect| rect.kind == RectKind::OtherFiles)
+                .map(|rect| (rect.parent_id, rect.hue, rect.mtime))
+                .collect();
+            found.sort_unstable();
+            found
+        };
+        assert_eq!(other_files(ColorMode::Age), [(2, 0, 1_000), (3, 120, 2_000)]);
+        assert_eq!(
+            other_files(ColorMode::Type),
+            [(2, hash_id_to_hue(2), 1_000), (3, hash_id_to_hue(3), 2_000)],
+            "Type mode keeps its colours"
+        );
+    }
+
+    /// With a filter on, a folder is as new as the newest file the filter shows in it.
+    #[test]
+    fn age_under_a_filter_counts_only_the_files_it_shows() {
+        let mut tree = DirTree::new();
+        tree.add_dir(1, 0, "root", &[]);
+        tree.add_dir(2, 1, "old-videos", &[("a.mp4", 5_000, 1_000), (".DS_Store", 10, 9_000)]);
+        tree.add_dir(3, 1, "new-videos", &[("b.mp4", 5_000, 5_000)]);
+        let mp4 = FilterConfig {
+            extensions: vec!["mp4".into()],
+            ..FilterConfig::default()
+        };
+        let config = LayoutConfig {
+            max_depth: 1,
+            color_mode: ColorMode::Age,
+            filter: &mp4,
+        };
+        let rects = layout(&tree, 1, 800.0, 600.0, &config);
+        let rect = |name: &str| rects.iter().find(|rect| rect.name == name).unwrap();
+        assert_eq!(rect("old-videos").mtime, 1_000, "not the hidden .DS_Store's 9000");
+        assert_eq!(rect("new-videos").mtime, 5_000);
+    }
+
+    /// A folder whose contents are all too small to draw is drawn as one block, not opened up into
+    /// an empty box.
+    #[test]
+    fn a_folder_of_only_tiny_subfolders_is_a_block() {
+        let mut tree = DirTree::new();
+        tree.add_dir(1, 0, "root", &[("big", 400_000_000, 0)]);
+        tree.add_dir(2, 1, "WinSxS", &[]);
+        for id in 3..100_003 {
+            tree.add_dir(id, 2, "tiny", &[("f", 1_000, 0)]);
+        }
+        let rects = layout(&tree, 1, 800.0, 600.0, &default_config());
+        let winsxs = rects.iter().find(|rect| rect.name == "WinSxS").unwrap();
+        assert_eq!(winsxs.kind, RectKind::Dir);
+        assert!(rects.iter().all(|rect| rect.parent_id != 2), "nothing drawn inside");
+    }
+
+    /// A level whose sizes f64 can't tell apart (an exabyte sparse file beside small ones) lays out
+    /// without the leftover items, instead of tripping the one-rect-per-item check.
+    #[test]
+    fn sizes_beyond_f64_precision_lay_out() {
+        let mut tree = DirTree::new();
+        tree.add_dir(1, 0, "root", &[("sparse.img", 1 << 60, 0), ("small", 1, 0)]);
+        tree.add_dir(2, 1, "a", &[("x", 1_000, 0)]);
+        let rects = layout(&tree, 1, 800.0, 600.0, &default_config());
+        assert!(rects.iter().any(|rect| rect.name == "sparse.img"));
+    }
+
+    /// Siblings of equal size keep their places when another sibling grows past them.
+    #[test]
+    fn equal_siblings_keep_their_order() {
+        let mut tree = DirTree::new();
+        tree.add_dir(1, 0, "root", &[]);
+        for id in 2..12 {
+            tree.add_dir(id, 1, &format!("eq{id}"), &[("f", 1_000, 0)]);
+        }
+        tree.add_dir(12, 1, "grower", &[("f", 10, 0)]);
+        let order = |tree: &DirTree| -> Vec<String> {
+            layout(tree, 1, 800.0, 600.0, &default_config())
+                .into_iter()
+                .filter(|rect| rect.name.starts_with("eq"))
+                .map(|rect| rect.name)
+                .collect()
+        };
+        let before = order(&tree);
+        tree.add_dir(13, 12, "more", &[("g", 50_000, 0)]);
+        assert_eq!(order(&tree), before);
+    }
+
+    /// A filtered view laid out again with nothing changed under it (a resize) reuses its sizes,
+    /// and sees a change under it.
+    #[test]
+    fn filtered_sizes_are_reused_until_the_view_changes() {
+        let mut tree = DirTree::new();
+        tree.add_dir(1, 0, "root", &[]);
+        tree.add_dir(2, 1, "src", &[("main.rs", 5_000, 1)]);
+        let rs = FilterConfig {
+            extensions: vec!["rs".into()],
+            ..FilterConfig::default()
+        };
+        let config = LayoutConfig {
+            filter: &rs,
+            ..default_config()
+        };
+        let mut filtered = FilteredSizes::default();
+        let first = compute_layout(&tree, 1, 800.0, 600.0, &config, &mut filtered);
+        let key = filtered.key.clone();
+        let resized = compute_layout(&tree, 1, 640.0, 480.0, &config, &mut filtered);
+        assert!(filtered.key == key, "a resize keeps the sizes");
+        assert_eq!((first.size, resized.size), (5_000, 5_000));
+        tree.add_dir(3, 1, "lib", &[("lib.rs", 3_000, 1)]);
+        let grown = compute_layout(&tree, 1, 640.0, 480.0, &config, &mut filtered);
+        assert_eq!(grown.size, 8_000, "a change under the view is seen");
     }
 
     #[test]

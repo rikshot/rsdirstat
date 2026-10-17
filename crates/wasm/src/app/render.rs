@@ -266,7 +266,7 @@ fn draw_rects(ctx: &CanvasRenderingContext2d, rects: &[RenderRect], draw_labels:
     let mut state = DrawState::default();
 
     let mut order: Vec<usize> = (0..rects.len())
-        .filter(|&i| rects[i].w >= 1.0 && rects[i].h >= 1.0)
+        .filter(|&i| rects[i].w >= wire::MIN_DRAWN_SIDE && rects[i].h >= wire::MIN_DRAWN_SIDE)
         .collect();
     // Colours are interned (`hsl`), so equal ones are the same string: grouping them by address
     // groups them as well as comparing their text, at a fraction of the cost.
