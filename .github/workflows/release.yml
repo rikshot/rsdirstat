@@ -64,7 +64,7 @@ jobs:
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-installer.sh | sh"
       - name: Cache dist
         uses: actions/upload-artifact@v7
         with:
@@ -130,7 +130,7 @@ jobs:
       - name: "Add wasm target"
         run: "rustup target add wasm32-unknown-unknown"
       - name: "Install trunk"
-        uses: "taiki-e/install-action@v2"
+        uses: "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe"
         with:
           "tool": "trunk"
       - name: "Build embedded frontend bundle"
