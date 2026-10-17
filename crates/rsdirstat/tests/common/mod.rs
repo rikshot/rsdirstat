@@ -111,6 +111,7 @@ fn newest_mtime(path: &Path) -> SystemTime {
 
 pub struct TestServer {
     child: Child,
+    /// The address it prints, which starts a browser's session: `http://localhost:<port>/?token=…`.
     pub url: String,
 }
 
@@ -163,6 +164,24 @@ impl TestServer {
             .recv_timeout(Duration::from_secs(10))
             .expect("server did not print its URL within 10s");
         server
+    }
+
+    /// `host:port`, as a `Host` header names the server.
+    pub fn authority(&self) -> &str {
+        let rest = self.url.trim_start_matches("http://");
+        rest.split_once('/').map_or(rest, |(authority, _)| authority)
+    }
+
+    /// The port it listens on.
+    pub fn port(&self) -> u16 {
+        self.authority().rsplit_once(':').unwrap().1.parse().unwrap()
+    }
+
+    /// The cookie a browser gets for the session, as a `Cookie` header's value, for requests made
+    /// without one.
+    pub fn cookie(&self) -> String {
+        let token = self.url.rsplit_once("token=").expect("the URL carries a token").1;
+        format!("rsdirstat-{}={token}", self.port())
     }
 
     pub fn is_running(&mut self) -> bool {

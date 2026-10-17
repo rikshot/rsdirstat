@@ -626,21 +626,21 @@ fn e2e_stop_mid_scan_exits_promptly() {
     );
 }
 
-/// A TCP connection to the server, as `TestServer::url`'s host names it.
+/// A TCP connection to the server.
 fn connect(server: &TestServer) -> TcpStream {
-    let port = server.url.rsplit_once(':').unwrap().1;
-    TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap()
+    TcpStream::connect(("127.0.0.1", server.port())).unwrap()
 }
 
 /// Open the WebSocket a tab holds while it is open. Dropping the stream closes it, as closing the
 /// tab does.
 fn open_tab(server: &TestServer) -> TcpStream {
     let mut stream = connect(server);
-    let host = server.url.trim_start_matches("http://");
     write!(
         stream,
-        "GET /ws HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        "GET /ws HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        server.authority(),
+        server.cookie(),
     )
     .unwrap();
     let mut status = String::new();
@@ -680,7 +680,7 @@ fn e2e_server_exits_after_its_last_tab_closes() {
 }
 
 /// Send a raw GET with the given extra headers and return the status code. `host` overrides the
-/// `Host` header.
+/// `Host` header. It carries the session's cookie, unless `headers` give a `Cookie` of their own.
 fn http_status(server: &TestServer, path: &str, host: Option<&str>, headers: &[(&str, &str)]) -> u16 {
     http_response(server, path, host, headers)
         .split(' ')
@@ -690,14 +690,17 @@ fn http_status(server: &TestServer, path: &str, host: Option<&str>, headers: &[(
         .unwrap()
 }
 
-/// The response to a GET of `path`, as text (lossy, as a body needn't be).
+/// The response to a GET of `path`, as text (lossy, as a body needn't be), with the session's cookie
+/// as `http_status` sends it.
 fn http_response(server: &TestServer, path: &str, host: Option<&str>, headers: &[(&str, &str)]) -> String {
-    let authority = server.url.trim_start_matches("http://");
     let mut stream = connect(server);
     let mut request = format!(
         "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
-        host.unwrap_or(authority)
+        host.unwrap_or(server.authority())
     );
+    if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("cookie")) {
+        request.push_str(&format!("Cookie: {}\r\n", server.cookie()));
+    }
     for (name, value) in headers {
         request.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -731,6 +734,40 @@ fn e2e_requests_for_another_host_are_refused() {
         assert_eq!(http_status(&server, "/volumes", Some(host), &[]), 403, "Host: {host}");
         assert_eq!(http_status(&server, "/", Some(host), &[]), 403, "Host: {host}");
     }
+}
+
+/// Another program, or another user of the machine, can connect to the port, but has no session:
+/// the API and the page refuse it. The address the server printed gives a browser the cookie.
+#[test]
+fn e2e_requests_without_the_session_are_refused() {
+    let server = TestServer::start_picker();
+    let token = server.url.rsplit_once("token=").unwrap().1;
+    let wrong = format!("rsdirstat-{}={}", server.port(), "0".repeat(token.len()));
+    for cookie in ["", wrong.as_str()] {
+        for path in ["/volumes", "/start", "/ws", "/"] {
+            assert_eq!(
+                http_status(&server, path, None, &[("Cookie", cookie)]),
+                403,
+                "{path} with {cookie:?}"
+            );
+        }
+    }
+    assert_eq!(http_status(&server, "/?token=nope", None, &[("Cookie", "")]), 403);
+    // The bundle besides the page is the same in every copy, so it needs none.
+    assert_eq!(http_status(&server, "/main.css", None, &[("Cookie", "")]), 200);
+
+    let page = http_response(&server, &format!("/?token={token}"), None, &[("Cookie", "")]);
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    let set_cookie = page
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+        .unwrap_or_else(|| panic!("no cookie: {page}"));
+    assert!(set_cookie.contains(&server.cookie()), "{set_cookie}");
+    assert!(
+        set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"),
+        "{set_cookie}"
+    );
+    assert_eq!(http_status(&server, "/volumes", None, &[]), 200, "with the cookie");
 }
 
 /// The API endpoints are only for the app's own page. A page on another site can make a browser

@@ -161,10 +161,11 @@ struct AppState {
     /// last one closes.
     connections: Mutex<Connections>,
     shutdown: watch::Sender<bool>,
+    session: Session,
 }
 
 impl AppState {
-    fn new(phase: ScanPhase, options: ScanOptions) -> Self {
+    fn new(phase: ScanPhase, options: ScanOptions, session: Session) -> Self {
         Self {
             scan: ScanState {
                 tree: RwLock::new(DirTree::new()),
@@ -175,11 +176,80 @@ impl AppState {
             tree_changes: watch::channel(()).0,
             connections: Mutex::default(),
             shutdown: watch::channel(false).0,
+            session,
         }
     }
 
     fn tree_changed(&self) {
         self.tree_changes.send_replace(());
+    }
+}
+
+/// What the page holds and nothing else does: a random token, in the address rsdirstat opens, which
+/// the page trades for a cookie. The API asks for that cookie. Listening on loopback keeps other
+/// machines out, and the checks of `Host`, `Origin` and `Sec-Fetch-Site` other websites, but neither
+/// stops another user of this machine, or another program, from connecting to the port.
+struct Session {
+    token: String,
+    /// The cookie's name, with the port in it: browsers send a host's cookies to all its ports, and
+    /// two servers running at once mustn't overwrite each other's.
+    cookie: String,
+}
+
+impl Session {
+    /// A new session for the server on `port`, with 128 random bits for its token.
+    fn new(port: u16) -> Result<Self> {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("can't make a session token: {e}"))?;
+        Ok(Self {
+            token: bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+            cookie: format!("rsdirstat-{port}"),
+        })
+    }
+
+    /// The address that starts the session in a browser.
+    fn url(&self, port: u16) -> String {
+        format!("http://localhost:{port}/?token={}", self.token)
+    }
+
+    /// Whether `token` is this session's, compared in constant time.
+    fn is_token(&self, token: &str) -> bool {
+        token.len() == self.token.len()
+            && token
+                .bytes()
+                .zip(self.token.bytes())
+                .fold(0, |differ, (a, b)| differ | (a ^ b))
+                == 0
+    }
+
+    /// Whether a request with `headers` carries the session's cookie.
+    fn admits(&self, headers: &HeaderMap) -> bool {
+        headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(';'))
+            .filter_map(|cookie| cookie.trim().split_once('='))
+            .any(|(name, value)| name == self.cookie && self.is_token(value))
+    }
+
+    /// Whether `uri` carries the session's token, as the address that starts the session does.
+    fn in_query(&self, uri: &Uri) -> bool {
+        uri.query()
+            .into_iter()
+            .flat_map(|query| query.split('&'))
+            .filter_map(|pair| pair.strip_prefix("token="))
+            .any(|token| self.is_token(token))
+    }
+
+    /// The cookie that admits the page's requests: only to this host, never sent by another site's
+    /// requests (`SameSite=Strict`), and not readable by scripts.
+    fn set_cookie(&self) -> HeaderValue {
+        HeaderValue::try_from(format!(
+            "{}={}; Path=/; HttpOnly; SameSite=Strict",
+            self.cookie, self.token
+        ))
+        .expect("a cookie of a hex token is a valid header")
     }
 }
 
@@ -225,7 +295,12 @@ async fn run_server(args: Args) -> Result<()> {
         },
     };
 
-    let state = Arc::new(AppState::new(phase, scan.into()));
+    // Bind loopback only: the UI is always pointed at localhost, and the server exposes full
+    // directory listings plus arbitrary-path scans, so there's no reason to accept connections from
+    // other hosts on the network. Connections from this one need the session's token.
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    let actual_port = listener.local_addr()?.port();
+    let state = Arc::new(AppState::new(phase, scan.into(), Session::new(actual_port)?));
 
     if Assets::get("index.html").is_none() {
         eprintln!("Warning: frontend bundle not embedded — run `trunk build` before building; the GUI will not load.");
@@ -237,33 +312,57 @@ async fn run_server(args: Args) -> Result<()> {
         .route("/volumes", get(volumes_handler))
         // The API only, not the frontend bundle the fallback serves.
         .route_layer(axum::middleware::from_fn(require_own_page))
-        .with_state(Arc::clone(&state))
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_session,
+        ))
         .fallback(static_handler)
+        .with_state(Arc::clone(&state))
         .layer(CompressionLayer::new())
         .layer(axum::middleware::map_response(deny_framing))
         .layer(axum::middleware::from_fn(require_loopback_host));
-
-    // Bind loopback only: the UI is always pointed at localhost, and the server exposes full
-    // directory listings plus arbitrary-path scans with no auth — there's no reason to accept
-    // connections from other hosts on the network.
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
-    let actual_port = listener.local_addr()?.port();
 
     // Once there is a server to show it: a port that can't be had fails the start before any scan.
     if !wait {
         start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart { .. }));
     }
-    eprintln!("Listening on http://localhost:{actual_port}");
+    let url = state.session.url(actual_port);
+    eprintln!("Listening on {url}");
 
-    // Without waiting for the browser: a launcher can take a while to return (xdg-open, `start`),
-    // and nothing is served until this does.
-    if !no_open && let Err(e) = open::that_detached(format!("http://localhost:{actual_port}")) {
-        eprintln!("Failed to open browser: {e}");
-    }
+    // Kept until the server exits, then deleted.
+    let _opener = if no_open {
+        None
+    } else {
+        open_browser(&url)
+            .inspect_err(|e| eprintln!("Failed to open browser: {e}"))
+            .ok()
+    };
 
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(Arc::clone(&state)));
     serve_until_stopped(server, state.shutdown.subscribe(), DRAIN_GRACE).await?;
     Ok(())
+}
+
+/// Open `url` in the browser through a file that redirects to it, as Jupyter does: the token stays out
+/// of the command lines of the programs that open it (`xdg-open`, the browser), which other users of
+/// the machine can read. Only this user can read the file (`tempfile` makes it 0600), and it is
+/// deleted when the returned path is dropped. Without waiting for the browser: a launcher can take a
+/// while to return, and nothing is served until this does.
+fn open_browser(url: &str) -> std::io::Result<tempfile::TempPath> {
+    use std::io::Write;
+    let mut file = tempfile::Builder::new()
+        .prefix("rsdirstat-")
+        .suffix(".html")
+        .tempfile()?;
+    write!(
+        file,
+        "<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=\"0;url={url}\">\
+         <title>rsdirstat</title><a href=\"{url}\">Open rsdirstat</a>"
+    )?;
+    // Closed, so the browser can read it on Windows too.
+    let path = file.into_temp_path();
+    open::that_detached(&path)?;
+    Ok(path)
 }
 
 /// Run `server` until it finishes, or until `grace` after `shutdown` turns true. A graceful shutdown
@@ -535,17 +634,43 @@ fn relay_scan(
 #[allow_missing = true]
 struct Assets;
 
-/// Serve the embedded frontend. Unknown paths 404.
-async fn static_handler(uri: Uri) -> Response {
+/// Serve the embedded frontend. Unknown paths 404. The page itself only with the session's token, in
+/// the address (which gives it the session's cookie) or as that cookie: without it, the page's
+/// requests would all be refused. The rest of the bundle is the same in every copy of rsdirstat.
+async fn static_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
     let path = match uri.path().trim_start_matches('/') {
         "" => "index.html",
         p => p,
+    };
+    let set_cookie = if path == "index.html" {
+        let session = &state.session;
+        if session.in_query(&uri) {
+            Some(session.set_cookie())
+        } else if session.admits(&headers) {
+            None
+        } else {
+            return (
+                StatusCode::FORBIDDEN,
+                "Open the address rsdirstat printed when it started (with its ?token=), or start it again.",
+            )
+                .into_response();
+        }
+    } else {
+        None
     };
     match Assets::get(path) {
         Some(content) => {
             // Content-type is baked in at compile time by rust-embed's `mime-guess` feature.
             let mime = content.metadata.mimetype().to_owned();
-            ([(header::CONTENT_TYPE, mime)], content.data).into_response()
+            let mut response = ([(header::CONTENT_TYPE, mime)], content.data).into_response();
+            if let Some(cookie) = set_cookie {
+                response.headers_mut().insert(header::SET_COOKIE, cookie);
+            }
+            response
         }
         None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
@@ -590,9 +715,21 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
-/// Refuse an API request from another site's page. Binding to loopback stops remote hosts, but the
-/// server has no auth and exposes the filesystem, so a malicious page in the user's own browser
-/// could otherwise drive it: connect to ws://127.0.0.1, or start a scan.
+/// Refuse an API request without the session's cookie (see `Session`).
+async fn require_session(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !state.session.admits(request.headers()) {
+        return (StatusCode::FORBIDDEN, "request refused: not from this app's own page").into_response();
+    }
+    next.run(request).await
+}
+
+/// Refuse an API request from another site's page, which could otherwise drive the server from the
+/// user's own browser: connect to ws://127.0.0.1, or start a scan. Its requests don't carry the
+/// session's cookie (`SameSite=Strict`) either, so this holds for a browser that would send it.
 async fn require_own_page(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     if !api_request_allowed(request.headers()) {
         return (StatusCode::FORBIDDEN, "request refused: not from this app's own page").into_response();
@@ -872,6 +1009,47 @@ mod tests {
     use super::*;
     use rsdirstat_core::scan::{ScanOutcome, ScannedFile};
 
+    fn session() -> Session {
+        Session::new(4242).unwrap()
+    }
+
+    /// Only the session's cookie admits a request, and only the session's token starts it.
+    #[test]
+    fn a_session_admits_only_its_own_token() {
+        let session = session();
+        assert_eq!(session.token.len(), 32);
+        assert_ne!(session.token, Session::new(4242).unwrap().token, "random");
+        let cookies = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, HeaderValue::try_from(value).unwrap());
+            headers
+        };
+        let token = &session.token;
+        assert!(session.admits(&cookies(&format!("rsdirstat-4242={token}"))));
+        assert!(session.admits(&cookies(&format!("other=1; rsdirstat-4242={token}; more=2"))));
+        assert!(!session.admits(&HeaderMap::new()));
+        assert!(
+            !session.admits(&cookies(&format!("rsdirstat-4243={token}"))),
+            "another port's"
+        );
+        assert!(!session.admits(&cookies("rsdirstat-4242=00000000000000000000000000000000")));
+        assert!(!session.admits(&cookies(&format!("rsdirstat-4242={}", &token[1..]))));
+
+        let uri = |query: &str| format!("/?{query}").parse::<Uri>().unwrap();
+        assert!(session.in_query(&uri(&format!("token={token}"))));
+        assert!(session.in_query(&uri(&format!("wait&token={token}"))));
+        assert!(!session.in_query(&uri("token=nope")));
+        assert!(!session.in_query(&"/".parse().unwrap()));
+        assert!(session.url(4242).ends_with(&format!(":4242/?token={token}")));
+        let cookie = session.set_cookie();
+        let cookie = cookie.to_str().unwrap();
+        assert!(cookie.starts_with(&format!("rsdirstat-4242={token};")), "{cookie}");
+        assert!(
+            cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"),
+            "{cookie}"
+        );
+    }
+
     /// The state after relaying a scan that ran for `ran_for` and ended with `ending`, or without
     /// a `ScanDone` at all, having found one 10-byte file.
     fn finished_scan(ending: Option<ScanOutcome>, ran_for: Duration) -> AppState {
@@ -881,7 +1059,7 @@ mod tests {
             cancel: Arc::clone(&cancel),
             started: Instant::now() - ran_for,
         };
-        let state = AppState::new(running, ScanOptions::default());
+        let state = AppState::new(running, ScanOptions::default(), session());
         let (tx, rx) = std::sync::mpsc::channel();
         let file = ScannedFile {
             name: "a".into(),
@@ -968,7 +1146,7 @@ mod tests {
             cancel: Arc::default(),
             started: Instant::now(),
         };
-        let state = AppState::new(running, ScanOptions::default());
+        let state = AppState::new(running, ScanOptions::default(), session());
         let dir = |id, parent, size| ScanEvent::Dir {
             id,
             parent,
@@ -1036,7 +1214,7 @@ mod tests {
                 cancel: Arc::clone(&cancel),
                 started: Instant::now(),
             };
-            let state = AppState::new(running, ScanOptions::default());
+            let state = AppState::new(running, ScanOptions::default(), session());
             let picker = state.picker.subscribe();
             let (tx, rx) = std::sync::mpsc::channel();
             tx.send(ScanEvent::ScanStart { root: "/root".into() }).unwrap();
@@ -1063,7 +1241,7 @@ mod tests {
             cancel: Arc::clone(&cancel),
             started: Instant::now(),
         };
-        let state = AppState::new(running, ScanOptions::default());
+        let state = AppState::new(running, ScanOptions::default(), session());
         let picker = state.picker.subscribe();
         let (_stuck, rx) = std::sync::mpsc::channel();
         relay_scan(&state, &rx, &cancel, Duration::from_millis(100));

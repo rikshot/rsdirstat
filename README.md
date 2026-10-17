@@ -79,13 +79,14 @@ rsdirstat --port 8080 [path]   # fixed port (default: random)
 rsdirstat --no-open [path]     # don't auto-open the browser
 ```
 
-`rsdirstat` prints the address it serves (`Listening on http://localhost:<port>`) and opens
-it in your browser. It stops on Ctrl-C, or by itself a few seconds after the last browser tab
+`rsdirstat` prints the address it serves (`Listening on http://localhost:<port>/?token=…`) and
+opens it in your browser; with `--no-open`, open that address yourself. It stops on Ctrl-C, or by itself a few seconds after the last browser tab
 is closed (reloading the page is fine).
 
-The server only listens on `127.0.0.1` and only accepts WebSocket connections from pages
-served by `localhost`, so neither other machines nor other websites open in your browser can
-read the file listing. Nothing leaves your machine.
+The server only listens on `127.0.0.1`, and only answers the page it opened: the address carries
+a random token, which the page trades for a cookie, and requests from other websites open in your
+browser are refused. So neither other machines, nor other users or programs on yours, nor other
+websites can read the file listing. Nothing leaves your machine.
 
 ### The treemap
 
