@@ -2,13 +2,36 @@ use rsdirstat_core::volume::VolumeInfo;
 use windows_sys::Win32::Storage::FileSystem::{
     GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
 };
+use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadErrorMode, SEM_FAILCRITICALERRORS, SetThreadErrorMode};
 
 use crate::{from_wide, wide};
 
 const DRIVE_REMOVABLE: u32 = 2;
 const DRIVE_FIXED: u32 = 3;
 
+/// Fails this thread's critical errors back to the caller, instead of the system's "There is no disk
+/// in the drive" box, until dropped. Without it, asking about an empty card-reader slot waits on that
+/// box until someone answers it.
+struct NoCriticalErrorBox(Option<u32>);
+
+impl NoCriticalErrorBox {
+    fn new() -> Self {
+        let mut old = 0;
+        let set = unsafe { SetThreadErrorMode(GetThreadErrorMode() | SEM_FAILCRITICALERRORS, &mut old) } != 0;
+        Self(set.then_some(old))
+    }
+}
+
+impl Drop for NoCriticalErrorBox {
+    fn drop(&mut self) {
+        if let Some(old) = self.0 {
+            unsafe { SetThreadErrorMode(old, std::ptr::null_mut()) };
+        }
+    }
+}
+
 pub fn list_volumes() -> Vec<VolumeInfo> {
+    let _no_box = NoCriticalErrorBox::new();
     let mut volumes = Vec::new();
     let drives = unsafe { GetLogicalDrives() };
 
@@ -25,9 +48,11 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
             continue;
         }
 
+        // Both as this user sees them: with disk quotas, the total is the user's quota, and the
+        // volume's free space would leave nothing of it used.
         let mut free_bytes: u64 = 0;
         let mut total_bytes: u64 = 0;
-        if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), std::ptr::null_mut(), &mut total_bytes, &mut free_bytes) } == 0 {
+        if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut free_bytes, &mut total_bytes, std::ptr::null_mut()) } == 0 {
             continue;
         }
 

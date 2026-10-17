@@ -16,4 +16,4 @@ default-target = "x86_64-pc-windows-msvc"
 [target.'cfg(windows)'.dependencies]
 rsdirstat-core.workspace = true
 anyhow.workspace = true
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Ioctl"] }
