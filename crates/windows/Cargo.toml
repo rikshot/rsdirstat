@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Windows filesystem scanner for rsdirstat (GetFileInformationByHandleEx)"
+description = "Windows filesystem scanner for rsdirstat (GetFileInformationByHandleEx, or the NTFS MFT)"
 categories = ["filesystem", "os::windows-apis"]
 
 # docs.rs builds on Linux by default; this crate only compiles for Windows, so point

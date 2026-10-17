@@ -77,6 +77,7 @@ rsdirstat --threads 16 [path]  # scan with 16 threads (default: one per CPU; two
 rsdirstat --no-mft [path]      # Windows: walk the folders even as administrator
 rsdirstat --port 8080 [path]   # fixed port (default: random)
 rsdirstat --no-open [path]     # don't auto-open the browser
+rsdirstat --wait [path]        # show a Start button instead of scanning at once (for profiling)
 ```
 
 `rsdirstat` prints the address it serves (`Listening on http://localhost:<port>/?token=…`) and
@@ -84,9 +85,9 @@ opens it in your browser; with `--no-open`, open that address yourself. It stops
 is closed (reloading the page is fine).
 
 The server only listens on `127.0.0.1`, and only answers the page it opened: the address carries
-a random token, which the page trades for a cookie, and requests from other websites open in your
-browser are refused. So neither other machines, nor other users or programs on yours, nor other
-websites can read the file listing. Nothing leaves your machine.
+a random token, made anew each run, which the page trades for a cookie, and requests from other
+websites open in your browser are refused. So neither other machines, nor other users on yours,
+nor other websites can read the file listing or start a scan. Nothing leaves your machine.
 
 ### The treemap
 
@@ -107,9 +108,9 @@ draw are grouped into one *(other files)* block per folder.
   as a single block gets a color from its name. **Age** colors files and folders by
   modification time, from red (oldest) to green (newest).
 - **Filters** narrow the treemap to matching files, and folder sizes are recomputed from just
-  those: **Ext** takes a comma-separated list of extensions (`mp4,mov`), **Name** matches part
-  of the file name (case-insensitive), and **Min** hides files smaller than the given size.
-  **Clear** resets them.
+  those: **Ext** takes a comma-separated list of extensions (`mp4,mov`; `.mp4`, `*.mp4` and
+  `tar.gz` work too), **Name** matches part of the file name (case-insensitive), and **Min**
+  hides files smaller than the given size. **Clear** resets them.
 - **Rescan** scans the same path again; **Change** goes back to the volume picker.
 - Each browser tab has its own view: zooming, depth, colors and filters in one tab leave the others
   as they are.
@@ -124,6 +125,23 @@ rsdirstat-cli --all [path]    # cross filesystem boundaries (not into /proc or /
 rsdirstat-cli --threads 16 [path] # scan with 16 threads (default: one per CPU; two per CPU on Linux; at most 4 on macOS)
 rsdirstat-cli --no-mft [path]     # Windows: walk the folders even as administrator
 ```
+
+### What a scan counts
+
+The treemap and the CLI count every file once, at its size (its length, as `ls -l` shows it):
+
+- A file with several names (hardlinks) counts under the first name the scan finds, and a folder
+  reachable under two (a bind mount, a macOS firmlink) is read once.
+- A cloud file that isn't on this machine (a Dropbox, OneDrive or iCloud placeholder) counts as 0.
+  The scan never downloads one, nor fetches the contents of a cloud folder.
+- Symlinks and junctions aren't followed or counted.
+- Other filesystems mounted inside the scanned folder are left out unless you pass `--all`. Even
+  then, Linux's `/proc`, `/sys` and the like are left out, and so are volumes mounted in folders on
+  Windows.
+- Folders you have no permission to read are left out quietly. A folder that can't be read in full
+  for any other reason is reported in the terminal, and so is one that stops answering for 30
+  seconds (a dead network mount, say), which ends the scan. Either way the scan is marked
+  incomplete, in the status bar and by the CLI.
 
 ## Building
 

@@ -5,6 +5,123 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - Unreleased
+
+### Added
+
+- On Windows, scanning a whole NTFS drive as administrator reads the drive's file index (the
+  MFT) straight off the disk instead of walking its folders: several times faster, with all of
+  `C:` in about 2 s where the walk took 8 on the test machine. Without administrator rights, on
+  other file systems and on network shares, rsdirstat walks the folders as before; `--no-mft`
+  always walks.
+  ([#6](https://github.com/rikshot/rsdirstat/pull/6))
+- `--threads N`, on both `rsdirstat` and `rsdirstat-cli`, scans with that many threads.
+- Each browser tab has its own view: zooming, depth, colours and filters in one tab no longer
+  change the others.
+- A scan that couldn't read everything now says so. Folders that can't be read for a reason
+  other than permission are printed with their paths, and the status bar and the CLI mark the
+  results incomplete. So does a scan cut short because a folder stopped answering (a dead
+  network mount).
+- The volume picker's cards can be chosen from the keyboard.
+
+### Changed
+
+- The address `rsdirstat` opens now carries a token, made anew each run
+  (`http://localhost:<port>/?token=…`, see Security). With `--no-open`, open the address it
+  prints; a bookmark of the bare address no longer reaches a new run.
+- Faster scans by default: macOS uses at most 4 threads, as more only queue up in the kernel
+  (`/System/Library` in about 2 s instead of 5.6), and Linux two per CPU, which hides disk waits
+  (a cold ext4 root in 0.46 s instead of 0.60). Plain folders on Windows scan about 7% faster.
+- A scan waits 30 s, instead of 3, for storage that has stopped answering before giving up, so
+  a disk spinning up or a NAS waking up no longer cuts it short.
+- A path given on the command line that can't be scanned (missing, a file, or a folder that
+  can't be read) is an error at startup, instead of opening the browser on the volume picker.
+- `rsdirstat-cli` prints sizes as the page does (`150 MiB`, `1.00 KiB`), with units up to PiB.
+- The extension filter also takes `.mp4`, `*.mp4` and extensions with several dots (`tar.gz`).
+  The name filter ignores case beyond ASCII too.
+- With a filter on, the status bar's total, the tooltip's share of the view and the Age colours
+  count only the matching files.
+- In Age mode, a folder drawn as one block is coloured by its newest file anywhere under it, not
+  only by the files directly in it, and *(other files)* blocks by their own age.
+- Rust 1.89 or later is needed to build from source.
+- The library crates (`rsdirstat-core`, `rsdirstat-protocol` and the three scanner crates) change
+  their APIs, hence 0.2.0: one scan driver in core (`run_scan`, `DirSink`, `ScanOptions`,
+  `ScanOutcome`) that the platforms supply directory reads to, `ScanEvent` moved to core with one
+  event per directory, and a leaner wire format between the server and the page.
+
+### Fixed
+
+- Scans no longer leave data out without saying so:
+  - A wide tree no longer runs out of file descriptors on macOS and Linux, which silently dropped
+    whole subtrees.
+  - A huge folder on slow storage no longer trips the stall detector, which cut the rest of the
+    scan off.
+  - Linux keeps names that aren't UTF-8, and everything under them.
+  - Windows counts deduplicated, WOF-compressed and tiered files, a name with an unpaired
+    surrogate and what's under it, and every folder of a volume without usable file ids
+    (sshfs-win, FAT).
+- Nothing is counted twice:
+  - Windows counts hardlinks on NTFS once. Most of WinSxS is linked into System32, so a scan of
+    `C:\` counted gigabytes twice.
+  - A scan of `/` or `/System` on macOS no longer counts the data volume twice through its
+    firmlinks.
+  - Linux reads a bind mount once, and tells hardlinks apart by their inode even on FUSE file
+    systems that report the same one for every entry.
+- Other file systems are left alone without `--all`: mount points inside the scanned folder are no
+  longer opened (which could wake a sleeping network share or hang on a dead one) and automount
+  points aren't triggered. With `--all`, Linux still leaves out `/proc`, `/sys` and the like.
+- Cloud files:
+  - Windows counts online-only Dropbox and OneDrive files as 0, where it counted them in full.
+  - macOS no longer fetches a cloud folder's contents from the network to list it.
+- The volume picker:
+  - On macOS it lists only real volumes, sized correctly past 16 TiB.
+  - On Linux it keeps ZFS datasets and composefs roots, and a dead network mount no longer holds
+    up the list.
+  - Windows no longer shows a "There is no disk in the drive" box for an empty card reader.
+  - Used space no longer counts the blocks a file system reserves for the superuser.
+- Right-click reveal on Windows works for paths given on the command line, and for paths with
+  commas in them. Elsewhere, each reveal no longer leaves a defunct process behind.
+- A scan that can't open its folder within 30 s, or stalls on it, returns to the volume picker
+  instead of showing "Scanning..." forever.
+- After **Change**, or a scan that fails, resizing the window no longer brings the old treemap
+  back over the picker.
+- After a reload in Chromium or WebKit, the treemap matches the toolbar's filters.
+- A tab opened during or after a scan shows the scan's own time, not the time since it connected.
+- Every tab opened in `--wait` mode shows the Start button, not only the first.
+- On Windows, the path bar no longer reads `C:\/Windows/...` under a drive root, and joins paths
+  with `\` for any scan.
+- The zoom animation moves each file to where it goes, instead of morphing unrelated files into
+  each other. Items of the same size keep their places from one layout to the next, and a folder
+  whose contents are all too small to draw is one block, not an empty dark box.
+- The tooltip updates as the treemap changes under a resting pointer, the breadcrumb shows its
+  end when it overflows, and the treemap redraws sharply after moving to a display of another
+  pixel density.
+- The page no longer leaks memory with each rescan and each keystroke in a filter.
+- Big scans: layouts are 21-29% smaller and faster to make, a scan's results go into the tree
+  about twice as fast, and resizing a filtered view no longer filters the whole tree again.
+- The server exits within 2 s of being stopped, even with a request or a scan stuck on a dead
+  network mount, and no longer shuts down under a tab that connects as the last one closes.
+  Ctrl+Break stops it on Windows, like Ctrl-C.
+- `rsdirstat-cli | head` no longer panics, and `--files` uses about half the memory.
+
+### Security
+
+- Other users of the machine, and programs that can't read your files, can no longer use a
+  running rsdirstat. It listened only on `127.0.0.1`, but anything on the machine could connect
+  to the port to read the file listing, start scans or reveal paths. Every request now needs the
+  run's token, which the page gets from its address and keeps as a cookie. The browser opens the
+  address through a file only you can read, so the token never appears on a command line that
+  other users can see.
+- Pages on other websites can no longer reach the server through DNS rebinding (every request
+  must be addressed to `localhost` or a loopback IP), nor with cross-site requests such as an
+  `<img>` pointed at the API (refused by `Sec-Fetch-Site` and `Origin`).
+- The page can't be shown in another site's frame, where clicks on it could be disguised
+  (clickjacking).
+- A message from the page can no longer make the server allocate 256 MiB, and a viewport it
+  sends is clamped, so a malformed one can't make a layout take arbitrarily long.
+- On Windows, reveal runs Explorer from the Windows directory, not whatever `explorer.exe` is
+  found first next to `rsdirstat.exe`.
+
 ## [0.1.3] - 2026-10-10
 
 ### Added
@@ -84,6 +201,7 @@ Trusted Publishing) and the prebuilt-binary release. No user-facing changes.
 - Treemap: zoom navigation, color by file type or modification time, filter by
   extension/size/name, click to navigate, right-click to reveal in the file manager.
 
+[0.2.0]: https://github.com/rikshot/rsdirstat/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/rikshot/rsdirstat/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/rikshot/rsdirstat/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/rikshot/rsdirstat/releases/tag/v0.1.1
