@@ -2,36 +2,16 @@ use rsdirstat_core::volume::VolumeInfo;
 use windows_sys::Win32::Storage::FileSystem::{
     GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
 };
-use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadErrorMode, SEM_FAILCRITICALERRORS, SetThreadErrorMode};
 
 use crate::{from_wide, wide};
 
 const DRIVE_REMOVABLE: u32 = 2;
 const DRIVE_FIXED: u32 = 3;
 
-/// Fails this thread's critical errors back to the caller, instead of the system's "There is no disk
-/// in the drive" box, until dropped. Without it, asking about an empty card-reader slot waits on that
-/// box until someone answers it.
-struct NoCriticalErrorBox(Option<u32>);
-
-impl NoCriticalErrorBox {
-    fn new() -> Self {
-        let mut old = 0;
-        let set = unsafe { SetThreadErrorMode(GetThreadErrorMode() | SEM_FAILCRITICALERRORS, &mut old) } != 0;
-        Self(set.then_some(old))
-    }
-}
-
-impl Drop for NoCriticalErrorBox {
-    fn drop(&mut self) {
-        if let Some(old) = self.0 {
-            unsafe { SetThreadErrorMode(old, std::ptr::null_mut()) };
-        }
-    }
-}
-
+/// The fixed and removable drives. Call `fail_critical_errors` first: asking about an empty
+/// card-reader slot would otherwise wait on the system's "There is no disk in the drive" box until
+/// someone answers it.
 pub fn list_volumes() -> Vec<VolumeInfo> {
-    let _no_box = NoCriticalErrorBox::new();
     let mut volumes = Vec::new();
     let drives = unsafe { GetLogicalDrives() };
 

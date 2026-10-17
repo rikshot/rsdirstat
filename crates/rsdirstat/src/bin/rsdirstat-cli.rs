@@ -43,6 +43,8 @@ fn main() -> Result<()> {
         top,
         scan,
     } = Args::parse();
+    #[cfg(windows)]
+    scanner::fail_critical_errors();
 
     let (tx, rx) = std::sync::mpsc::channel();
     let options = scan.into();

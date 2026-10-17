@@ -268,6 +268,8 @@ const OPEN_TIMEOUT: Duration = rsdirstat_core::scan::STALL_TIMEOUT;
 fn main() -> Result<()> {
     let args = Args::parse();
     let rt = tokio::runtime::Runtime::new()?;
+    #[cfg(windows)]
+    scanner::fail_critical_errors();
     let result = rt.block_on(run_server(args));
     // Dropping the runtime would wait for every blocking task, and one can be stuck in a syscall on
     // a dead network mount (a scan of it, or `statvfs` for /volumes) for as long as the mount takes
