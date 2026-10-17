@@ -2,21 +2,16 @@
 //! binary, because it lowers the limit for the whole process for good.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
-use std::sync::mpsc;
 
-use rsdirstat_core::tree::DirTree;
-
-#[cfg(target_os = "linux")]
-use rsdirstat_linux as scanner;
-#[cfg(target_os = "macos")]
-use rsdirstat_macos as scanner;
+use rsdirstat_core::scan::cpu_count;
 
 #[test]
 fn a_tree_wider_than_the_fd_limit_is_scanned_in_full() {
     // Far below the subdirectory count, but enough for the workers' own descriptors.
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let limit = (threads as u64 * 8).max(256);
+    let limit = (cpu_count() as u64 * 8).max(256);
     let dirs = limit * 4;
 
     let dir = tempfile::tempdir().unwrap();
@@ -33,17 +28,7 @@ fn a_tree_wider_than_the_fd_limit_is_scanned_in_full() {
     };
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) }, 0);
 
-    let (tx, rx) = mpsc::channel();
-    let root = dir.path().to_path_buf();
-    let handle =
-        std::thread::spawn(move || scanner::scan::scan(&root, Default::default(), tx, Default::default()).unwrap());
-    let mut tree = DirTree::new();
-    for event in rx {
-        tree.apply(event);
-    }
-    handle.join().unwrap();
-
-    assert!(tree.complete);
+    let tree = common::scan_to_tree(dir.path());
     assert_eq!(tree.nodes.len() as u64, dirs + 1, "every subdirectory is found");
     assert_eq!(tree.nodes[&tree.root_id.unwrap()].size, dirs, "and read");
 }

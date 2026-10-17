@@ -1,3 +1,4 @@
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +113,27 @@ pub enum ColorMode {
     Age,
 }
 
+/// `bytes` for people to read, in binary units to three significant figures: "512 B", "1.00 KiB",
+/// "15.0 KiB", "500 KiB". The page and `rsdirstat-cli` both show sizes this way.
+pub fn format_size(bytes: u64) -> String {
+    let mut value = bytes as f64;
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut index = 0usize;
+    while value >= 1024.0 && index < units.len() - 1 {
+        value /= 1024.0;
+        index += 1;
+    }
+    if index == 0 {
+        format!("{value:.0} {}", units[index])
+    } else if value < 10.0 {
+        format!("{value:.2} {}", units[index])
+    } else if value < 100.0 {
+        format!("{value:.1} {}", units[index])
+    } else {
+        format!("{value:.0} {}", units[index])
+    }
+}
+
 /// A mounted volume, as the `/volumes` endpoint lists them (`encode_list`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VolumeInfo {
@@ -136,11 +158,11 @@ impl VolumeInfo {
 
     /// The `/volumes` response: `volumes` in the same encoding as the WebSocket messages.
     pub fn encode_list(volumes: &[VolumeInfo]) -> Vec<u8> {
-        pack(postcard::to_allocvec(volumes).expect("volumes must serialize"))
+        encode(volumes)
     }
 
     pub fn decode_list(data: &[u8]) -> Option<Vec<VolumeInfo>> {
-        postcard::from_bytes(&unpack(data)?).ok()
+        decode(data)
     }
 }
 
@@ -151,43 +173,65 @@ pub enum ServerMessage {
     /// layout.
     ScanStart,
     Layout(LayoutPayload),
+    /// No path to scan: the page shows the volume picker.
     PickerMode,
+    /// A path is set, and the scan waits for the page's Start button (`--wait`).
+    AwaitingStart,
 }
 
 impl ServerMessage {
     pub fn encode(&self) -> Vec<u8> {
-        pack(postcard::to_allocvec(self).expect("ServerMessage must serialize"))
+        encode(self)
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        postcard::from_bytes(&unpack(data)?).ok()
+        decode(data)
     }
 }
 
 /// Client → server WebSocket messages.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ClientMessage {
-    Viewport { width: f32, height: f32 },
-    Navigate { id: u64 },
-    RevealDir { id: u64 },
-    RevealFile { dir_id: u64, name: String },
+    Viewport {
+        width: f32,
+        height: f32,
+    },
+    Navigate {
+        id: u64,
+    },
+    RevealDir {
+        id: u64,
+    },
+    RevealFile {
+        dir_id: u64,
+        name: String,
+    },
     Rescan,
-    SetDepth { depth: u8 },
-    ColorMode { mode: ColorMode },
-    FilterExt { extensions: Vec<Box<str>> },
-    FilterSize { min: u64, max: u64 },
-    FilterName { pattern: String },
-    ClearFilter,
-    ScanPath { path: String },
+    SetDepth {
+        depth: u8,
+    },
+    ColorMode {
+        mode: ColorMode,
+    },
+    /// Show only the files with one of `extensions` (any, if empty), at least `min_size` bytes, and
+    /// `name_pattern` in their names (any, if empty).
+    Filter {
+        extensions: Vec<Box<str>>,
+        min_size: u64,
+        name_pattern: String,
+    },
+    ScanPath {
+        path: String,
+    },
 }
 
 impl ClientMessage {
     pub fn encode(&self) -> Vec<u8> {
-        pack(postcard::to_allocvec(self).expect("ClientMessage must serialize"))
+        encode(self)
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        let mut msg: ClientMessage = postcard::from_bytes(&unpack(data)?).ok()?;
+        let mut msg: ClientMessage = decode(data)?;
         msg.normalize();
         Some(msg)
     }
@@ -208,7 +252,7 @@ impl ClientMessage {
                 }
             }
             ClientMessage::SetDepth { depth } => *depth = (*depth).clamp(1, MAX_DEPTH),
-            ClientMessage::FilterExt { extensions } => {
+            ClientMessage::Filter { extensions, .. } => {
                 for extension in extensions.iter_mut() {
                     if extension.starts_with(['*', '.']) {
                         *extension = extension.trim_start_matches(['*', '.']).into();
@@ -230,17 +274,27 @@ const COMPRESSION_LEVEL: u8 = 1;
 /// Sanity backstop against a malicious/corrupt frame inflating to an unreasonable size.
 const MAX_DECOMPRESSED: usize = 256 * 1024 * 1024;
 
+/// `value` as it goes over the wire: postcard, packed.
+fn encode(value: &(impl Serialize + ?Sized)) -> Vec<u8> {
+    pack(&postcard::to_allocvec(value).expect("wire types always serialize"))
+}
+
+/// A value `encode` made, or `None` if `data` isn't one.
+fn decode<T: DeserializeOwned>(data: &[u8]) -> Option<T> {
+    postcard::from_bytes(&unpack(data)?).ok()
+}
+
 /// Prefix a payload with a 1-byte flag: 1 = deflated, 0 = raw. Compression is only kept when it
 /// actually shrinks the payload, so tiny control messages never expand.
-fn pack(bytes: Vec<u8>) -> Vec<u8> {
-    let compressed = miniz_oxide::deflate::compress_to_vec(&bytes, COMPRESSION_LEVEL);
+fn pack(bytes: &[u8]) -> Vec<u8> {
+    let compressed = miniz_oxide::deflate::compress_to_vec(bytes, COMPRESSION_LEVEL);
     let mut out = Vec::with_capacity(compressed.len().min(bytes.len()) + 1);
     if compressed.len() < bytes.len() {
         out.push(1);
         out.extend_from_slice(&compressed);
     } else {
         out.push(0);
-        out.extend_from_slice(&bytes);
+        out.extend_from_slice(bytes);
     }
     out
 }
@@ -374,9 +428,8 @@ mod tests {
     }
 
     #[test]
-    fn rescan_and_clear_filter_round_trip() {
+    fn rescan_round_trips() {
         assert_eq!(client_roundtrip(ClientMessage::Rescan), ClientMessage::Rescan);
-        assert_eq!(client_roundtrip(ClientMessage::ClearFilter), ClientMessage::ClearFilter);
     }
 
     #[test]
@@ -403,35 +456,43 @@ mod tests {
         }
         let mut unknown = postcard::to_allocvec(&ClientMessage::ColorMode { mode: ColorMode::Age }).unwrap();
         *unknown.last_mut().unwrap() = 7;
-        assert_eq!(ClientMessage::decode(&pack(unknown)), None);
+        assert_eq!(ClientMessage::decode(&pack(&unknown)), None);
     }
 
     #[test]
-    fn filter_ext_round_trips() {
-        let msg = ClientMessage::FilterExt {
+    fn filter_round_trips() {
+        let msg = ClientMessage::Filter {
             extensions: vec!["rs".into(), "toml".into(), "json".into()],
+            min_size: 1024,
+            name_pattern: "main".into(),
         };
         assert_eq!(client_roundtrip(msg.clone()), msg);
     }
 
     #[test]
     fn extensions_arrive_without_their_dot() {
-        let msg = ClientMessage::FilterExt {
-            extensions: vec![".mp4".into(), "*.MOV".into(), "rs".into(), ".".into(), "tar.gz".into()],
+        let filter = |extensions: Vec<Box<str>>| ClientMessage::Filter {
+            extensions,
+            min_size: 0,
+            name_pattern: String::new(),
         };
-        let expected = ClientMessage::FilterExt {
-            extensions: vec!["mp4".into(), "MOV".into(), "rs".into(), "tar.gz".into()],
-        };
+        let msg = filter(vec![
+            ".mp4".into(),
+            "*.MOV".into(),
+            "rs".into(),
+            ".".into(),
+            "tar.gz".into(),
+        ]);
+        let expected = filter(vec!["mp4".into(), "MOV".into(), "rs".into(), "tar.gz".into()]);
         assert_eq!(client_roundtrip(msg), expected);
     }
 
     #[test]
-    fn filter_size_round_trips() {
-        let msg = ClientMessage::FilterSize {
-            min: 1024,
-            max: u64::MAX,
-        };
-        assert_eq!(client_roundtrip(msg.clone()), msg);
+    fn format_size_units() {
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(1024 * 1024), "1.00 MiB");
+        assert_eq!(format_size(15 * 1024), "15.0 KiB");
+        assert_eq!(format_size(500 * 1024), "500 KiB");
     }
 
     #[test]
@@ -448,9 +509,14 @@ mod tests {
     }
 
     #[test]
-    fn scan_start_and_picker_mode_round_trip() {
-        assert_eq!(server_roundtrip(ServerMessage::ScanStart), ServerMessage::ScanStart);
-        assert_eq!(server_roundtrip(ServerMessage::PickerMode), ServerMessage::PickerMode);
+    fn phase_messages_round_trip() {
+        for msg in [
+            ServerMessage::ScanStart,
+            ServerMessage::PickerMode,
+            ServerMessage::AwaitingStart,
+        ] {
+            assert_eq!(server_roundtrip(msg.clone()), msg);
+        }
     }
 
     #[test]

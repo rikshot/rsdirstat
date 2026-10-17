@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOptions, UnixDir, cpu_count, node_id, open_dir, run_scan};
+use rsdirstat_core::scan::{
+    DirJob, DirSink, ScanEvent, ScanOptions, Started, UnixDir, cpu_count, node_id, open_root, run_scan,
+};
 
 /// The most worker threads a scan uses by default. More only queue up in the kernel, which serializes much of
 /// `openat` and `getattrlistbulk` on a volume: on a 10-core Mac with warm caches, /System/Library
@@ -60,16 +62,21 @@ pub fn scan(
 ) -> Result<()> {
     let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
     let meta = std::fs::metadata(&path).context("failed to stat root path")?;
-    let fd = open_dir(&path).context("failed to open root directory")?;
+    let fd = open_root(&path).context("failed to open root directory")?;
     let id = node_id(meta.dev(), meta.ino());
     let root_dev = meta.dev() as i32;
     let root = UnixDir::Root(Arc::new(fd));
     let threads = options
         .threads
         .map_or_else(|| cpu_count().min(MAX_THREADS), NonZeroUsize::get);
-    run_scan(&path, root, id, tx, cancel, threads, move |dir, buffer, sink| {
-        read_dir(dir, buffer, sink, root_dev, options.cross_filesystems)
-    });
+    run_scan(
+        Started::new(path, tx),
+        root,
+        id,
+        cancel,
+        threads,
+        move |dir, buffer, sink| read_dir(dir, buffer, sink, root_dev, options.cross_filesystems),
+    );
     Ok(())
 }
 
@@ -132,7 +139,7 @@ fn read_dir(
                         };
                         if let Some(id) = id {
                             let child = UnixDir::Child(Arc::clone(&fd), parsed.c_name.to_owned());
-                            sink.dir(id, &parsed.name, sink.child_path(&parsed.name), child);
+                            sink.dir(id, &parsed.name, child);
                         }
                     }
                     VREG => {

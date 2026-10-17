@@ -3,22 +3,14 @@ use std::collections::{HashMap, HashSet};
 
 use rsdirstat_protocol::{BreadcrumbEntry, ClientMessage, LayoutPayload, LayoutRect, RectKind, ServerMessage};
 
-pub(crate) fn format_size(bytes: u64) -> String {
-    let mut value = bytes as f64;
-    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut index = 0usize;
-    while value >= 1024.0 && index < units.len() - 1 {
-        value /= 1024.0;
-        index += 1;
-    }
-    if index == 0 {
-        format!("{value:.0} {}", units[index])
-    } else if value < 10.0 {
-        format!("{value:.2} {}", units[index])
-    } else if value < 100.0 {
-        format!("{value:.1} {}", units[index])
+pub(crate) use rsdirstat_protocol::format_size;
+
+/// `part` as a percentage of `whole`; 0 of nothing.
+pub(crate) fn percent(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
     } else {
-        format!("{value:.0} {}", units[index])
+        part as f64 / whole as f64 * 100.0
     }
 }
 
@@ -138,21 +130,22 @@ pub(crate) struct InterpolationPlan {
     steps: Vec<InterpolationStep>,
 }
 
-pub(crate) fn find_rect_index(rects: &[RenderRect], mouse_x: f64, mouse_y: f64) -> Option<usize> {
+/// The topmost (last-drawn) rect under the cursor that `accept` takes.
+fn topmost(rects: &[RenderRect], mouse_x: f64, mouse_y: f64, accept: impl Fn(&RenderRect) -> bool) -> Option<usize> {
     rects
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(index, rect)| hit_test(rect, mouse_x, mouse_y).then_some(index))
+        .find_map(|(index, rect)| (accept(rect) && hit_test(rect, mouse_x, mouse_y)).then_some(index))
 }
 
+pub(crate) fn find_rect_index(rects: &[RenderRect], mouse_x: f64, mouse_y: f64) -> Option<usize> {
+    topmost(rects, mouse_x, mouse_y, |_| true)
+}
+
+/// The topmost folder under the cursor.
 pub(crate) fn find_navigable_target_index(rects: &[RenderRect], mouse_x: f64, mouse_y: f64) -> Option<usize> {
-    // Topmost (last-drawn) folder under the cursor — same back-to-front scan as find_rect_index.
-    rects
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, rect)| (hit_test(rect, mouse_x, mouse_y) && rect.kind.is_dir()).then_some(index))
+    topmost(rects, mouse_x, mouse_y, |rect| rect.kind.is_dir())
 }
 
 pub(crate) fn build_rect_index(rects: &[RenderRect]) -> HashMap<u64, usize> {
@@ -165,15 +158,14 @@ pub(crate) fn build_rect_index(rects: &[RenderRect]) -> HashMap<u64, usize> {
     id_to_index
 }
 
+/// The hover state of the rect at `hovered_index`.
 pub(crate) fn build_hover_state(
     rects: &[RenderRect],
     id_to_index: &HashMap<u64, usize>,
     breadcrumb: &[BreadcrumbEntry],
     separator: char,
-    mouse_x: f64,
-    mouse_y: f64,
-) -> Option<HoverState> {
-    let hovered_index = find_rect_index(rects, mouse_x, mouse_y)?;
+    hovered_index: usize,
+) -> HoverState {
     let hovered_rect = &rects[hovered_index];
     let mut current_parent = hovered_rect.parent_id;
     let mut hovered_ancestor_indices = Vec::new();
@@ -196,11 +188,11 @@ pub(crate) fn build_hover_state(
     parts.push(&hovered_rect.name);
     let path_text = join_path(&parts, separator);
 
-    Some(HoverState {
+    HoverState {
         hovered_index,
         hovered_ancestor_indices,
         path_text,
-    })
+    }
 }
 
 impl InterpolationPlan {
@@ -395,11 +387,9 @@ mod tests {
     }
 
     #[test]
-    fn format_size_units() {
-        assert_eq!(format_size(512), "512 B");
-        assert_eq!(format_size(1024 * 1024), "1.00 MiB");
-        assert_eq!(format_size(15 * 1024), "15.0 KiB");
-        assert_eq!(format_size(500 * 1024), "500 KiB");
+    fn percent_of_nothing_is_zero() {
+        assert_eq!(percent(1, 4), 25.0);
+        assert_eq!(percent(1, 0), 0.0);
     }
 
     #[test]
@@ -476,7 +466,8 @@ mod tests {
             name: "/tmp".into(),
         }];
         let rects = [root, child, leaf];
-        let hover = build_hover_state(&rects, &build_rect_index(&rects), &breadcrumb, '/', 16.0, 16.0).unwrap();
+        let hovered = find_rect_index(&rects, 16.0, 16.0).unwrap();
+        let hover = build_hover_state(&rects, &build_rect_index(&rects), &breadcrumb, '/', hovered);
         assert_eq!(hover.hovered_index, 2);
         assert_eq!(hover.hovered_ancestor_indices, vec![1, 0]);
         assert_eq!(hover.path_text, "/tmp/src/nested/main.rs");

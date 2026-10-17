@@ -26,7 +26,6 @@ rsdirstat-protocol.workspace = true
 anyhow.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 clap.workspace = true
-humansize = "2"
 mimalloc = "0.1"
 open = "5"
 parking_lot = "0.12"

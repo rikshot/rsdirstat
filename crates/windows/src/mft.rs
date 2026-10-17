@@ -8,12 +8,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 
-use anyhow::{Context, Result, anyhow, bail};
-use rsdirstat_core::scan::{ScanEvent, ScanOutcome, plain_path};
+use anyhow::{Context, Result, bail};
+use rsdirstat_core::scan::{ScanEvent, ScanOutcome, Started};
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_NO_BUFFERING, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -24,8 +23,8 @@ use windows_sys::Win32::System::Ioctl::{
     FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_GET_RETRIEVAL_POINTERS, NTFS_VOLUME_DATA_BUFFER,
 };
 
+use crate::entry::reparse_tag_by_id;
 use crate::ntfs::{Mft, Record, is_torn, parse_record, u32_at, u64_at};
-use crate::scan::reparse_tag_by_id;
 
 /// How much of the MFT one read takes.
 const CHUNK: usize = 4 << 20;
@@ -37,111 +36,114 @@ const ALIGNMENT: usize = 4096;
 /// How many times a read is made while it has a record caught being rewritten.
 const READ_ATTEMPTS: usize = 3;
 
-/// Scan the folder `path` (canonical), open as `root` with file reference `root_reference` on the
-/// volume with serial number `volume_serial`, from the volume's MFT, reading with up to `threads`
-/// reads in flight. The whole MFT is read however small the folder. An error means the volume can't
-/// be read this way (no administrator rights, not NTFS, a network share) and the folder walk should
-/// scan it instead: `ScanStart` may have been sent by then, but nothing after it.
-pub(crate) fn scan(
-    path: &Path,
-    root: &OwnedHandle,
-    root_reference: u64,
-    volume_serial: u32,
-    threads: usize,
-    tx: &Sender<ScanEvent>,
-    cancel: &AtomicBool,
-) -> Result<()> {
-    let volume = volume_path(root)?;
-    let open = |access| {
-        OpenOptions::new()
-            .access_mode(access)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(&volume)
-    };
-    // Opened for writing too, where it can be, to flush it below.
-    let (device, writable) = match open(GENERIC_READ | GENERIC_WRITE) {
-        Ok(device) => (device, true),
-        Err(_) => (
-            open(GENERIC_READ).context("opening the volume (needs administrator rights)")?,
-            false,
-        ),
-    };
-    // The volume can be read: the scan has started, though nothing is known until it's all read.
-    let _ = tx.send(ScanEvent::ScanStart {
-        root: plain_path(path).into_owned(),
-    });
+/// The volume a scan root is on, open for reading its MFT.
+pub(crate) struct Volume {
+    /// Its device path (see `volume_path`).
+    path: String,
+    device: File,
+    /// Whether `device` is open for writing too, which flushing it needs.
+    writable: bool,
+}
 
-    // From here on, failing is unexpected: say so, as the walk takes over.
-    let fall_back = |e: anyhow::Error| {
-        eprintln!(
-            "Can't read the MFT for {}, walking it instead: {e:#}",
-            plain_path(path).display()
-        );
-        e
-    };
-
-    // The MFT on the disk lags what Windows has cached by a few seconds; flushing the volume brings
-    // it up to date, so files made or deleted just before the scan are seen as they are. A volume
-    // that can't be written is read as it is.
-    if writable {
-        unsafe { FlushFileBuffers(device.as_raw_handle()) };
+impl Volume {
+    /// The volume `root` is on, opened for reading its MFT. An error where it can't be (no
+    /// administrator rights, a network share): the folder walk scans it instead.
+    pub(crate) fn open(root: &OwnedHandle) -> Result<Self> {
+        let path = volume_path(root)?;
+        let open = |access| {
+            OpenOptions::new()
+                .access_mode(access)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&path)
+        };
+        let (device, writable) = match open(GENERIC_READ | GENERIC_WRITE) {
+            Ok(device) => (device, true),
+            Err(_) => (
+                open(GENERIC_READ).context("opening the volume (needs administrator rights)")?,
+                false,
+            ),
+        };
+        Ok(Self { path, device, writable })
     }
-    let mut data: NTFS_VOLUME_DATA_BUFFER = unsafe { std::mem::zeroed() };
-    let data_bytes =
-        unsafe { std::slice::from_raw_parts_mut(&mut data as *mut _ as *mut u8, size_of::<NTFS_VOLUME_DATA_BUFFER>()) };
-    ioctl(&device, FSCTL_GET_NTFS_VOLUME_DATA, &[], data_bytes)
-        .context("not an NTFS volume")
-        .map_err(fall_back)?;
-    drop(device);
 
-    let cluster = data.BytesPerCluster as usize;
-    let record_size = data.BytesPerFileRecordSegment as usize;
-    if record_size == 0 || cluster == 0 || !cluster.is_multiple_of(record_size) || !CHUNK.is_multiple_of(cluster) {
-        return Err(fall_back(anyhow!(
-            "unexpected NTFS geometry: {cluster}-byte clusters, {record_size}-byte records"
-        )));
-    }
-    let record_count = data.MftValidDataLength as usize / record_size;
-    let reads = mft_reads(&volume, cluster, data.MftValidDataLength as usize).map_err(fall_back)?;
-
-    // Each reader takes the next read, parses its records and hands them over; this thread gathers
-    // them as they come. An error ends the gathering, which stops the readers.
-    let next = AtomicUsize::new(0);
-    let (records_tx, records_rx) = mpsc::channel::<Result<Vec<(usize, Record)>>>();
-    let mut mft = std::thread::scope(|scope| -> Result<Mft> {
-        for _ in 0..threads.clamp(1, MAX_READERS) {
-            let records_tx = records_tx.clone();
-            let (volume, reads, next) = (&volume, &reads, &next);
-            scope.spawn(move || {
-                if let Err(e) = read_records(volume, reads, next, record_size, cancel, &records_tx) {
-                    let _ = records_tx.send(Err(e));
-                }
-            });
+    /// Scan the folder of `scan`, open as `root` with file reference `root_reference` on this volume
+    /// (serial number `volume_serial`), from the volume's MFT, reading with up to `threads` reads in
+    /// flight. The whole MFT is read however small the folder. An error means it unexpectedly can't
+    /// be read (not NTFS after all, say), and nothing has been sent: the folder walk should scan it
+    /// instead.
+    pub(crate) fn scan(
+        self,
+        scan: &Started,
+        root: &OwnedHandle,
+        root_reference: u64,
+        volume_serial: u32,
+        threads: usize,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        let Self {
+            path: volume,
+            device,
+            writable,
+        } = self;
+        // The MFT on the disk lags what Windows has cached by a few seconds; flushing the volume
+        // brings it up to date, so files made or deleted just before the scan are seen as they are.
+        // A volume that can't be written is read as it is.
+        if writable {
+            unsafe { FlushFileBuffers(device.as_raw_handle()) };
         }
-        drop(records_tx);
-        // Made while the first reads are under way: a big MFT's table takes a while to set up.
-        let mut mft = Mft::new(record_count);
-        for records in records_rx {
-            for (number, record) in records? {
-                mft.insert(number, record);
+        let mut data: NTFS_VOLUME_DATA_BUFFER = unsafe { std::mem::zeroed() };
+        let data_bytes = unsafe {
+            std::slice::from_raw_parts_mut(&mut data as *mut _ as *mut u8, size_of::<NTFS_VOLUME_DATA_BUFFER>())
+        };
+        ioctl(&device, FSCTL_GET_NTFS_VOLUME_DATA, &[], data_bytes).context("not an NTFS volume")?;
+        drop(device);
+
+        let cluster = data.BytesPerCluster as usize;
+        let record_size = data.BytesPerFileRecordSegment as usize;
+        if record_size == 0 || cluster == 0 || !cluster.is_multiple_of(record_size) || !CHUNK.is_multiple_of(cluster) {
+            bail!("unexpected NTFS geometry: {cluster}-byte clusters, {record_size}-byte records");
+        }
+        let record_count = data.MftValidDataLength as usize / record_size;
+        let reads = mft_reads(&volume, cluster, data.MftValidDataLength as usize)?;
+
+        // Each reader takes the next read, parses its records and hands them over; this thread
+        // gathers them as they come. An error ends the gathering, which stops the readers.
+        let next = AtomicUsize::new(0);
+        let (records_tx, records_rx) = mpsc::channel::<Result<Vec<(usize, Record)>>>();
+        let mut mft = std::thread::scope(|scope| -> Result<Mft> {
+            for _ in 0..threads.clamp(1, MAX_READERS) {
+                let records_tx = records_tx.clone();
+                let (volume, reads, next) = (&volume, &reads, &next);
+                scope.spawn(move || {
+                    if let Err(e) = read_records(volume, reads, next, record_size, cancel, &records_tx) {
+                        let _ = records_tx.send(Err(e));
+                    }
+                });
             }
-        }
-        Ok(mft)
-    })
-    .map_err(fall_back)?;
+            drop(records_tx);
+            // Made while the first reads are under way: a big MFT's table takes a while to set up.
+            let mut mft = Mft::new(record_count);
+            for records in records_rx {
+                for (number, record) in records? {
+                    mft.insert(number, record);
+                }
+            }
+            Ok(mft)
+        })?;
 
-    let outcome = if cancel.load(Ordering::Relaxed) {
-        ScanOutcome::Cancelled
-    } else if mft.send_scan(path, root_reference, volume_serial as u64, tx, |file| {
-        reparse_tag_by_id(root, file as i64)
-    }) {
-        ScanOutcome::Complete
-    } else {
-        return Err(fall_back(anyhow!("the scan root isn't in its volume's MFT")));
-    };
-    // Before the table is freed, so nothing waits for that.
-    let _ = tx.send(ScanEvent::ScanDone { outcome });
-    Ok(())
+        let outcome = if cancel.load(Ordering::Relaxed) {
+            ScanOutcome::Cancelled
+        } else if mft.send_scan(scan.root(), root_reference, volume_serial as u64, scan.tx(), |file| {
+            reparse_tag_by_id(root, file as i64)
+        }) {
+            ScanOutcome::Complete
+        } else {
+            bail!("the scan root isn't in its volume's MFT");
+        };
+        // Before the table is freed, so nothing waits for that.
+        let _ = scan.tx().send(ScanEvent::ScanDone { outcome });
+        Ok(())
+    }
 }
 
 /// The volume `handle` is on, as a device path (`\\?\Volume{GUID}`): what the volume opens as,

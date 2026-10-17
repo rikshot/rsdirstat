@@ -20,8 +20,8 @@ impl TreemapApp {
         listen(&chrome.breadcrumb_bar, "click", |app, event: Event| {
             app.handle_breadcrumb_event(event)
         })?;
-        // One delegated listener on the picker grid instead of a closure per volume card (which
-        // leaked one forgotten closure per card on every picker refresh).
+        // One delegated listener on the picker grid, not a closure per volume card: each refresh
+        // replaces the cards, and their closures would have to be kept and dropped with them.
         listen(&chrome.picker_grid, "click", |app, event: Event| {
             app.handle_picker_event(event)
         })?;
@@ -67,9 +67,7 @@ impl TreemapApp {
     }
 
     pub(super) fn schedule_filter_send(&mut self) -> Result<(), JsValue> {
-        if let Some(id) = self.session.filter_timer_id.take() {
-            self.window.clear_timeout_with_handle(id);
-        }
+        self.cancel_filter_send();
         let id = self.window.set_timeout_with_callback_and_timeout_and_arguments_0(
             self.callbacks.filter_send.as_ref().unchecked_ref(),
             300,
@@ -78,20 +76,23 @@ impl TreemapApp {
         Ok(())
     }
 
-    pub(super) fn clear_filter(&mut self) -> Result<(), JsValue> {
-        // Cancel any debounced filter send still pending, or it would fire after the clear and
-        // re-send the (now empty) inputs.
+    /// Cancel the debounced filter send, if one is pending.
+    fn cancel_filter_send(&mut self) {
         if let Some(id) = self.session.filter_timer_id.take() {
             self.window.clear_timeout_with_handle(id);
         }
+    }
+
+    pub(super) fn clear_filter(&mut self) -> Result<(), JsValue> {
         self.chrome.filter_ext_input.set_value("");
         self.chrome.filter_name_input.set_value("");
         self.chrome.filter_min_input.set_value("");
-        self.send_message(ClientMessage::ClearFilter)
+        self.send_filter_now()
     }
 
+    /// Send the filter as the toolbar has it, superseding a debounced send still pending.
     pub(super) fn send_filter_now(&mut self) -> Result<(), JsValue> {
-        self.session.filter_timer_id = None;
+        self.cancel_filter_send();
         let extensions = self
             .chrome
             .filter_ext_input
@@ -101,16 +102,13 @@ impl TreemapApp {
             .filter(|s| !s.is_empty())
             .map(Box::from)
             .collect();
-        self.send_message(ClientMessage::FilterExt { extensions })?;
-
         let min_value = self.chrome.filter_min_input.value().parse::<f64>().unwrap_or(0.0);
         let min_unit = self.chrome.filter_min_unit_select.value().parse::<u64>().unwrap_or(1);
-        self.send_message(ClientMessage::FilterSize {
-            min: (min_value * min_unit as f64).floor() as u64,
-            max: 0,
-        })?;
-        let pattern = self.chrome.filter_name_input.value().trim().to_string();
-        self.send_message(ClientMessage::FilterName { pattern })
+        self.send_message(ClientMessage::Filter {
+            extensions,
+            min_size: (min_value * min_unit as f64).floor() as u64,
+            name_pattern: self.chrome.filter_name_input.value().trim().to_string(),
+        })
     }
 
     pub(super) fn build_breadcrumb(&mut self) -> Result<(), JsValue> {
@@ -167,9 +165,7 @@ impl TreemapApp {
     }
 
     pub(super) fn load_volumes(&mut self) -> Result<(), JsValue> {
-        self.chrome
-            .picker_grid
-            .set_inner_html(r#"<div class="picker-loading">Loading volumes...</div>"#);
+        self.set_picker_message("Loading volumes...");
         spawn_local(async move {
             let result = fetch_volumes().await;
             with_app(|app| {
@@ -179,74 +175,57 @@ impl TreemapApp {
         Ok(())
     }
 
+    /// Fill the picker grid with just `message`.
+    fn set_picker_message(&self, message: &str) {
+        self.chrome
+            .picker_grid
+            .set_inner_html(&format!(r#"<div class="picker-loading">{message}</div>"#));
+    }
+
     pub(super) fn apply_volume_result(&mut self, result: Result<Vec<VolumeInfo>, JsValue>) -> Result<(), JsValue> {
-        self.chrome.picker_grid.set_inner_html("");
-        match result {
-            Ok(volumes) if volumes.is_empty() => {
-                self.chrome
-                    .picker_grid
-                    .set_inner_html(r#"<div class="picker-loading">No volumes found</div>"#);
-            }
-            Ok(volumes) => {
+        let message = match result {
+            Ok(volumes) if !volumes.is_empty() => {
+                self.chrome.picker_grid.set_inner_html("");
                 for volume in volumes {
                     self.chrome
                         .picker_grid
                         .append_child(self.create_volume_card(volume)?.as_ref())?;
                 }
+                return Ok(());
             }
-            Err(_) => {
-                self.chrome
-                    .picker_grid
-                    .set_inner_html(r#"<div class="picker-loading">Failed to load volumes</div>"#);
-            }
-        }
+            Ok(_) => "No volumes found",
+            Err(_) => "Failed to load volumes",
+        };
+        self.set_picker_message(message);
         Ok(())
+    }
+
+    /// A new `<div>` of class `class` holding `text`, at the end of `parent`.
+    fn append_div(&self, parent: &Element, class: &str, text: &str) -> Result<Element, JsValue> {
+        let div = self.document.create_element("div")?;
+        div.set_class_name(class);
+        div.set_text_content(Some(text));
+        parent.append_child(&div)?;
+        Ok(div)
     }
 
     pub(super) fn create_volume_card(&self, volume: VolumeInfo) -> Result<Element, JsValue> {
         let card = self.document.create_element("div")?;
         card.set_class_name("volume-card");
-
-        let name = self.document.create_element("div")?;
-        name.set_class_name("volume-name");
-        name.set_text_content(Some(&volume.name));
-        card.append_child(&name)?;
-
-        let path = self.document.create_element("div")?;
-        path.set_class_name("volume-path");
-        path.set_text_content(Some(&volume.mount_point));
-        card.append_child(&path)?;
-
-        let bar = self.document.create_element("div")?;
-        bar.set_class_name("volume-bar");
-        let fill = self.document.create_element("div")?;
-        fill.set_class_name("volume-bar-fill");
-        let used_percent = if volume.total_bytes > 0 {
-            (volume.used_bytes as f64 / volume.total_bytes as f64) * 100.0
-        } else {
-            0.0
-        };
-        fill.dyn_ref::<HtmlElement>()
-            .ok_or_else(|| JsValue::from_str("volume bar fill is not HtmlElement"))?
-            .style()
-            .set_property("width", &format!("{used_percent:.1}%"))?;
-        bar.append_child(&fill)?;
-        card.append_child(&bar)?;
-
-        let sizes = self.document.create_element("div")?;
-        sizes.set_class_name("volume-sizes");
-        sizes.set_text_content(Some(&format!(
+        self.append_div(&card, "volume-name", &volume.name)?;
+        self.append_div(&card, "volume-path", &volume.mount_point)?;
+        let bar = self.append_div(&card, "volume-bar", "")?;
+        let fill = self.append_div(&bar, "volume-bar-fill", "")?;
+        let used_percent = percent(volume.used_bytes, volume.total_bytes);
+        fill.set_attribute("style", &format!("width: {used_percent:.1}%"))?;
+        let sizes = format!(
             "{} used of {}",
             format_size(volume.used_bytes),
             format_size(volume.total_bytes)
-        )));
-        card.append_child(&sizes)?;
-
+        );
+        self.append_div(&card, "volume-sizes", &sizes)?;
         if !volume.fs_type.is_empty() {
-            let fs_type = self.document.create_element("div")?;
-            fs_type.set_class_name("volume-fs");
-            fs_type.set_text_content(Some(&volume.fs_type));
-            card.append_child(&fs_type)?;
+            self.append_div(&card, "volume-fs", &volume.fs_type)?;
         }
 
         // The delegated picker-grid listener reads this to start the scan; no per-card closure.

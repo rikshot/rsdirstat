@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::PathBuf;
 
+use rsdirstat_protocol::BreadcrumbEntry;
+
 use crate::color::{hash_name, hue_for_extension};
 use crate::scan::{ScanEvent, ScanOutcome, ScannedFile};
 
@@ -54,26 +56,25 @@ pub struct DirNode {
     /// Newest modification time of anything under this directory, which Age mode colours it by: a
     /// folder holding only subfolders is as recent as the newest file in them. Kept up like `size`.
     pub mtime: i64,
+    /// The tree's `changes` when anything under this directory last changed, so a view of it is
+    /// known to be the same while it stays.
+    pub changed: u64,
 }
 
 #[derive(Clone, Default, PartialEq)]
 pub struct FilterConfig {
     pub extensions: Vec<Box<str>>,
     pub min_size: u64,
-    pub max_size: u64,
     pub name_pattern: String,
 }
 
 impl FilterConfig {
     pub fn is_active(&self) -> bool {
-        !self.extensions.is_empty() || self.min_size > 0 || self.max_size > 0 || !self.name_pattern.is_empty()
+        !self.extensions.is_empty() || self.min_size > 0 || !self.name_pattern.is_empty()
     }
 
     pub fn matches_file(&self, name: &str, size: u64) -> bool {
-        if self.min_size > 0 && size < self.min_size {
-            return false;
-        }
-        if self.max_size > 0 && size > self.max_size {
+        if size < self.min_size {
             return false;
         }
         if !self.name_pattern.is_empty() {
@@ -99,8 +100,6 @@ impl FilterConfig {
         true
     }
 }
-
-use rsdirstat_protocol::BreadcrumbEntry;
 
 pub struct DirTree {
     pub nodes: NodeMap<DirNode>,
@@ -171,6 +170,13 @@ impl DirTree {
 
     /// `name` is taken by value so a scanner's `String` moves in without a second allocation.
     pub fn insert_dir(&mut self, id: u64, parent: u64, name: impl Into<Box<str>>, size: u64, mtime: i64) {
+        self.insert_dir_deferred(id, parent, name, size, mtime);
+        self.propagate(id, size, mtime);
+    }
+
+    /// `insert_dir`, but leaving the totals of the directories above it to `recompute_totals`
+    /// (which `ScanDone` runs), for a caller with no use for them before then.
+    pub fn insert_dir_deferred(&mut self, id: u64, parent: u64, name: impl Into<Box<str>>, size: u64, mtime: i64) {
         let name = name.into();
         let hue = hash_name(&name);
 
@@ -192,8 +198,6 @@ impl DirTree {
         node.direct_size = size;
         node.direct_mtime = mtime;
         node.hue = hue;
-
-        self.propagate(id, size, mtime);
     }
 
     /// A directory's scanned files, added with one lookup of its node.
@@ -241,13 +245,14 @@ impl DirTree {
         hue
     }
 
-    /// Add `size` to the size of `node_id` and of every directory above it, and bring their newest
-    /// modification time up to `mtime`.
+    /// Add `size` to the size of `node_id` and of every directory above it, bring their newest
+    /// modification time up to `mtime`, and mark them changed.
     fn propagate(&mut self, node_id: u64, size: u64, mtime: i64) {
         let mut current = node_id;
         while let Some(node) = self.nodes.get_mut(&current) {
             node.size = node.size.saturating_add(size);
             node.mtime = node.mtime.max(mtime);
+            node.changed = self.changes;
             if node.parent == 0 {
                 break;
             }
@@ -419,15 +424,6 @@ mod tests {
     }
 
     #[test]
-    fn filter_active_with_max_size() {
-        let f = FilterConfig {
-            max_size: 100,
-            ..Default::default()
-        };
-        assert!(f.is_active());
-    }
-
-    #[test]
     fn filter_active_with_name_pattern() {
         let f = FilterConfig {
             name_pattern: "foo".into(),
@@ -452,31 +448,6 @@ mod tests {
         assert!(!f.matches_file("a.txt", 99));
         assert!(f.matches_file("a.txt", 100));
         assert!(f.matches_file("a.txt", 101));
-    }
-
-    #[test]
-    fn filter_max_size() {
-        let f = FilterConfig {
-            max_size: 100,
-            ..Default::default()
-        };
-        assert!(f.matches_file("a.txt", 99));
-        assert!(f.matches_file("a.txt", 100));
-        assert!(!f.matches_file("a.txt", 101));
-    }
-
-    #[test]
-    fn filter_size_range() {
-        let f = FilterConfig {
-            min_size: 50,
-            max_size: 150,
-            ..Default::default()
-        };
-        assert!(!f.matches_file("a.txt", 49));
-        assert!(f.matches_file("a.txt", 50));
-        assert!(f.matches_file("a.txt", 100));
-        assert!(f.matches_file("a.txt", 150));
-        assert!(!f.matches_file("a.txt", 151));
     }
 
     #[test]

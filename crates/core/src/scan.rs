@@ -13,9 +13,8 @@ use std::time::Duration;
 
 use dashmap::DashSet;
 
-/// What a scan reports, in order: `ScanStart`, then the entries, then `ScanDone`. `ScanStart` may
-/// come again before the first entry, when a scanner falls back to another way of scanning; each
-/// starts the scan over. In-process only; nothing here goes over the wire.
+/// What a scan reports, in order: `ScanStart`, then the entries, then `ScanDone`. In-process only;
+/// nothing here goes over the wire.
 #[derive(Clone, Debug)]
 pub enum ScanEvent {
     /// The first event, with the scan root as people see it: canonical, and on Windows without the
@@ -48,6 +47,27 @@ impl ScannedFile {
     /// The total size of `files`: their directory's own size.
     pub fn total(files: &[ScannedFile]) -> u64 {
         files.iter().fold(0u64, |total, file| total.saturating_add(file.size))
+    }
+}
+
+/// A directory's files as its `Dir` reports them: the non-empty ones, and the newest mtime of all.
+#[derive(Clone, Debug, Default)]
+pub struct DirFiles {
+    pub mtime: i64,
+    pub files: Vec<ScannedFile>,
+}
+
+impl DirFiles {
+    /// A file of `size` bytes, modified at `mtime` (Unix seconds).
+    pub fn add(&mut self, name: impl Into<String>, size: u64, mtime: i64) {
+        self.mtime = self.mtime.max(mtime);
+        if size > 0 {
+            self.files.push(ScannedFile {
+                name: name.into(),
+                size,
+                mtime,
+            });
+        }
     }
 }
 
@@ -108,10 +128,12 @@ fn raise_fd_limit() {
     }
 }
 
-/// Open a directory for reading its entries.
+/// Open the root of a Unix scan, first raising the process's descriptor limit for the scan (see
+/// `UnixDir`).
 #[cfg(unix)]
-pub fn open_dir(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+pub fn open_root(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::os::unix::fs::OpenOptionsExt;
+    raise_fd_limit();
     let dir = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY)
@@ -200,9 +222,22 @@ pub struct ScanOptions {
     pub cross_filesystems: bool,
     /// How many worker threads to scan with, instead of the platform's default.
     pub threads: Option<NonZeroUsize>,
-    /// On Windows, walk the folders even where NTFS's file index (the MFT) could be read instead,
-    /// which needs administrator rights.
-    pub no_mft: bool,
+    /// On Windows, when to read NTFS's file index (the MFT) instead of walking the folders.
+    pub mft: Mft,
+}
+
+/// When a Windows scan reads NTFS's file index (the MFT), which needs administrator rights, instead
+/// of walking the folders. Elsewhere there is none, and every scan walks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mft {
+    /// For a whole NTFS drive, where it can be read; any other scan walks. Reading takes seconds
+    /// however little of the drive is scanned, but for all of it is several times faster.
+    #[default]
+    Auto,
+    /// Never: always walk.
+    Off,
+    /// For any folder, failing where it can't be read instead of walking. For comparing the two ways.
+    Require,
 }
 
 /// Size of each worker's buffer for directory reads. Measured from 16 KiB to 1 MiB, it makes no
@@ -224,6 +259,32 @@ const ENTRIES_PER_PROGRESS: u32 = 64;
 
 /// How often the waiting caller samples progress and the cancel flag.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// A scan that has begun: its `ScanStart` sent, and its root and channel ready for the rest.
+pub struct Started {
+    root: PathBuf,
+    tx: Sender<ScanEvent>,
+}
+
+impl Started {
+    /// Begin the scan of `root` (canonical), sending its `ScanStart` to `tx`.
+    pub fn new(root: PathBuf, tx: Sender<ScanEvent>) -> Self {
+        let _ = tx.send(ScanEvent::ScanStart {
+            root: plain_path(&root).into_owned(),
+        });
+        Self { root, tx }
+    }
+
+    /// The root, as given: on Windows, still verbatim.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Where the scan's events go.
+    pub fn tx(&self) -> &Sender<ScanEvent> {
+        &self.tx
+    }
+}
 
 /// One directory waiting to be read.
 pub struct DirJob<H> {
@@ -248,39 +309,27 @@ pub enum ScanOutcome {
     Stalled,
 }
 
-/// Walk the tree under `root`, already opened as `handle` and identified as `id`, on `threads`
-/// worker threads, sending `ScanStart`, then a `Dir` per directory carrying its files, then
-/// `ScanDone` with how the scan ended.
+/// Walk the tree under the root of `scan`, already opened as `handle` and identified as `id`, on
+/// `threads` worker threads, sending a `Dir` per directory carrying its files, then `ScanDone` with
+/// how the scan ended.
 ///
 /// `read_dir` reads one directory: it reports every entry to the [`DirSink`] and calls
 /// [`DirSink::checkpoint`] after each read from the OS, stopping when it returns false. It returns
 /// false if the directory can't be opened, which leaves it out, like any unreadable directory.
 ///
 /// Returns once the walk finishes, the `cancel` flag is set (within [`POLL_INTERVAL`]), or the scan
-/// stalls. `ScanDone` is sent last, and `tx` is dropped on return, so the receiver's channel closes
+/// stalls. `ScanDone` is sent last, and the channel is dropped on return, so the receiver's closes
 /// then. Workers are detached rather than joined so that one blocked in a syscall can't hold the
 /// scan open; whatever it finds afterwards is dropped.
-pub fn run_scan<H, F>(
-    root: &Path,
-    handle: H,
-    id: u64,
-    tx: Sender<ScanEvent>,
-    cancel: Arc<AtomicBool>,
-    threads: usize,
-    read_dir: F,
-) where
+pub fn run_scan<H, F>(scan: Started, handle: H, id: u64, cancel: Arc<AtomicBool>, threads: usize, read_dir: F)
+where
     H: Send + 'static,
     F: Fn(&DirJob<H>, &mut [u8], &mut DirSink<'_, H>) -> bool + Send + Sync + 'static,
 {
-    #[cfg(unix)]
-    raise_fd_limit();
-
-    let _ = tx.send(ScanEvent::ScanStart {
-        root: plain_path(root).into_owned(),
-    });
+    let Started { root, tx } = scan;
     let root = DirJob {
         handle,
-        name: root_name(root),
+        name: root_name(&root),
         id,
         parent_id: 0,
         // On Windows children are opened by path, built from this one. It keeps its
@@ -348,14 +397,15 @@ where
             shared,
             dir_id: job.id,
             dir_path: &job.path,
-            mtime: 0,
-            files: Vec::new(),
+            files: DirFiles::default(),
             children: Vec::new(),
             entries: 0,
         };
         let opened = read_dir(&job, &mut buffer, &mut sink);
         let DirSink {
-            mtime, files, children, ..
+            files: DirFiles { mtime, files },
+            children,
+            ..
         } = sink;
 
         let DirJob {
@@ -390,8 +440,7 @@ pub struct DirSink<'a, H> {
     shared: &'a Shared<H>,
     dir_id: u64,
     dir_path: &'a str,
-    mtime: i64,
-    files: Vec<ScannedFile>,
+    files: DirFiles,
     children: Vec<DirJob<H>>,
     /// Entries reported so far, for recording progress every `ENTRIES_PER_PROGRESS`.
     entries: u32,
@@ -406,9 +455,9 @@ impl<H> DirSink<'_, H> {
         )
     }
 
-    /// A subdirectory to read, through `handle`. One already reached under another name is skipped
-    /// (and `handle` dropped).
-    pub fn dir(&mut self, id: u64, name: &str, path: String, handle: H) {
+    /// The subdirectory `name` to read, through `handle`. One already reached under another name is
+    /// skipped (and `handle` dropped).
+    pub fn dir(&mut self, id: u64, name: &str, handle: H) {
         self.count_entry();
         if self.shared.visited_dirs.insert(id) {
             self.children.push(DirJob {
@@ -416,7 +465,7 @@ impl<H> DirSink<'_, H> {
                 id,
                 parent_id: self.dir_id,
                 name: name.to_owned(),
-                path,
+                path: self.child_path(name),
             });
         }
     }
@@ -429,14 +478,7 @@ impl<H> DirSink<'_, H> {
         if hardlink.is_some_and(|id| !self.shared.visited_files.insert(id)) {
             return;
         }
-        self.mtime = self.mtime.max(mtime);
-        if size > 0 {
-            self.files.push(ScannedFile {
-                name: name.into(),
-                size,
-                mtime,
-            });
-        }
+        self.files.add(name, size, mtime);
     }
 
     /// Call after each read from the OS. Records progress for stall detection, and returns false
@@ -850,7 +892,7 @@ mod tests {
             }
             for &child in &dir.dirs {
                 let child_dir = &tree[child];
-                sink.dir(child_dir.id, child_dir.name, sink.child_path(child_dir.name), child);
+                sink.dir(child_dir.id, child_dir.name, child);
             }
             sink.checkpoint();
             true
@@ -862,10 +904,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let root = format!("/{}", tree[0].name);
         run_scan(
-            Path::new(&root),
+            Started::new(root.into(), tx),
             0,
             tree[0].id,
-            tx,
             Arc::default(),
             4,
             fake_read_dir(Arc::clone(tree)),
@@ -956,7 +997,7 @@ mod tests {
                     if id == 100 {
                         cancel.store(true, Ordering::Relaxed);
                     }
-                    sink.dir(id, "d", sink.child_path("d"), ());
+                    sink.dir(id, "d", ());
                 }
                 sink.checkpoint();
                 true
@@ -964,7 +1005,7 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel();
         let started = Instant::now();
-        run_scan(Path::new("/root"), (), 1, tx, cancel, 4, read_dir);
+        run_scan(Started::new("/root".into(), tx), (), 1, cancel, 4, read_dir);
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "took {:?}",
@@ -995,8 +1036,7 @@ mod tests {
             shared,
             dir_id: 1,
             dir_path,
-            mtime: 0,
-            files: Vec::new(),
+            files: DirFiles::default(),
             children: Vec::new(),
             entries: 0,
         }
@@ -1028,7 +1068,7 @@ mod tests {
         }
         assert_eq!(progress(), 1);
         for index in 0..ENTRIES_PER_PROGRESS {
-            sink.dir(index.into(), "d", sink.child_path("d"), ());
+            sink.dir(index.into(), "d", ());
         }
         assert_eq!(progress(), 2);
     }

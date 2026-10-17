@@ -1,38 +1,10 @@
+mod common;
+
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
-use std::sync::mpsc;
 
-use rsdirstat_core::scan::ScanEvent;
+use common::scan_to_tree;
 use rsdirstat_core::tree::{DirTree, FileEntry};
-
-#[cfg(target_os = "linux")]
-use rsdirstat_linux as scanner;
-#[cfg(target_os = "macos")]
-use rsdirstat_macos as scanner;
-#[cfg(target_os = "windows")]
-use rsdirstat_windows as scanner;
-
-fn scan_to_tree(root: &Path) -> DirTree {
-    let (tx, rx) = mpsc::channel();
-    let root = root.to_path_buf();
-    let handle =
-        std::thread::spawn(move || scanner::scan::scan(&root, Default::default(), tx, Default::default()).unwrap());
-    // The scan's own failure first, before what it left out.
-    handle.join().unwrap();
-    tree_from(rx)
-}
-
-/// The tree a scan's `events` build, which must be complete.
-fn tree_from(events: mpsc::Receiver<ScanEvent>) -> DirTree {
-    let mut tree = DirTree::new();
-    // `ScanDone` is the last event, and applying it recomputes the sizes.
-    for event in events {
-        tree.apply(event);
-    }
-    assert!(tree.complete, "the scan must read everything");
-    tree
-}
 
 fn files(tree: &DirTree) -> impl Iterator<Item = &FileEntry> {
     tree.nodes.values().flat_map(|node| &node.files)
@@ -40,6 +12,10 @@ fn files(tree: &DirTree) -> impl Iterator<Item = &FileEntry> {
 
 fn file_names(tree: &DirTree) -> Vec<&str> {
     files(tree).map(|file| &*file.name).collect()
+}
+
+fn dir_names(tree: &DirTree) -> Vec<&str> {
+    tree.nodes.values().map(|node| &*node.name).collect()
 }
 
 fn create_test_dir() -> tempfile::TempDir {
@@ -66,7 +42,7 @@ fn scanner_finds_all_directories() {
 
     assert!(tree.root_id.is_some());
 
-    let names: Vec<&str> = tree.nodes.values().map(|n| &*n.name).collect();
+    let names = dir_names(&tree);
     assert!(names.contains(&"src"), "missing src in {names:?}");
     assert!(names.contains(&"docs"), "missing docs in {names:?}");
     assert!(names.contains(&"nested"), "missing nested in {names:?}");
@@ -152,7 +128,7 @@ fn scanner_handles_empty_directory() {
     let tree = scan_to_tree(dir.path());
 
     assert!(tree.root_id.is_some());
-    let names: Vec<&str> = tree.nodes.values().map(|n| &*n.name).collect();
+    let names = dir_names(&tree);
     assert!(names.contains(&"empty"));
     assert_eq!(files(&tree).count(), 0);
 }
@@ -214,8 +190,8 @@ fn scanner_unicode_filenames() {
 
     let tree = scan_to_tree(dir.path());
 
-    let dir_names: Vec<&str> = tree.nodes.values().map(|n| &*n.name).collect();
-    assert!(dir_names.contains(&"données"), "missing unicode dir in {dir_names:?}");
+    let names = dir_names(&tree);
+    assert!(names.contains(&"données"), "missing unicode dir in {names:?}");
 
     let file_names = file_names(&tree);
     assert!(
@@ -248,9 +224,9 @@ fn scanner_leaves_out_unreadable_directories() {
     let tree = scan_to_tree(dir.path());
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let dir_names: Vec<&str> = tree.nodes.values().map(|node| &*node.name).collect();
-    assert!(!dir_names.contains(&"locked"), "{dir_names:?}");
-    assert!(dir_names.contains(&"nested"), "the rest is scanned: {dir_names:?}");
+    let names = dir_names(&tree);
+    assert!(!names.contains(&"locked"), "{names:?}");
+    assert!(names.contains(&"nested"), "the rest is scanned: {names:?}");
 }
 
 /// On Windows a scan of a whole drive reads NTFS's file index (the MFT) where it can, as
@@ -261,8 +237,10 @@ fn scanner_leaves_out_unreadable_directories() {
 #[test]
 fn reading_the_mft_finds_what_the_folder_walk_finds() {
     use std::collections::BTreeMap;
+    use std::sync::mpsc;
 
-    use rsdirstat_core::scan::ScanOptions;
+    use common::{scanner, tree_from};
+    use rsdirstat_core::scan::{Mft, ScanOptions};
 
     let dir = create_test_dir();
     let root = dir.path();
@@ -291,24 +269,26 @@ fn reading_the_mft_finds_what_the_folder_walk_finds() {
             .collect()
     };
 
-    let (tx, rx) = mpsc::channel();
-    let options = ScanOptions {
-        no_mft: true,
-        ..Default::default()
+    let scan = |mft| {
+        let (tx, rx) = mpsc::channel();
+        let options = ScanOptions {
+            mft,
+            ..Default::default()
+        };
+        scanner::scan::scan(root, options, tx, Default::default()).map(|()| rx)
     };
-    scanner::scan::scan(root, options, tx, Default::default()).unwrap();
-    let walked = tree_from(rx);
-
-    let (tx, rx) = mpsc::channel();
-    if let Err(e) = scanner::scan::scan_mft(root, tx) {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "CI runs as administrator, so the MFT must be readable: {e:#}"
-        );
-        eprintln!("skipped: can't read the MFT here ({e:#}); run as administrator");
-        return;
-    }
-    let read = tree_from(rx);
+    let walked = tree_from(scan(Mft::Off).unwrap());
+    let read = match scan(Mft::Require) {
+        Ok(events) => tree_from(events),
+        Err(e) => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI runs as administrator, so the MFT must be readable: {e:#}"
+            );
+            eprintln!("skipped: can't read the MFT here ({e:#}); run as administrator");
+            return;
+        }
+    };
     assert_eq!(folders(&read), folders(&walked));
 }
 

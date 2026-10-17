@@ -3,22 +3,18 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use humansize::{BINARY, format_size};
-use rsdirstat_core::scan::{ScanEvent, ScanOptions, ScannedFile};
+use rsdirstat_core::scan::{ScanEvent, ScannedFile};
 use rsdirstat_core::tree::DirTree;
+use rsdirstat_protocol::format_size;
 
-#[cfg(target_os = "linux")]
-use rsdirstat_linux as scanner;
-#[cfg(target_os = "macos")]
-use rsdirstat_macos as scanner;
-#[cfg(target_os = "windows")]
-use rsdirstat_windows as scanner;
+#[path = "../scanning.rs"]
+mod scanning;
+use scanning::{ScanArgs, scanner};
 
 #[derive(Parser)]
 #[command(name = "rsdirstat-cli", version, about = "Blazing fast disk usage scanner")]
@@ -35,30 +31,20 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     top: usize,
 
-    /// Cross filesystem boundaries
-    #[arg(long)]
-    all: bool,
-
-    /// Scan with this many threads, any number [default: one per CPU; two on Linux; 4 on macOS]
-    #[arg(long)]
-    threads: Option<NonZeroUsize>,
-
-    /// On Windows, walk a whole drive's folders even as administrator, instead of reading NTFS's
-    /// file index
-    #[arg(long)]
-    no_mft: bool,
+    #[command(flatten)]
+    scan: ScanArgs,
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let Args {
+        path,
+        files: list_files,
+        top,
+        scan,
+    } = Args::parse();
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let path = args.path.clone();
-    let options = ScanOptions {
-        cross_filesystems: args.all,
-        threads: args.threads,
-        no_mft: args.no_mft,
-    };
+    let options = scan.into();
     let handle = std::thread::spawn(move || scanner::scan::scan(&path, options, tx, Arc::default()));
 
     let mut tree = DirTree::new();
@@ -66,7 +52,8 @@ fn main() -> Result<()> {
     // be dropped first.
     let mut files = BinaryHeap::new();
 
-    while let Ok(event) = rx.recv() {
+    let mut done = false;
+    while !done && let Ok(event) = rx.recv() {
         match event {
             // The tree only needs each directory's total, so files are kept (outside the tree, and
             // only the largest) only when listing them.
@@ -78,27 +65,35 @@ fn main() -> Result<()> {
                 files: dir_files,
             } => {
                 let size = ScannedFile::total(&dir_files);
-                if args.files {
+                if list_files {
                     for file in dir_files {
                         files.push(Reverse((file.size, id, file.name)));
-                        if files.len() > args.top {
+                        if files.len() > top {
                             files.pop();
                         }
                     }
                 }
-                tree.insert_dir(id, parent, name, size, mtime);
+                tree.insert_dir_deferred(id, parent, name, size, mtime);
             }
-            // `ScanDone`, the last event, recomputes the sizes.
-            event => tree.apply(event),
+            // `ScanDone`, the last event, computes the totals.
+            event => {
+                done = matches!(event, ScanEvent::ScanDone { .. });
+                tree.apply(event);
+            }
         }
     }
 
-    handle.join().map_err(|_| anyhow::anyhow!("scan thread panicked"))??;
+    // A scan that sent `ScanDone` succeeded, and what it still has to free isn't waited for. One
+    // that didn't is, for its error; without one, its totals were never computed.
+    if !done {
+        handle.join().map_err(|_| anyhow::anyhow!("scan thread panicked"))??;
+        tree.recompute_totals();
+    }
     if !tree.complete {
         eprintln!("The scan stopped early, so these results are incomplete.");
     }
 
-    if args.files {
+    if list_files {
         // Sorted by `Reverse`, so largest first.
         print_entries(
             files
@@ -108,7 +103,7 @@ fn main() -> Result<()> {
         );
     } else {
         let mut dirs: Vec<(u64, u64)> = tree.nodes.iter().map(|(&id, node)| (id, node.size)).collect();
-        top_n(&mut dirs, args.top, |&(_, size)| size);
+        top_n(&mut dirs, top, |&(_, size)| size);
         print_entries(
             dirs.iter()
                 .map(|&(id, size)| (tree.full_path(id).unwrap_or_default(), size)),
@@ -131,7 +126,7 @@ fn top_n<T>(items: &mut Vec<T>, n: usize, key: impl Fn(&T) -> u64) {
 }
 
 fn print_entries(entries: impl Iterator<Item = (PathBuf, u64)>) {
-    let rows: Vec<(String, PathBuf)> = entries.map(|(path, size)| (format_size(size, BINARY), path)).collect();
+    let rows: Vec<(String, PathBuf)> = entries.map(|(path, size)| (format_size(size), path)).collect();
     let width = rows.iter().map(|(size, _)| size.len()).max().unwrap_or(0);
     for (size, path) in &rows {
         println!("{size:>width$}  {}", path.display());

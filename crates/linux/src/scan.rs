@@ -6,35 +6,29 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use rsdirstat_core::scan::{DirJob, DirSink, ScanEvent, ScanOptions, UnixDir, cpu_count, node_id, open_dir, run_scan};
+use libc::{
+    AT_STATX_DONT_SYNC, DT_DIR, DT_REG, DT_UNKNOWN, STATX_INO, STATX_MNT_ID, STATX_MODE, STATX_MTIME, STATX_NLINK,
+    STATX_SIZE, STATX_TYPE, statx as Statx,
+};
+use rsdirstat_core::scan::{
+    DirJob, DirSink, ScanEvent, ScanOptions, Started, UnixDir, cpu_count, node_id, open_root, run_scan,
+};
 
-const DT_DIR: u8 = 4;
-const DT_REG: u8 = 8;
-
-const STATX_TYPE: u32 = 0x0001;
-const STATX_MODE: u32 = 0x0002;
-const STATX_NLINK: u32 = 0x0004;
-const STATX_MTIME: u32 = 0x0040;
-const STATX_INO: u32 = 0x0100;
-const STATX_SIZE: u32 = 0x0200;
-const STATX_MNT_ID: u32 = 0x1000;
 /// What a file's entry needs: its size, its mtime, and its link count (for hardlink dedup).
 const FILE_STATX_MASK: u32 = STATX_SIZE | STATX_MTIME | STATX_NLINK;
 /// What a directory's entry needs: its identity (with the device, always reported) and its mount.
 const DIR_STATX_MASK: u32 = STATX_INO | STATX_MNT_ID;
-const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
 
-/// Combine the statx device major/minor into a single value for node identity. This need not match
-/// the kernel's `dev_t` encoding — only be consistent within a scan.
-fn makedev(major: u32, minor: u32) -> u64 {
-    ((major as u64) << 32) | minor as u64
+/// The device an entry is on.
+fn device(sx: &Statx) -> u64 {
+    libc::makedev(sx.stx_dev_major, sx.stx_dev_minor)
 }
 
 /// A directory's node id: its inode with its device. From the directory's own `statx` rather than
 /// the entry's `d_ino`, which for a mount point is the directory it covers, so a bind mount gets
 /// the same id as the directory it shows and is read only once.
 fn dir_id(sx: &Statx) -> u64 {
-    node_id(makedev(sx.stx_dev_major, sx.stx_dev_minor), sx.stx_ino)
+    node_id(device(sx), sx.stx_ino)
 }
 
 /// Which mounted filesystem an entry is on, for staying on the root's: its mount id, or, on kernels
@@ -44,50 +38,14 @@ fn filesystem(sx: &Statx) -> u64 {
     if sx.stx_mask & STATX_MNT_ID != 0 {
         sx.stx_mnt_id
     } else {
-        makedev(sx.stx_dev_major, sx.stx_dev_minor)
+        device(sx)
     }
 }
 
-#[repr(C)]
-#[derive(Default)]
-struct StatxTimestamp {
-    tv_sec: i64,
-    tv_nsec: u32,
-    _pad: i32,
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct Statx {
-    stx_mask: u32,
-    stx_blksize: u32,
-    stx_attributes: u64,
-    stx_nlink: u32,
-    stx_uid: u32,
-    stx_gid: u32,
-    stx_mode: u16,
-    _spare0: u16,
-    stx_ino: u64,
-    stx_size: u64,
-    stx_blocks: u64,
-    stx_attributes_mask: u64,
-    stx_atime: StatxTimestamp,
-    stx_btime: StatxTimestamp,
-    stx_ctime: StatxTimestamp,
-    stx_mtime: StatxTimestamp,
-    stx_rdev_major: u32,
-    stx_rdev_minor: u32,
-    stx_dev_major: u32,
-    stx_dev_minor: u32,
-    stx_mnt_id: u64,
-    stx_dio_mem_align: u32,
-    stx_dio_offset_align: u32,
-    _spare3: [u64; 12],
-}
-
 /// `statx` the entry `name` of `dirfd`, from cached attributes where the filesystem keeps them.
+/// Through the raw syscall, which unlike glibc's wrapper needs no glibc 2.28.
 fn statx(dirfd: i32, name: &CStr, flags: libc::c_int, mask: u32) -> Option<Statx> {
-    let mut buf = Statx::default();
+    let mut buf: Statx = unsafe { std::mem::zeroed() };
     let ret = unsafe {
         libc::syscall(
             libc::SYS_statx,
@@ -126,15 +84,14 @@ pub fn scan(
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     let path = std::fs::canonicalize(root).context("failed to canonicalize root path")?;
-    let fd = open_dir(&path).context("failed to open root directory")?;
+    let fd = open_root(&path).context("failed to open root directory")?;
     let sx = statx_fd(fd.as_raw_fd(), DIR_STATX_MASK).context("failed to statx root directory")?;
     let root_filesystem = filesystem(&sx);
     let root = UnixDir::Root(Arc::new(fd));
     run_scan(
-        &path,
+        Started::new(path, tx),
         root,
         dir_id(&sx),
-        tx,
         cancel,
         options
             .threads
@@ -208,7 +165,7 @@ fn read_dir(
 
             // Some filesystems leave the type unknown (DT_UNKNOWN). Resolve it with a statx that
             // also asks for everything a file or directory needs, so either costs one statx.
-            let (entry_type, stat) = if d_type == 0 {
+            let (entry_type, stat) = if d_type == DT_UNKNOWN {
                 let mask = STATX_TYPE | STATX_MODE | FILE_STATX_MASK | DIR_STATX_MASK;
                 let Some(sx) = statx_path(dir_fd, name, mask) else {
                     continue;
@@ -233,13 +190,12 @@ fn read_dir(
                         continue;
                     }
                     let child = UnixDir::Child(Arc::clone(&fd), name.to_owned());
-                    sink.dir(dir_id(&sx), &display_name, sink.child_path(&display_name), child);
+                    sink.dir(dir_id(&sx), &display_name, child);
                 }
                 DT_REG => {
                     if let Some(sx) = stat.or_else(|| statx_path(dir_fd, name, FILE_STATX_MASK)) {
                         // Hardlink identity: the entry's inode (d_ino) with the file's device.
-                        let hardlink =
-                            (sx.stx_nlink > 1).then(|| node_id(makedev(sx.stx_dev_major, sx.stx_dev_minor), d_ino));
+                        let hardlink = (sx.stx_nlink > 1).then(|| node_id(device(&sx), d_ino));
                         sink.file(display_name, sx.stx_size, sx.stx_mtime.tv_sec, hardlink);
                     }
                 }

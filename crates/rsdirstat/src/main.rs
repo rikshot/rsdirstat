@@ -2,7 +2,6 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::future::IntoFuture;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,12 +26,8 @@ use rsdirstat_core::scan::{ScanEvent, ScanOptions};
 use rsdirstat_core::tree::{DirTree, FilterConfig};
 use rsdirstat_protocol::{self as wire, ClientMessage};
 
-#[cfg(target_os = "linux")]
-use rsdirstat_linux as scanner;
-#[cfg(target_os = "macos")]
-use rsdirstat_macos as scanner;
-#[cfg(target_os = "windows")]
-use rsdirstat_windows as scanner;
+mod scanning;
+use scanning::{ScanArgs, scanner};
 
 #[derive(Parser)]
 #[command(name = "rsdirstat", version, about = "Interactive treemap disk usage server")]
@@ -40,18 +35,8 @@ struct Args {
     /// Path to scan (omit to show volume picker)
     path: Option<PathBuf>,
 
-    /// Cross filesystem boundaries
-    #[arg(long)]
-    all: bool,
-
-    /// Scan with this many threads, any number [default: one per CPU; two on Linux; 4 on macOS]
-    #[arg(long)]
-    threads: Option<NonZeroUsize>,
-
-    /// On Windows, walk a whole drive's folders even as administrator, instead of reading NTFS's
-    /// file index
-    #[arg(long)]
-    no_mft: bool,
+    #[command(flatten)]
+    scan: ScanArgs,
 
     /// Port for the GUI server (0 = random)
     #[arg(long, default_value_t = 0)]
@@ -78,6 +63,8 @@ struct ViewConfig {
     filter: FilterConfig,
     /// The sizes `filter` left at the last layout, kept for the next while they still hold.
     filtered: FilteredSizes,
+    /// What the last layout sent showed.
+    shown: Option<Shown>,
 }
 
 impl Default for ViewConfig {
@@ -90,8 +77,26 @@ impl Default for ViewConfig {
             color_mode: wire::ColorMode::default(),
             filter: FilterConfig::default(),
             filtered: FilteredSizes::default(),
+            shown: None,
         }
     }
+}
+
+/// Everything a tab's layout shows, so one that would show nothing new isn't sent: during a scan,
+/// a view of a folder already read stays as it is while the rest of the tree grows.
+#[derive(PartialEq)]
+struct Shown {
+    scan: u64,
+    view_root: u64,
+    /// When anything under the view root last changed (`DirNode::changed`).
+    changed: u64,
+    viewport: (f64, f64),
+    max_depth: u8,
+    color_mode: wire::ColorMode,
+    filter: FilterConfig,
+    scan_done: bool,
+    /// In Age mode, the tree's range of mtimes, which a folder's colour is relative to.
+    age_range: Option<(i64, i64)>,
 }
 
 /// How often a tab gets a new layout while a scan streams in, at most. Once it's done, a tab gets one
@@ -114,20 +119,33 @@ enum ScanPhase {
     /// No path to scan: the volume picker is up. At startup without a path, and after a scan
     /// couldn't start.
     AwaitingPath,
-    /// A path is set, and the scan waits for the page's Start button (`--wait`).
-    AwaitingStart,
-    /// Scanning since `started`. `cancel` stops it, and also identifies this scan to its relay task.
-    Running { cancel: Arc<AtomicBool>, started: Instant },
-    /// The last scan has ended (complete, or cut short by a cancel or stall), after running this
-    /// long.
-    Done(Duration),
+    /// The scan of `root` waits for the page's Start button (`--wait`).
+    AwaitingStart { root: PathBuf },
+    /// Scanning `root` since `started`. `cancel` stops it, and also identifies this scan to its
+    /// relay task.
+    Running {
+        root: PathBuf,
+        cancel: Arc<AtomicBool>,
+        started: Instant,
+    },
+    /// The last scan, of `root`, has ended (complete, or cut short by a cancel or stall), after
+    /// running for `took`.
+    Done { root: PathBuf, took: Duration },
+}
+
+impl ScanPhase {
+    /// The path about to be, being or last scanned.
+    fn root(&self) -> Option<&PathBuf> {
+        match self {
+            Self::AwaitingPath => None,
+            Self::AwaitingStart { root } | Self::Running { root, .. } | Self::Done { root, .. } => Some(root),
+        }
+    }
 }
 
 struct ScanState {
     tree: RwLock<DirTree>,
     phase: Mutex<ScanPhase>,
-    /// The path being (or last) scanned.
-    root: Mutex<PathBuf>,
     options: ScanOptions,
 }
 
@@ -145,12 +163,11 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(phase: ScanPhase, root: PathBuf, options: ScanOptions) -> Self {
+    fn new(phase: ScanPhase, options: ScanOptions) -> Self {
         Self {
             scan: ScanState {
                 tree: RwLock::new(DirTree::new()),
                 phase: Mutex::new(phase),
-                root: Mutex::new(root),
                 options,
             },
             picker: watch::channel(()).0,
@@ -185,33 +202,24 @@ fn main() -> Result<()> {
 async fn run_server(args: Args) -> Result<()> {
     let Args {
         path,
-        all: cross_filesystems,
-        threads,
-        no_mft,
+        scan,
         port,
         no_open,
         wait,
     } = args;
-    let picker_mode = path.is_none();
     // Canonicalize once, here at the boundary, and fail fast: a mistyped path is an error on the
     // command line, not a browser tab that opens on the volume picker.
-    let (phase, scan_root) = match path {
-        None => (ScanPhase::AwaitingPath, PathBuf::new()),
-        Some(path) => {
-            let root = std::fs::canonicalize(&path).with_context(|| format!("can't scan {}", path.display()))?;
-            (ScanPhase::AwaitingStart, root)
-        }
+    let phase = match path {
+        None => ScanPhase::AwaitingPath,
+        Some(path) => ScanPhase::AwaitingStart {
+            root: std::fs::canonicalize(&path).with_context(|| format!("can't scan {}", path.display()))?,
+        },
     };
 
-    let options = ScanOptions {
-        cross_filesystems,
-        threads,
-        no_mft,
-    };
-    let state = Arc::new(AppState::new(phase, scan_root, options));
+    let state = Arc::new(AppState::new(phase, scan.into()));
 
     if !wait {
-        start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart));
+        start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart { .. }));
     }
 
     if Assets::get("index.html").is_none() {
@@ -236,17 +244,10 @@ async fn run_server(args: Args) -> Result<()> {
     let actual_port = listener.local_addr()?.port();
     eprintln!("Listening on http://localhost:{actual_port}");
 
-    if !no_open {
-        let url = if picker_mode {
-            format!("http://localhost:{actual_port}/?picker")
-        } else if wait {
-            format!("http://localhost:{actual_port}/?wait")
-        } else {
-            format!("http://localhost:{actual_port}")
-        };
-        if let Err(e) = open::that(&url) {
-            eprintln!("Failed to open browser: {e}");
-        }
+    // Without waiting for the browser: a launcher can take a while to return (xdg-open, `start`),
+    // and nothing is served until this does.
+    if !no_open && let Err(e) = open::that_detached(format!("http://localhost:{actual_port}")) {
+        eprintln!("Failed to open browser: {e}");
     }
 
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(Arc::clone(&state)));
@@ -279,12 +280,13 @@ async fn serve_until_stopped(
 /// tree it last showed (which also takes its view back to the root), then a layout of its view.
 /// No layout while there is nothing to show: waiting for a path or for Start (the tree may still
 /// hold an earlier scan, and a layout would bring its treemap back over the picker), before the
-/// tab's first viewport, or before a scan's root arrives.
+/// tab's first viewport, or before a scan's root arrives. Nor when it would show what the tab's last
+/// layout did.
 fn update_tab(state: &AppState, view: &mut ViewConfig) -> (Option<Bytes>, Option<Bytes>) {
     let (scan_done, scan_time) = match *state.scan.phase.lock() {
         ScanPhase::Running { started, .. } => (false, started.elapsed()),
-        ScanPhase::Done(took) => (true, took),
-        ScanPhase::AwaitingPath | ScanPhase::AwaitingStart => return (None, None),
+        ScanPhase::Done { took, .. } => (true, took),
+        ScanPhase::AwaitingPath | ScanPhase::AwaitingStart { .. } => return (None, None),
     };
 
     let tree = state.scan.tree.read();
@@ -303,6 +305,21 @@ fn update_tab(state: &AppState, view: &mut ViewConfig) -> (Option<Bytes>, Option
         .view_root
         .filter(|id| tree.nodes.contains_key(id))
         .unwrap_or(root_id);
+    let shown = Shown {
+        scan: tree.scans,
+        view_root,
+        changed: tree.nodes[&view_root].changed,
+        viewport: view.viewport,
+        max_depth: view.max_depth,
+        color_mode: view.color_mode,
+        filter: view.filter.clone(),
+        scan_done,
+        age_range: (view.color_mode == wire::ColorMode::Age).then_some(tree.mtime_range),
+    };
+    if view.shown.as_ref() == Some(&shown) {
+        return (scan_start, None);
+    }
+    view.shown = Some(shown);
     let config = LayoutConfig {
         max_depth: view.max_depth,
         color_mode: view.color_mode,
@@ -368,15 +385,15 @@ fn start_scan(state: &Arc<AppState>, root: Option<PathBuf>, allowed: impl FnOnce
         if !allowed(&phase) {
             return;
         }
+        let Some(root) = root.or_else(|| phase.root().cloned()) else {
+            return;
+        };
         *phase = ScanPhase::Running {
+            root: root.clone(),
             cancel: Arc::clone(&cancel),
             started: Instant::now(),
         };
-        let mut current_root = state.scan.root.lock();
-        if let Some(root) = root {
-            *current_root = root;
-        }
-        current_root.clone()
+        root
     };
 
     let (tx, rx) = std::sync::mpsc::channel::<ScanEvent>();
@@ -397,10 +414,11 @@ fn start_scan(state: &Arc<AppState>, root: Option<PathBuf>, allowed: impl FnOnce
 /// `ScanDone`, or, if the scanner stops without one, back to the picker when it never started (it
 /// couldn't open the root) and `Done` with what it found when it did (it panicked).
 fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cancel: &Arc<AtomicBool>) {
-    // Only this scan's relay may end its phase. `next` gets how long the scan ran.
-    let end_phase = |next: fn(Duration) -> ScanPhase| {
+    // Only this scan's relay may end its phase. `next` gets its root and how long it ran.
+    let end_phase = |next: fn(PathBuf, Duration) -> ScanPhase| {
         let mut phase = state.scan.phase.lock();
         let ScanPhase::Running {
+            root,
             cancel: running,
             started,
         } = &*phase
@@ -410,9 +428,10 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
         if !Arc::ptr_eq(running, cancel) {
             return false;
         }
-        *phase = next(started.elapsed());
+        *phase = next(root.clone(), started.elapsed());
         true
     };
+    let ended = |root, took| ScanPhase::Done { root, took };
 
     // Reused across iterations so the per-batch drain doesn't reallocate each wakeup.
     let mut events = Vec::new();
@@ -428,7 +447,7 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
             tree.apply(event);
             if done {
                 // Under the tree lock, so no tab lays out the final tree still marked as running.
-                end_phase(ScanPhase::Done);
+                end_phase(ended);
                 drop(tree);
                 state.tree_changed();
                 return;
@@ -441,10 +460,10 @@ fn relay_scan(state: &AppState, rx: &std::sync::mpsc::Receiver<ScanEvent>, cance
     // The scanner stopped without `ScanDone`, so the tree isn't marked complete: the page says so.
     if started {
         state.scan.tree.write().recompute_totals();
-        if end_phase(ScanPhase::Done) {
+        if end_phase(ended) {
             state.tree_changed();
         }
-    } else if end_phase(|_| ScanPhase::AwaitingPath) {
+    } else if end_phase(|_, _| ScanPhase::AwaitingPath) {
         state.picker.send_replace(());
     }
 }
@@ -478,7 +497,7 @@ async fn static_handler(uri: Uri) -> Response {
 }
 
 async fn start_handler(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> &'static str {
-    start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart));
+    start_scan(&state, None, |phase| matches!(phase, ScanPhase::AwaitingStart { .. }));
     "ok"
 }
 
@@ -614,10 +633,17 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     let mut shutdown_rx = state.shutdown.subscribe();
     let picker_mode = || Message::Binary(wire::ServerMessage::PickerMode.encode().into());
 
-    // A new tab starts on the picker while the server waits for a path. Otherwise its first layout
-    // follows the viewport it sends on connecting.
-    let awaiting_path = matches!(*state.scan.phase.lock(), ScanPhase::AwaitingPath);
-    if awaiting_path && socket.send(picker_mode()).await.is_err() {
+    // A new tab starts on the picker while the server waits for a path, and on the Start button
+    // while it waits for that. Otherwise its first layout follows the viewport it sends on
+    // connecting.
+    let waiting = match *state.scan.phase.lock() {
+        ScanPhase::AwaitingPath => Some(picker_mode()),
+        ScanPhase::AwaitingStart { .. } => Some(Message::Binary(wire::ServerMessage::AwaitingStart.encode().into())),
+        ScanPhase::Running { .. } | ScanPhase::Done { .. } => None,
+    };
+    if let Some(message) = waiting
+        && socket.send(message).await.is_err()
+    {
         return;
     }
 
@@ -690,30 +716,9 @@ fn reveal(state: &AppState, dir_id: u64, name: Option<&str>) {
     if let Some(name) = name {
         path.push(name);
     }
-    reveal_in_file_manager(&path);
-}
-
-fn reveal_in_file_manager(path: &std::path::Path) {
-    let mut command;
-    #[cfg(target_os = "macos")]
-    {
-        command = std::process::Command::new("open");
-        command.arg("-R").arg(path);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        command = std::process::Command::new("xdg-open");
-        command.arg(path.parent().unwrap_or(path));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        command = std::process::Command::new("explorer");
-        command.arg("/select,").arg(path);
-    }
-
     // Waited for off the async workers (xdg-open can last as long as the file manager it opens),
     // so the finished child is reaped instead of left a zombie for the life of the server.
-    if let Ok(mut child) = command.spawn() {
+    if let Ok(mut child) = scanner::reveal::command(&path).spawn() {
         std::thread::spawn(move || child.wait());
     }
 }
@@ -737,12 +742,18 @@ fn handle_client_message(state: &Arc<AppState>, view: &mut ViewConfig, data: &[u
         ClientMessage::Navigate { id } => set(&mut view.view_root, Some(id)),
         ClientMessage::SetDepth { depth } => set(&mut view.max_depth, depth),
         ClientMessage::ColorMode { mode } => set(&mut view.color_mode, mode),
-        ClientMessage::FilterExt { extensions } => set(&mut view.filter.extensions, extensions),
-        ClientMessage::FilterSize { min, max } => {
-            set(&mut view.filter.min_size, min) | set(&mut view.filter.max_size, max)
-        }
-        ClientMessage::FilterName { pattern } => set(&mut view.filter.name_pattern, pattern),
-        ClientMessage::ClearFilter => set(&mut view.filter, FilterConfig::default()),
+        ClientMessage::Filter {
+            extensions,
+            min_size,
+            name_pattern,
+        } => set(
+            &mut view.filter,
+            FilterConfig {
+                extensions,
+                min_size,
+                name_pattern,
+            },
+        ),
         ClientMessage::RevealDir { id } => {
             reveal(state, id, None);
             false
@@ -756,14 +767,14 @@ fn handle_client_message(state: &Arc<AppState>, view: &mut ViewConfig, data: &[u
             false
         }
         ClientMessage::Rescan => {
-            start_scan(state, None, |phase| matches!(phase, ScanPhase::Done(_)));
+            start_scan(state, None, |phase| matches!(phase, ScanPhase::Done { .. }));
             false
         }
         ClientMessage::ScanPath { path } => {
             // Only from the picker, or once the current scan is done (never mid-scan). A path that
             // can't be scanned sends the page back to the picker (see `relay_scan`).
             start_scan(state, Some(path.into()), |phase| {
-                matches!(phase, ScanPhase::AwaitingPath | ScanPhase::Done(_))
+                matches!(phase, ScanPhase::AwaitingPath | ScanPhase::Done { .. })
             });
             false
         }
@@ -790,10 +801,11 @@ mod tests {
     fn finished_scan(ending: Option<ScanOutcome>, ran_for: Duration) -> AppState {
         let cancel = Arc::new(AtomicBool::new(false));
         let running = ScanPhase::Running {
+            root: "/root".into(),
             cancel: Arc::clone(&cancel),
             started: Instant::now() - ran_for,
         };
-        let state = AppState::new(running, PathBuf::from("/root"), ScanOptions::default());
+        let state = AppState::new(running, ScanOptions::default());
         let (tx, rx) = std::sync::mpsc::channel();
         let file = ScannedFile {
             name: "a".into(),
@@ -838,8 +850,7 @@ mod tests {
         layout(state, &mut view)
     }
 
-    /// A tab keeps its filtered sizes from one layout to the next, but not past a change to the
-    /// tree or to its filter.
+    /// A tab gets a layout when the tree under its view or its filter changes, and not otherwise.
     #[test]
     fn filtered_layouts_follow_the_tree_and_the_filter() {
         let state = finished_scan(Some(ScanOutcome::Complete), Duration::ZERO);
@@ -852,7 +863,7 @@ mod tests {
             ..ViewConfig::default()
         };
         assert_eq!(layout(&state, &mut view).root_size, 10);
-        assert_eq!(layout(&state, &mut view).root_size, 10, "laid out again");
+        assert_eq!(update_tab(&state, &mut view).1, None, "nothing new to show");
 
         let file = ScannedFile {
             name: "ab".into(),
@@ -870,6 +881,46 @@ mod tests {
 
         view.filter.name_pattern = "ab".into();
         assert_eq!(layout(&state, &mut view).root_size, 5, "the filter changed");
+    }
+
+    /// While a scan runs, a tab viewing a folder already read gets no layouts as the rest of the tree
+    /// grows, and one as soon as something under its folder changes.
+    #[test]
+    fn a_view_is_laid_out_again_only_when_its_folder_changes() {
+        let running = ScanPhase::Running {
+            root: "/root".into(),
+            cancel: Arc::default(),
+            started: Instant::now(),
+        };
+        let state = AppState::new(running, ScanOptions::default());
+        let dir = |id, parent, size| ScanEvent::Dir {
+            id,
+            parent,
+            name: format!("d{id}"),
+            mtime: 0,
+            files: vec![ScannedFile {
+                name: "f".into(),
+                size,
+                mtime: 0,
+            }],
+        };
+        let apply = |event| state.scan.tree.write().apply(event);
+        apply(ScanEvent::ScanStart { root: "/root".into() });
+        apply(dir(1, 0, 10));
+        apply(dir(2, 1, 10));
+        let mut view = ViewConfig {
+            scan: 1,
+            viewport: (800.0, 600.0),
+            view_root: Some(2),
+            ..ViewConfig::default()
+        };
+        assert_eq!(layout(&state, &mut view).root_size, 10);
+
+        apply(dir(3, 1, 10));
+        assert_eq!(update_tab(&state, &mut view).1, None, "a change elsewhere");
+
+        apply(dir(4, 2, 5));
+        assert_eq!(layout(&state, &mut view).root_size, 15, "a change under the view");
     }
 
     /// A finished scan's layouts tell the page whether it read everything: not when it stalled, nor

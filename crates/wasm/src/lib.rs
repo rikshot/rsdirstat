@@ -2,6 +2,8 @@
 mod app;
 #[cfg(any(target_arch = "wasm32", test))]
 mod logic;
+#[cfg(any(target_arch = "wasm32", test))]
+mod style;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;

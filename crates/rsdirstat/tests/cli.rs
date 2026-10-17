@@ -1,8 +1,19 @@
+mod common;
+
 use std::fs;
+use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 fn rsdirstat_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_rsdirstat-cli"))
+}
+
+/// What `rsdirstat-cli` prints for `dir` with `args`; it must succeed.
+fn cli_output(dir: &Path, args: &[&str]) -> String {
+    let output = rsdirstat_bin().arg(dir).args(args).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 fn create_test_dir() -> tempfile::TempDir {
@@ -22,20 +33,14 @@ fn create_test_dir() -> tempfile::TempDir {
 #[test]
 fn cli_default_shows_directories() {
     let dir = create_test_dir();
-    let output = rsdirstat_bin().arg(dir.path()).output().unwrap();
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = cli_output(dir.path(), &[]);
     assert!(stdout.contains("big_dir"), "output should contain big_dir:\n{stdout}");
 }
 
 #[test]
 fn cli_files_flag_shows_files() {
     let dir = create_test_dir();
-    let output = rsdirstat_bin().arg(dir.path()).arg("--files").output().unwrap();
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = cli_output(dir.path(), &["--files"]);
     assert!(
         stdout.contains("large.bin"),
         "output should contain large.bin:\n{stdout}"
@@ -45,10 +50,7 @@ fn cli_files_flag_shows_files() {
 #[test]
 fn cli_top_limits_output() {
     let dir = create_test_dir();
-    let output = rsdirstat_bin().arg(dir.path()).arg("--top").arg("1").output().unwrap();
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = cli_output(dir.path(), &["--top", "1"]);
     let lines: Vec<&str> = stdout.trim().lines().collect();
     assert_eq!(
         lines.len(),
@@ -61,10 +63,7 @@ fn cli_top_limits_output() {
 #[test]
 fn cli_largest_dir_appears_first() {
     let dir = create_test_dir();
-    let output = rsdirstat_bin().arg(dir.path()).output().unwrap();
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = cli_output(dir.path(), &[]);
     let lines: Vec<&str> = stdout.trim().lines().collect();
     // big_dir should appear before small_dir (root may appear first since it's largest)
     let big_pos = lines.iter().position(|l| l.contains("big_dir"));
@@ -106,16 +105,9 @@ fn gui_rejects_an_unscannable_path_before_starting() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("the server started instead of rejecting the path");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+    let Some(status) = common::wait_for_exit(&mut child, Duration::from_secs(10)) else {
+        let _ = child.kill();
+        panic!("the server started instead of rejecting the path");
     };
     assert!(!status.success());
     let mut stderr = String::new();

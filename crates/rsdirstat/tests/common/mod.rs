@@ -4,10 +4,42 @@ use std::io::{BufRead, BufReader};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::FutureExt;
 use playwright_rs::protocol::WaitForFunctionOptions;
+use rsdirstat_core::scan::ScanEvent;
+use rsdirstat_core::tree::DirTree;
+
+#[cfg(target_os = "linux")]
+pub use rsdirstat_linux as scanner;
+#[cfg(target_os = "macos")]
+pub use rsdirstat_macos as scanner;
+#[cfg(target_os = "windows")]
+pub use rsdirstat_windows as scanner;
+
+/// The tree a scan of `root` with the default options builds, which must be complete.
+pub fn scan_to_tree(root: &Path) -> DirTree {
+    let (tx, rx) = mpsc::channel();
+    let root = root.to_path_buf();
+    let handle =
+        std::thread::spawn(move || scanner::scan::scan(&root, Default::default(), tx, Default::default()).unwrap());
+    // The scan's own failure first, before what it left out.
+    handle.join().unwrap();
+    tree_from(rx)
+}
+
+/// The tree a scan's `events` build, which must be complete.
+pub fn tree_from(events: mpsc::Receiver<ScanEvent>) -> DirTree {
+    let mut tree = DirTree::new();
+    // `ScanDone` is the last event, and applying it recomputes the sizes.
+    for event in events {
+        tree.apply(event);
+    }
+    assert!(tree.complete, "the scan must read everything");
+    tree
+}
 
 /// Ensure the trunk frontend bundle is built and up to date; debug builds of the server read it
 /// from `crates/rsdirstat/dist` on disk (rust-embed only embeds in release), so the e2e/visual
@@ -84,8 +116,7 @@ impl TestServer {
         Self::spawn(&["--port", "0", "--no-open"])
     }
 
-    /// Like `start`, but with `--wait`: the scan begins when the page's Start button is clicked
-    /// (load the page with `?wait`).
+    /// Like `start`, but with `--wait`: the scan begins when the page's Start button is clicked.
     pub fn start_waiting(scan_path: &Path) -> Self {
         Self::spawn(&["--port", "0", "--no-open", "--wait", scan_path.to_str().unwrap()])
     }
@@ -106,13 +137,8 @@ impl TestServer {
         let (tx, rx) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
             let mut sent = false;
-            for line in reader.lines() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => break,
-                };
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if !sent && let Some(u) = line.strip_prefix("Listening on ") {
                     let _ = tx.send(u.to_string());
                     sent = true;
@@ -132,16 +158,7 @@ impl TestServer {
 
     /// Wait up to `timeout` for the server to exit; how it exited, if it did.
     pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Ok(Some(status)) = self.child.try_wait() {
-                return Some(status);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_for_exit(&mut self.child, timeout)
     }
 
     /// Stop the server the way a terminal would (SIGTERM, or Ctrl+Break on Windows) and wait for it
@@ -174,6 +191,20 @@ impl TestServer {
 impl Drop for TestServer {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Wait up to `timeout` for `child` to exit; how it exited, if it did.
+pub fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

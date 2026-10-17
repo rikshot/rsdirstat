@@ -17,17 +17,13 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     BinaryType, CanvasRenderingContext2d, Document, Element, Event, EventTarget, HtmlButtonElement, HtmlCanvasElement,
-    HtmlElement, HtmlInputElement, HtmlSelectElement, MessageEvent, MouseEvent, Response, UrlSearchParams, WebSocket,
-    Window,
+    HtmlElement, HtmlInputElement, HtmlSelectElement, MessageEvent, MouseEvent, Response, WebSocket, Window,
 };
 
 use self::dom::{app_callback, by_id, canvas_context, query};
-use crate::logic::{HoverState, InterpolationPlan, RenderRect, format_size};
+use crate::logic::{HoverState, InterpolationPlan, RenderRect, format_size, percent};
+use crate::style::{BACKGROUND, BREADCRUMB_HEIGHT, FONT, PATH_BAR_HEIGHT, TOOLBAR_HEIGHT};
 
-const BACKGROUND: &str = "#1a1a2e";
-const BREADCRUMB_HEIGHT: f64 = 32.0;
-const TOOLBAR_HEIGHT: f64 = 28.0;
-const PATH_BAR_HEIGHT: f64 = 24.0;
 const ZOOM_DURATION: f64 = 300.0;
 const GAP: f64 = 0.5;
 const RADIUS: f64 = 3.0;
@@ -35,7 +31,6 @@ const RADIUS: f64 = 3.0;
 /// `fillRect` instead of a rounded `fill()` path — the corner radius is invisible at small sizes
 /// and the rounded-path rasterization is the dominant render cost.
 const ROUND_MIN: f64 = 16.0;
-const FONT: &str = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
 
 thread_local! {
     static APP: RefCell<Option<Rc<RefCell<TreemapApp>>>> = const { RefCell::new(None) };
@@ -109,7 +104,6 @@ struct ViewState {
 }
 
 struct SessionState {
-    wait_mode: bool,
     scan_start_time: f64,
     scan_timer_id: Option<i32>,
     filter_timer_id: Option<i32>,
@@ -222,11 +216,6 @@ impl TreemapApp {
             .map_err(|_| JsValue::from_str("failed to create buffer canvas"))?;
         let buffer_context = canvas_context(&buffer_canvas)?;
 
-        let search = window.location().search().unwrap_or_default();
-        let wait_mode = UrlSearchParams::new_with_str(&search)
-            .map(|params| params.has("wait"))
-            .unwrap_or(false);
-
         let pixel_ratio = effective_pixel_ratio(&window);
 
         Ok(Self {
@@ -261,7 +250,6 @@ impl TreemapApp {
                 layout_seq: 0,
             },
             session: SessionState {
-                wait_mode,
                 scan_start_time: 0.0,
                 scan_timer_id: None,
                 filter_timer_id: None,

@@ -33,6 +33,17 @@ body {
     font-family: var(--font);
 }
 
+button {
+    background: var(--accent);
+    color: var(--link);
+    border: 1px solid var(--border-dim);
+    cursor: pointer;
+
+    &:hover {
+        background: var(--accent-hover);
+    }
+}
+
 #breadcrumb-bar {
     height: 32px;
     background: var(--panel);
@@ -41,7 +52,6 @@ body {
     padding: 0 8px;
     font-size: 13px;
     gap: 2px;
-    flex-shrink: 0;
     border-bottom: 1px solid var(--border);
     user-select: none;
     white-space: nowrap;
@@ -98,7 +108,6 @@ body {
     padding: 0 8px;
     font-size: 11px;
     gap: 6px;
-    flex-shrink: 0;
     border-bottom: 1px solid var(--border);
     user-select: none;
 
@@ -125,17 +134,10 @@ body {
     }
 
     & button {
-        background: var(--accent);
-        color: var(--link);
-        border: 1px solid var(--border-dim);
         border-radius: 3px;
         padding: 1px 8px;
-        cursor: pointer;
         font-size: 11px;
         height: 20px;
-        &:hover {
-            background: var(--accent-hover);
-        }
     }
 }
 
@@ -157,17 +159,10 @@ body {
 }
 
 .action-button {
-    background: var(--accent);
-    color: var(--link);
-    border: 1px solid var(--border-dim);
     border-radius: 3px;
     padding: 1px 10px;
-    cursor: pointer;
     font-size: 12px;
     height: 20px;
-    &:hover {
-        background: var(--accent-hover);
-    }
 }
 
 canvas {
@@ -276,17 +271,9 @@ canvas {
 
 .picker-refresh {
     margin-top: 20px;
-    background: var(--accent);
-    color: var(--link);
-    border: 1px solid var(--border-dim);
     border-radius: 5px;
     padding: 6px 16px;
-    cursor: pointer;
     font-size: 13px;
-
-    &:hover {
-        background: var(--accent-hover);
-    }
 }
 
 #path-bar {
@@ -297,7 +284,6 @@ canvas {
     padding: 0 8px;
     font-size: 12px;
     gap: 8px;
-    flex-shrink: 0;
     border-top: 1px solid var(--border);
     white-space: nowrap;
     overflow: hidden;

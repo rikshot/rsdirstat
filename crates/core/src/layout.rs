@@ -21,25 +21,26 @@ pub struct Layout {
     pub rects: Vec<LayoutRect>,
 }
 
-/// Sizes under a filter, kept from one layout of a view to the next while the tree, the filter and
-/// the view root stay the same. Filtering visits every file under the view, too much to repeat for
-/// each layout of a big tree that hasn't changed (resizing a window lays it out many times).
+/// Sizes under a filter, kept from one layout of a view to the next while the tree under the view
+/// root, the view root and the filter stay the same. Filtering visits every file under the view,
+/// too much to repeat for each layout of a big tree that hasn't changed (resizing a window lays it
+/// out many times).
 #[derive(Default)]
 pub struct FilteredSizes {
-    /// What `sizes` were computed for: the tree as of its `changes`, the view root and the filter.
+    /// What `sizes` were computed for: the view root, as of when it last `changed`, and the filter.
     key: Option<(u64, u64, FilterConfig)>,
     sizes: NodeMap<u64>,
 }
 
 impl FilteredSizes {
-    fn get(&mut self, tree: &DirTree, filter: &FilterConfig, view_root: u64) -> &NodeMap<u64> {
+    fn get(&mut self, tree: &DirTree, filter: &FilterConfig, view_root: u64, changed: u64) -> &NodeMap<u64> {
         let fresh = self
             .key
             .as_ref()
-            .is_some_and(|(changes, root, cached)| *changes == tree.changes && *root == view_root && cached == filter);
+            .is_some_and(|(root, as_of, cached)| (*root, *as_of) == (view_root, changed) && cached == filter);
         if !fresh {
             self.sizes = tree.compute_filtered_sizes(filter, view_root);
-            self.key = Some((tree.changes, view_root, filter.clone()));
+            self.key = Some((view_root, changed, filter.clone()));
         }
         &self.sizes
     }
@@ -61,7 +62,7 @@ pub fn compute_layout(
     let filtered_sizes = config
         .filter
         .is_active()
-        .then(|| filtered.get(tree, config.filter, view_root));
+        .then(|| filtered.get(tree, config.filter, view_root, root.changed));
     let mut ctx = LayoutCtx {
         tree,
         filtered_sizes,
@@ -100,15 +101,14 @@ impl Rect {
 }
 
 enum ItemKind<'a> {
-    Dir(&'a DirNode),
+    /// A folder, with its node id.
+    Dir(u64, &'a DirNode),
     File(&'a FileEntry),
     /// Files too small to draw individually, summed into one "(other files)" rect.
     Aggregate,
 }
 
 struct LayoutItem<'a> {
-    /// The folder's node id; 0 for files and "(other files)" (see `LayoutRect::id`).
-    id: u64,
     size: u64,
     kind: ItemKind<'a>,
 }
@@ -159,9 +159,8 @@ impl<'a> LayoutCtx<'a> {
                 && size > 0
             {
                 items.push(LayoutItem {
-                    id,
                     size,
-                    kind: ItemKind::Dir(child),
+                    kind: ItemKind::Dir(id, child),
                 });
             }
         }
@@ -182,7 +181,6 @@ impl<'a> LayoutCtx<'a> {
             }
             if (file.size as f64) >= min_file_size {
                 items.push(LayoutItem {
-                    id: 0,
                     size: file.size,
                     kind: ItemKind::File(file),
                 });
@@ -192,7 +190,6 @@ impl<'a> LayoutCtx<'a> {
         }
         if residual > 0 {
             items.push(LayoutItem {
-                id: 0,
                 size: residual,
                 kind: ItemKind::Aggregate,
             });
@@ -218,8 +215,8 @@ impl<'a> LayoutCtx<'a> {
             if r.w < 1.0 || r.h < 1.0 {
                 continue;
             }
+            // Files and "(other files)" keep id 0 (see `LayoutRect::id`).
             let mut rect = LayoutRect {
-                id: item.id,
                 parent_id: node_id,
                 x: r.x as f32,
                 y: r.y as f32,
@@ -231,17 +228,18 @@ impl<'a> LayoutCtx<'a> {
             };
             let mut nest = None;
             match item.kind {
-                ItemKind::Dir(child) => {
+                ItemKind::Dir(id, child) => {
+                    rect.id = id;
                     rect.name = child.name.to_string();
                     rect.hue = self.hue(child.hue, child.mtime);
                     rect.mtime = child.mtime;
                     // `max_depth` is the number of levels shown: this rect sits on level `depth + 1`,
                     // so opening it puts its contents on `depth + 2`. Any folder with room opens up,
-                    // including one holding only files — gating on "has sub-folders" left files-only
-                    // folders as solid blocks at every depth (issue #5).
+                    // including one holding only files, which would otherwise stay a solid block at
+                    // every depth.
                     if depth + 1 < self.config.max_depth && r.w >= MIN_NEST_PX && r.h >= MIN_NEST_PX {
                         rect.kind = RectKind::Container;
-                        nest = Some(child);
+                        nest = Some((id, child));
                     }
                 }
                 ItemKind::File(file) => {
@@ -260,8 +258,8 @@ impl<'a> LayoutCtx<'a> {
             // right below the header it draws.
             let header = f64::from(rect.header_height());
             self.out.push(rect);
-            if let Some(child) = nest {
-                self.layout_node(item.id, child, item.size, r, header, depth + 1);
+            if let Some((id, child)) = nest {
+                self.layout_node(id, child, item.size, r, header, depth + 1);
             }
         }
     }
@@ -358,7 +356,6 @@ mod tests {
     const NO_FILTER: &FilterConfig = &FilterConfig {
         extensions: Vec::new(),
         min_size: 0,
-        max_size: 0,
         name_pattern: String::new(),
     };
 

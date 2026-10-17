@@ -2,5 +2,6 @@
 //! each OS's build of `rsdirstat` picks its own scanner.
 #![cfg(target_os = "macos")]
 
+pub mod reveal;
 pub mod scan;
 pub mod volumes;

@@ -8,10 +8,10 @@
 use std::path::Path;
 use std::sync::mpsc::Sender;
 
-use rsdirstat_core::scan::{ScanEvent, ScannedFile, node_id, root_name};
-use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
+use rsdirstat_core::scan::{DirFiles, ScanEvent, node_id, root_name};
+use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT};
 
-use crate::scan::{EntryKind, classify, filetime_to_unix};
+use crate::entry::{Entry, EntryKind, filetime_to_unix};
 
 /// Records below this are NTFS's own metadata files ($MFT, $LogFile, ..., and $Extend, which holds
 /// more of them), which folder listings never show.
@@ -72,17 +72,17 @@ pub struct FileRecord {
 }
 
 impl FileRecord {
-    /// What the folder walk does with this file, from what a folder listing would show of it.
+    /// What the folder walk does with this file.
     fn kind(&self) -> EntryKind {
-        let mut attributes = self.attributes;
-        if self.is_dir {
-            attributes |= FILE_ATTRIBUTE_DIRECTORY;
+        Entry {
+            is_dir: self.is_dir,
+            // Only a reparse point has a tag.
+            reparse_tag: (self.reparse_tag != 0).then_some(self.reparse_tag),
+            recall_on_access: self.attributes & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0,
+            size: self.size,
+            allocated: self.allocated,
         }
-        // Only a reparse point has a tag.
-        if self.reparse_tag != 0 {
-            attributes |= FILE_ATTRIBUTE_REPARSE_POINT;
-        }
-        classify(attributes, self.reparse_tag, self.size as i64, self.allocated as i64)
+        .kind()
     }
 }
 
@@ -126,9 +126,11 @@ fn fixup_array(record: &[u8]) -> Option<(usize, usize)> {
 /// were swapped for the record's update sequence number, and the originals kept in the fixup array:
 /// a mismatch means that stride was written after the others. Read again, it won't be.
 pub fn is_torn(record: &[u8]) -> bool {
-    let Some((fixups, fixup_count)) = fixup_array(record) else {
-        return false;
-    };
+    fixup_array(record).is_some_and(|(fixups, fixup_count)| torn(record, fixups, fixup_count))
+}
+
+/// `is_torn`, for a record whose fixup array has been found.
+fn torn(record: &[u8], fixups: usize, fixup_count: usize) -> bool {
     (1..fixup_count).any(|i| record[i * FIXUP_STRIDE - 2..i * FIXUP_STRIDE] != record[fixups..fixups + 2])
 }
 
@@ -136,7 +138,7 @@ pub fn is_torn(record: &[u8]) -> bool {
 /// in use, and for one torn by a write in progress while it was read.
 pub fn parse_record(record: &mut [u8]) -> Option<Record> {
     let (fixups, fixup_count) = fixup_array(record)?;
-    if is_torn(record) {
+    if torn(record, fixups, fixup_count) {
         return None;
     }
     for i in 1..fixup_count {
@@ -281,38 +283,9 @@ impl Mft {
         root_reference: u64,
         volume: u64,
         tx: &Sender<ScanEvent>,
-        mut tag_of: impl FnMut(u64) -> Option<u32>,
+        tag_of: impl FnMut(u64) -> Option<u32>,
     ) -> bool {
-        let mut extensions = std::mem::take(&mut self.extensions);
-        // In record order, so a file's names come in the same order on every scan.
-        extensions.sort_unstable_by_key(|&(number, ..)| number);
-        for (_, base, attributes) in extensions {
-            // Only into the file it was written for, not one that has reused its record since.
-            let number = record_number(base);
-            let Some(Some(file)) = self.records.get_mut(number) else {
-                continue;
-            };
-            if reference(number, file.sequence) != base {
-                continue;
-            }
-            file.names.extend(attributes.names);
-            if attributes.has_data {
-                file.has_data = true;
-                file.size = attributes.size;
-                file.allocated = attributes.allocated;
-            }
-            if attributes.reparse_tag != 0 {
-                file.reparse_tag = attributes.reparse_tag;
-            }
-        }
-        for (number, file) in self.records.iter_mut().enumerate().skip(FIRST_USER_RECORD) {
-            if let Some(file) = file
-                && file.reparse_tag == 0
-                && file.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            {
-                file.reparse_tag = tag_of(reference(number, file.sequence)).unwrap_or(0);
-            }
-        }
+        self.complete_records(tag_of);
         let records = &self.records;
 
         // A name's parent, if that record still holds the folder the name was made in.
@@ -374,8 +347,7 @@ impl Mft {
         };
 
         // Each file goes in the first folder that has it under the root: a hardlink counts once.
-        let mut files: Vec<Vec<ScannedFile>> = vec![Vec::new(); order.len()];
-        let mut mtimes = vec![0i64; order.len()];
+        let mut files = vec![DirFiles::default(); order.len()];
         for file in self.records.iter_mut().skip(FIRST_USER_RECORD).flatten() {
             let EntryKind::File { size } = file.kind() else {
                 continue;
@@ -385,17 +357,10 @@ impl Mft {
                 .iter_mut()
                 .find_map(|(parent, name)| Some((placed(*parent)?, name)));
             let Some((folder_place, name)) = found else { continue };
-            mtimes[folder_place] = mtimes[folder_place].max(file.mtime);
-            if size > 0 {
-                files[folder_place].push(ScannedFile {
-                    name: std::mem::take(name).into(),
-                    size,
-                    mtime: file.mtime,
-                });
-            }
+            files[folder_place].add(std::mem::take(name), size, file.mtime);
         }
 
-        for (folder_place, (&number, folder_files)) in order.iter().zip(files).enumerate() {
+        for (folder_place, (&number, DirFiles { mtime, files })) in order.iter().zip(files).enumerate() {
             let (parent, name) = if folder_place == 0 {
                 (0, root_name(root))
             } else {
@@ -407,11 +372,46 @@ impl Mft {
                 id: node_id(volume, references[folder_place]),
                 parent,
                 name,
-                mtime: mtimes[folder_place],
-                files: folder_files,
+                mtime,
+                files,
             });
         }
         true
+    }
+
+    /// Fold the extension records into their base records, and fill in the reparse tags that no
+    /// record holds from `tag_of` (see `send_scan`).
+    fn complete_records(&mut self, mut tag_of: impl FnMut(u64) -> Option<u32>) {
+        let mut extensions = std::mem::take(&mut self.extensions);
+        // In record order, so a file's names come in the same order on every scan.
+        extensions.sort_unstable_by_key(|&(number, ..)| number);
+        for (_, base, attributes) in extensions {
+            // Only into the file it was written for, not one that has reused its record since.
+            let number = record_number(base);
+            let Some(Some(file)) = self.records.get_mut(number) else {
+                continue;
+            };
+            if reference(number, file.sequence) != base {
+                continue;
+            }
+            file.names.extend(attributes.names);
+            if attributes.has_data {
+                file.has_data = true;
+                file.size = attributes.size;
+                file.allocated = attributes.allocated;
+            }
+            if attributes.reparse_tag != 0 {
+                file.reparse_tag = attributes.reparse_tag;
+            }
+        }
+        for (number, file) in self.records.iter_mut().enumerate().skip(FIRST_USER_RECORD) {
+            if let Some(file) = file
+                && file.reparse_tag == 0
+                && file.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                file.reparse_tag = tag_of(reference(number, file.sequence)).unwrap_or(0);
+            }
+        }
     }
 }
 
@@ -419,8 +419,6 @@ impl Mft {
 mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc;
-
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
 
     use super::*;
 

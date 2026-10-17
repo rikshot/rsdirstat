@@ -72,21 +72,9 @@ impl TreemapApp {
 
     pub(super) fn handle_ws_open(&mut self) -> Result<(), JsValue> {
         self.session.reconnect_attempts = 0;
-        if self.session.wait_mode {
-            // The Start button lives in the status bar, inside the treemap view — which otherwise
-            // stays hidden until the first layout, and none comes before the scan is started.
-            set_hidden(&self.chrome.treemap_view, false)?;
-            self.chrome.status_element.set_text_content(Some(""));
-            let button = self.document.create_element("button")?;
-            button.set_text_content(Some("Start Scan"));
-            button.set_class_name("action-button");
-            listen(&button, "click", |app, _: Event| app.handle_manual_start())?;
-            self.chrome.status_element.append_child(&button)?;
-        } else {
-            self.chrome
-                .status_element
-                .set_text_content(Some("Connected. Waiting for scan..."));
-        }
+        self.chrome
+            .status_element
+            .set_text_content(Some("Connected. Waiting for scan..."));
         // Each connection starts from the server's default view, but the toolbar may hold other
         // values: ones the browser restored on a reload, or ones set before a reconnect. Send them,
         // before the viewport that triggers the first layout, so the treemap matches the toolbar.
@@ -94,6 +82,20 @@ impl TreemapApp {
         self.handle_color_mode_change()?;
         self.send_filter_now()?;
         self.send_viewport()
+    }
+
+    /// Show the Start button, for a server waiting for it (`--wait`).
+    fn show_start_button(&mut self) -> Result<(), JsValue> {
+        // The button lives in the status bar, inside the treemap view — which otherwise stays
+        // hidden until the first layout, and none comes before the scan is started.
+        set_hidden(&self.chrome.treemap_view, false)?;
+        self.chrome.status_element.set_text_content(Some(""));
+        let button = self.document.create_element("button")?;
+        button.set_text_content(Some("Start Scan"));
+        button.set_class_name("action-button");
+        listen(&button, "click", |app, _: Event| app.handle_manual_start())?;
+        self.chrome.status_element.append_child(&button)?;
+        Ok(())
     }
 
     pub(super) fn handle_manual_start(&mut self) -> Result<(), JsValue> {
@@ -105,7 +107,6 @@ impl TreemapApp {
             button.set_text_content(Some("Starting…"));
         }
         let _ = self.window.fetch_with_str("/start");
-        self.session.wait_mode = false;
         Ok(())
     }
 
@@ -117,6 +118,9 @@ impl TreemapApp {
         match wire::ServerMessage::decode(&bytes) {
             Some(ServerMessage::PickerMode) => {
                 self.show_picker()?;
+            }
+            Some(ServerMessage::AwaitingStart) => {
+                self.show_start_button()?;
             }
             Some(ServerMessage::ScanStart) => {
                 self.hide_picker()?;
@@ -166,8 +170,8 @@ impl TreemapApp {
         }
         self.session.reconnect_attempts += 1;
 
-        // Exponential backoff capped at 30s (1, 2, 4, 8, 16, 30, 30, ...) instead of hammering a
-        // dead port every 3s.
+        // Exponential backoff capped at 30s (1, 2, 4, 8, 16, 30, 30, ...), so a server that is gone
+        // isn't asked again and again.
         let delay_ms = (1000u32 << (self.session.reconnect_attempts - 1).min(5)).min(30_000);
         self.chrome
             .status_element
@@ -187,21 +191,19 @@ impl TreemapApp {
                 start_time: self.now(),
             });
         }
-        let root_size = payload.root_size;
-        let dir_count = payload.dir_count;
-        let new_scan_done = payload.scan_done;
         self.view.rect_index_by_id = crate::logic::build_rect_index(&rects);
         self.view.rects = rects;
-        self.view.view_root_size = root_size;
+        self.view.view_root_size = payload.root_size;
         self.view.breadcrumb = payload.breadcrumb;
         self.view.separator = payload.separator;
         self.build_breadcrumb()?;
         self.recompute_hover();
         self.redraw(true)?;
 
-        set_hidden(&self.chrome.rescan_button, !new_scan_done)?;
-        set_hidden(&self.chrome.change_button, !new_scan_done)?;
-        if !new_scan_done {
+        let scan_done = payload.scan_done;
+        set_hidden(&self.chrome.rescan_button, !scan_done)?;
+        set_hidden(&self.chrome.change_button, !scan_done)?;
+        if !scan_done {
             self.start_scan_timer()?;
             // The server's clock, so a tab that joined mid-scan counts from the scan's start.
             self.session.scan_start_time = self.now() - f64::from(payload.scan_ms);
@@ -209,18 +211,18 @@ impl TreemapApp {
             self.stop_scan_timer();
             let seconds = f64::from(payload.scan_ms) / 1000.0;
             self.chrome.status_element.set_text_content(Some(&scan_summary(
-                dir_count,
+                payload.dir_count,
                 seconds,
-                root_size,
+                payload.root_size,
                 payload.partial,
             )));
         }
-        self.view.scan_done = new_scan_done;
+        self.view.scan_done = scan_done;
 
         self.view.layout_seq += 1;
         let canvas = &self.surface.canvas;
         canvas.set_attribute("data-layout-seq", &self.view.layout_seq.to_string())?;
-        canvas.set_attribute("data-scan-done", if new_scan_done { "true" } else { "false" })?;
+        canvas.set_attribute("data-scan-done", if scan_done { "true" } else { "false" })?;
         Ok(())
     }
 }

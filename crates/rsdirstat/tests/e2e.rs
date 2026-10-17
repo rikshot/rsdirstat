@@ -38,7 +38,7 @@ async fn run_scanned(case: &str, f: impl AsyncFn(&playwright_rs::Page)) {
 async fn run_picker<F: AsyncFn(&playwright_rs::Page)>(f: F) {
     let server = TestServer::start_picker();
     in_chromium(std::any::type_name::<F>(), async |page| {
-        page.goto(&format!("{}/?picker", server.url), None).await.unwrap();
+        page.goto(&server.url, None).await.unwrap();
         // Best effort: `f` asserts on the picker itself, with a clearer message.
         let _ = page
             .locator("#picker")
@@ -49,20 +49,9 @@ async fn run_picker<F: AsyncFn(&playwright_rs::Page)>(f: F) {
     .await;
 }
 
-async fn crumbs(page: &playwright_rs::Page) -> String {
-    page.locator("#crumbs")
-        .text_content()
-        .await
-        .unwrap()
-        .unwrap_or_default()
-}
-
-async fn status(page: &playwright_rs::Page) -> String {
-    page.locator("#status")
-        .text_content()
-        .await
-        .unwrap()
-        .unwrap_or_default()
+/// The text of what `selector` finds on `page`; empty if it has none.
+async fn text(page: &playwright_rs::Page, selector: &str) -> String {
+    page.locator(selector).text_content().await.unwrap().unwrap_or_default()
 }
 
 /// Wait options for an element that should appear.
@@ -85,13 +74,16 @@ async fn page_title(page: &playwright_rs::Page) {
 }
 
 async fn status_bar_shows_scan_results(page: &playwright_rs::Page) {
-    let text = status(page).await;
-    assert!(text.contains("dirs"), "status should show dir count: {text}");
-    assert!(text.contains("MiB"), "status should show total size: {text}");
+    let status = text(page, "#status").await;
+    assert!(status.contains("dirs"), "status should show dir count: {status}");
+    assert!(status.contains("MiB"), "status should show total size: {status}");
 }
 
 async fn breadcrumb_shows_root(page: &playwright_rs::Page) {
-    assert!(!crumbs(page).await.is_empty(), "breadcrumb should not be empty");
+    assert!(
+        !text(page, "#crumbs").await.is_empty(),
+        "breadcrumb should not be empty"
+    );
 }
 
 async fn toolbar_elements_visible(page: &playwright_rs::Page) {
@@ -138,8 +130,8 @@ async fn filter_by_extension(page: &playwright_rs::Page) {
     assert_ne!(initial, filtered, "extension filter should change the treemap");
     // The total, and so each rect's share in the tooltip, counts only the matching files: the
     // three .rs files, 9 MB of the 17.3 MB.
-    let text = status(page).await;
-    assert!(text.contains("— 8.58 MiB"), "filtered total: {text}");
+    let status = text(page, "#status").await;
+    assert!(status.contains("— 8.58 MiB"), "filtered total: {status}");
 
     let before = layout_seq(page).await;
     page.locator("#filter-clear").click(None).await.unwrap();
@@ -148,8 +140,8 @@ async fn filter_by_extension(page: &playwright_rs::Page) {
     assert!(filter_ext.input_value(None).await.unwrap().is_empty());
     let cleared = canvas.screenshot(None).await.unwrap();
     assert_eq!(initial, cleared, "clearing the filter should restore the treemap");
-    let text = status(page).await;
-    assert!(text.contains("— 16.5 MiB"), "total: {text}");
+    let status = text(page, "#status").await;
+    assert!(status.contains("— 16.5 MiB"), "total: {status}");
 }
 
 async fn filter_by_name(page: &playwright_rs::Page) {
@@ -187,41 +179,19 @@ async fn hover_shows_tooltip(page: &playwright_rs::Page) {
     page.locator("#treemap").hover(None).await.unwrap();
     expect(tooltip).not().to_have_css("display", "none").await.unwrap();
 
-    assert!(
-        !page
-            .locator(".tip-name")
-            .text_content()
-            .await
-            .unwrap()
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        !page
-            .locator(".tip-size")
-            .text_content()
-            .await
-            .unwrap()
-            .unwrap()
-            .is_empty()
-    );
+    assert!(!text(page, ".tip-name").await.is_empty());
+    assert!(!text(page, ".tip-size").await.is_empty());
 }
 
 async fn hover_shows_path_bar(page: &playwright_rs::Page) {
-    let path_text = page.locator("#path-text");
-    assert!(path_text.text_content().await.unwrap().unwrap_or_default().is_empty());
+    assert!(text(page, "#path-text").await.is_empty());
 
     page.locator("#treemap").hover(None).await.unwrap();
-    expect(path_text).to_have_text_regex(r"\S").await.unwrap();
-    assert!(
-        !page
-            .locator("#path-size")
-            .text_content()
-            .await
-            .unwrap()
-            .unwrap_or_default()
-            .is_empty()
-    );
+    expect(page.locator("#path-text"))
+        .to_have_text_regex(r"\S")
+        .await
+        .unwrap();
+    assert!(!text(page, "#path-size").await.is_empty());
 }
 
 /// Hover must resolve to the rect under the cursor. The canvas sits below the breadcrumb and tool
@@ -296,14 +266,14 @@ async fn reload_keeps_treemap_in_sync_with_toolbar(page: &playwright_rs::Page) {
 }
 
 async fn click_navigates_into_directory(page: &playwright_rs::Page) {
-    let initial_text = crumbs(page).await;
+    let initial_text = text(page, "#crumbs").await;
     let initial_parts: Vec<&str> = initial_text.split('/').collect();
 
     let before = layout_seq(page).await;
     page.locator("#treemap").click(None).await.unwrap();
     wait_for_layout_after(page, before).await;
 
-    let after_text = crumbs(page).await;
+    let after_text = text(page, "#crumbs").await;
     let after_parts: Vec<&str> = after_text.split('/').collect();
 
     assert!(
@@ -317,13 +287,13 @@ async fn breadcrumb_click_navigates_back(page: &playwright_rs::Page) {
     page.locator("#treemap").click(None).await.unwrap();
     wait_for_layout_after(page, before).await;
 
-    let deep_text = crumbs(page).await;
+    let deep_text = text(page, "#crumbs").await;
 
     let before = layout_seq(page).await;
     page.locator("#crumbs span:first-child").click(None).await.unwrap();
     wait_for_layout_after(page, before).await;
 
-    let back_text = crumbs(page).await;
+    let back_text = text(page, "#crumbs").await;
     assert!(
         back_text.len() <= deep_text.len(),
         "breadcrumb back: deep={deep_text}, back={back_text}"
@@ -350,31 +320,16 @@ async fn picker_has_volume_details(page: &playwright_rs::Page) {
         .await
         .expect("should show at least one volume card");
 
-    let name = page
-        .locator(".volume-card:first-child .volume-name")
-        .text_content()
-        .await
-        .unwrap()
-        .unwrap_or_default();
+    let name = text(page, ".volume-card:first-child .volume-name").await;
     assert!(!name.is_empty(), "volume card should have a name");
 
-    let path = page
-        .locator(".volume-card:first-child .volume-path")
-        .text_content()
-        .await
-        .unwrap()
-        .unwrap_or_default();
+    let path = text(page, ".volume-card:first-child .volume-path").await;
     assert!(
         path.starts_with('/') || path.contains(":\\"),
         "volume should have a mount path: {path}"
     );
 
-    let sizes = page
-        .locator(".volume-card:first-child .volume-sizes")
-        .text_content()
-        .await
-        .unwrap()
-        .unwrap_or_default();
+    let sizes = text(page, ".volume-card:first-child .volume-sizes").await;
     assert!(sizes.contains("used of"), "should show usage: {sizes}");
 }
 
@@ -400,8 +355,8 @@ async fn rescan_button_works(page: &playwright_rs::Page) {
     rescan.click(None).await.unwrap();
     wait_for_layout_after(page, before).await;
 
-    let text = status(page).await;
-    assert!(text.contains(" dirs in "), "after rescan: {text}");
+    let status = text(page, "#status").await;
+    assert!(status.contains(" dirs in "), "after rescan: {status}");
 }
 
 /// The frontend's own checks of its logic and codec, run as WebAssembly in the browser.
@@ -634,7 +589,7 @@ async fn e2e_wait_mode_start_button_starts_scan() {
     let dir = create_test_dir();
     let server = TestServer::start_waiting(dir.path());
     in_chromium("wait_mode_start_button_starts_scan", async |page| {
-        page.goto(&format!("{}/?wait", server.url), None).await.unwrap();
+        page.goto(&server.url, None).await.unwrap();
         let start = page.locator("#status button");
         start
             .wait_for(visible())
@@ -807,7 +762,7 @@ async fn e2e_tabs_have_independent_views() {
             page.goto(&server.url, None).await.unwrap();
             wait_for_scan_done(page).await;
         }
-        let second_crumbs = crumbs(&second).await;
+        let second_crumbs = text(&second, "#crumbs").await;
         let second_canvas = second.locator("#treemap").screenshot(None).await.unwrap();
 
         let before = layout_seq(&first).await;
@@ -816,7 +771,7 @@ async fn e2e_tabs_have_independent_views() {
         let before = layout_seq(&first).await;
         first.locator("#filter-name").fill("main", None).await.unwrap();
         wait_for_layout_after(&first, before).await;
-        assert_ne!(crumbs(&first).await, second_crumbs, "the first tab zoomed in");
+        assert_ne!(text(&first, "#crumbs").await, second_crumbs, "the first tab zoomed in");
 
         assert_no_layout_after(
             &second,
@@ -824,7 +779,7 @@ async fn e2e_tabs_have_independent_views() {
             "the second tab got a layout for the first tab's view",
         )
         .await;
-        assert_eq!(crumbs(&second).await, second_crumbs);
+        assert_eq!(text(&second, "#crumbs").await, second_crumbs);
         assert_eq!(
             second.locator("#treemap").screenshot(None).await.unwrap(),
             second_canvas

@@ -46,14 +46,22 @@ impl TreemapApp {
     }
 
     pub(super) fn recompute_hover(&mut self) {
-        self.view.hover = self.view.last_mouse.and_then(|(mouse_x, mouse_y)| {
+        let hovered = self
+            .view
+            .last_mouse
+            .and_then(|(mouse_x, mouse_y)| find_rect_index(&self.view.rects, mouse_x, mouse_y));
+        self.set_hover(hovered);
+    }
+
+    /// Hover the rect at `hovered`, or none.
+    fn set_hover(&mut self, hovered: Option<usize>) {
+        self.view.hover = hovered.map(|index| {
             build_hover_state(
                 &self.view.rects,
                 &self.view.rect_index_by_id,
                 &self.view.breadcrumb,
                 self.view.separator,
-                mouse_x,
-                mouse_y,
+                index,
             )
         });
         self.show_hover_path();
@@ -67,9 +75,9 @@ impl TreemapApp {
         self.view.last_mouse = Some((mouse_x, mouse_y));
 
         // Most moves stay on the same rect, and only the tooltip follows the pointer.
-        let hovered = self.view.hover.as_ref().map(|hover| hover.hovered_index);
-        if find_rect_index(&self.view.rects, mouse_x, mouse_y) != hovered {
-            self.recompute_hover();
+        let hovered = find_rect_index(&self.view.rects, mouse_x, mouse_y);
+        if hovered != self.view.hover.as_ref().map(|hover| hover.hovered_index) {
+            self.set_hover(hovered);
             self.redraw(false)?;
             self.fill_tooltip()?;
         }
@@ -106,14 +114,10 @@ impl TreemapApp {
         tooltip.style().set_property("display", "block")?;
         self.chrome.tooltip_name.set_text_content(Some(&rect.name));
         self.chrome.tooltip_size.set_text_content(Some(&format_size(rect.size)));
-        let percent = if self.view.view_root_size > 0 {
-            (rect.size as f64 / self.view.view_root_size as f64) * 100.0
-        } else {
-            0.0
-        };
+        let share = percent(rect.size, self.view.view_root_size);
         self.chrome
             .tooltip_percent
-            .set_text_content(Some(&format!("{percent:.1}%")));
+            .set_text_content(Some(&format!("{share:.1}%")));
         let mtime = if rect.mtime > 0 {
             Date::new(&JsValue::from_f64(rect.mtime as f64 * 1000.0))
                 .to_locale_date_string("default", &JsValue::UNDEFINED)

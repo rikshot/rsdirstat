@@ -61,9 +61,7 @@ impl TreemapApp {
             self.surface
                 .ctx
                 .draw_image_with_html_canvas_element(&self.surface.buffer_canvas, 0.0, 0.0)?;
-            self.surface
-                .ctx
-                .set_transform(self.surface.pixel_ratio, 0.0, 0.0, self.surface.pixel_ratio, 0.0, 0.0)?;
+            scale_to_device(&self.surface.ctx, self.surface.pixel_ratio)?;
             let hover = self.view.hover.as_ref();
             draw_hover_overlay(
                 &self.surface.ctx,
@@ -78,36 +76,19 @@ impl TreemapApp {
     pub(super) fn resize(&mut self) -> Result<(), JsValue> {
         let (width, inner_height) = window_inner_size(&self.window)?;
         let height = inner_height - BREADCRUMB_HEIGHT - TOOLBAR_HEIGHT - PATH_BAR_HEIGHT;
-        self.surface
-            .canvas
-            .style()
-            .set_property("width", &format!("{width}px"))?;
-        self.surface
-            .canvas
-            .style()
-            .set_property("height", &format!("{height}px"))?;
-        self.surface
-            .canvas
-            .set_width((width * self.surface.pixel_ratio).round() as u32);
-        self.surface
-            .canvas
-            .set_height((height * self.surface.pixel_ratio).round() as u32);
-        self.surface.canvas_width = width;
-        self.surface.canvas_height = height;
-        self.surface
-            .ctx
-            .set_transform(self.surface.pixel_ratio, 0.0, 0.0, self.surface.pixel_ratio, 0.0, 0.0)?;
-
-        self.surface.buffer_canvas.set_width(self.surface.canvas.width());
-        self.surface.buffer_canvas.set_height(self.surface.canvas.height());
-        self.surface.buffer_context.set_transform(
-            self.surface.pixel_ratio,
-            0.0,
-            0.0,
-            self.surface.pixel_ratio,
-            0.0,
-            0.0,
-        )?;
+        let surface = &mut self.surface;
+        let style = surface.canvas.style();
+        style.set_property("width", &format!("{width}px"))?;
+        style.set_property("height", &format!("{height}px"))?;
+        surface.canvas_width = width;
+        surface.canvas_height = height;
+        // Resizing a canvas resets its context's transform, so both are scaled again after.
+        for canvas in [&surface.canvas, &surface.buffer_canvas] {
+            canvas.set_width((width * surface.pixel_ratio).round() as u32);
+            canvas.set_height((height * surface.pixel_ratio).round() as u32);
+        }
+        scale_to_device(&surface.ctx, surface.pixel_ratio)?;
+        scale_to_device(&surface.buffer_context, surface.pixel_ratio)?;
 
         self.redraw(true)?;
         self.send_viewport()
@@ -117,6 +98,11 @@ impl TreemapApp {
         self.surface.pixel_ratio = effective_pixel_ratio(&self.window);
         self.resize()
     }
+}
+
+/// Scale `ctx` so it draws in CSS pixels on a canvas of `pixel_ratio` device pixels to each.
+fn scale_to_device(ctx: &CanvasRenderingContext2d, pixel_ratio: f64) -> Result<(), JsValue> {
+    ctx.set_transform(pixel_ratio, 0.0, 0.0, pixel_ratio, 0.0, 0.0)
 }
 
 fn ease_out(progress: f64) -> f64 {
@@ -272,9 +258,9 @@ fn draw_leaf_label(
 
 /// Render all rects in colour-batched passes. Bodies are filled in depth order (a parent's
 /// background is drawn before the children that sit on top of it) and grouped by colour within a
-/// depth, so `fillStyle` is set roughly once per colour rather than once per rect. Per-rect borders
-/// are gone — the `GAP` between rects already separates them (a hovered rect is still outlined by
-/// the overlay). During the zoom animation `draw_labels` is false: text is the costliest per-rect
+/// depth, so `fillStyle` is set roughly once per colour rather than once per rect. Rects have no
+/// borders: the `GAP` between them separates them (a hovered rect is outlined by the overlay).
+/// During the zoom animation `draw_labels` is false: text is the costliest per-rect
 /// work and is illegible mid-transition, so it is skipped until the view settles.
 fn draw_rects(ctx: &CanvasRenderingContext2d, rects: &[RenderRect], draw_labels: bool) -> Result<(), JsValue> {
     let mut state = DrawState::default();
@@ -282,12 +268,9 @@ fn draw_rects(ctx: &CanvasRenderingContext2d, rects: &[RenderRect], draw_labels:
     let mut order: Vec<usize> = (0..rects.len())
         .filter(|&i| rects[i].w >= 1.0 && rects[i].h >= 1.0)
         .collect();
-    order.sort_by(|&a, &b| {
-        rects[a]
-            .depth
-            .cmp(&rects[b].depth)
-            .then_with(|| rects[a].fill.cmp(rects[b].fill))
-    });
+    // Colours are interned (`hsl`), so equal ones are the same string: grouping them by address
+    // groups them as well as comparing their text, at a fraction of the cost.
+    order.sort_unstable_by_key(|&i| (rects[i].depth, rects[i].fill.as_ptr()));
 
     // Pass 1 — bodies.
     for &i in &order {
@@ -304,9 +287,9 @@ fn draw_rects(ctx: &CanvasRenderingContext2d, rects: &[RenderRect], draw_labels:
     let mut headers: Vec<usize> = order
         .iter()
         .copied()
-        .filter(|&i| rects[i].kind.is_container() && rects[i].header_height > 0.0)
+        .filter(|&i| rects[i].header_height > 0.0)
         .collect();
-    headers.sort_by_key(|&i| rects[i].header_fill);
+    headers.sort_unstable_by_key(|&i| rects[i].header_fill.as_ptr());
     for &i in &headers {
         let (x, y, w, h) = inset_rect(&rects[i]);
         if w < 4.0 || h < 4.0 {
@@ -369,7 +352,7 @@ fn draw_hover_overlay(
         let (x, y, w, h) = inset_rect(rect);
         if w > 0.0 && h > 0.0 {
             let radius = RADIUS.min(w / 2.0).min(h / 2.0);
-            let fill_height = if rect.kind.is_container() && rect.header_height > 0.0 {
+            let fill_height = if rect.header_height > 0.0 {
                 rect.header_height - GAP
             } else {
                 h
