@@ -1,8 +1,11 @@
-//! The platform-independent half of a scan: the worker threads, the work queue, and each
-//! directory's bookkeeping. A platform crate supplies only how to open the root and how to read
-//! one directory ([`run_scan`]'s `read_dir`), reporting each entry to a [`DirSink`].
+//! The platform-independent half of a scan: the worker threads, the work queue, each directory's
+//! bookkeeping, and which failures to read one are expected. A platform crate supplies only how to
+//! open the root and how to read one directory ([`run_scan`]'s `read_dir`), reporting each entry,
+//! and each failure, to a [`DirSink`].
 
 use std::borrow::Cow;
+use std::fmt::Display;
+use std::io::{self, ErrorKind};
 use std::num::NonZeroUsize;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -161,11 +164,9 @@ pub enum UnixDir {
 
 #[cfg(unix)]
 impl DirJob<UnixDir> {
-    /// Open the directory, or `None` if it can't be opened. A lack of permission, the directory
-    /// having gone or been replaced (by a file, or a symlink: it isn't followed out of the tree),
-    /// or a macOS cloud folder not yet fetched leave it out quietly; any other failure is reported
-    /// to `sink`, and makes the scan incomplete.
-    pub fn open(&self, sink: &DirSink<'_, UnixDir>) -> Option<Arc<std::os::fd::OwnedFd>> {
+    /// Open the directory, or `None` if it can't be opened, which leaves it out (see
+    /// [`DirSink::entry_failed`]).
+    pub fn open(&self, sink: &mut DirSink<'_, UnixDir>) -> Option<Arc<std::os::fd::OwnedFd>> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         let (parent, name) = match &self.handle {
             UnixDir::Root(fd) => return Some(Arc::clone(fd)),
@@ -181,15 +182,29 @@ impl DirJob<UnixDir> {
         if fd >= 0 {
             return Some(Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }));
         }
-        let error = std::io::Error::last_os_error();
-        if !matches!(
-            error.raw_os_error(),
-            Some(libc::EACCES | libc::EPERM | libc::ENOENT | libc::ENOTDIR | libc::ELOOP | libc::EDEADLK)
-        ) {
-            sink.read_failed(format_args!("can't open it: {error}"));
-        }
+        sink.entry_failed(&std::io::Error::last_os_error(), "can't open it");
+        sink.left_out = true;
         None
     }
+}
+
+/// Whether failing to open or look at an entry with `error` leaves it out quietly: there's no
+/// permission to, it has gone or been replaced since it was listed (by a file, or by a symlink, which
+/// isn't followed out of the tree), or nothing of it is on this machine (a macOS cloud folder not
+/// fetched, which fails with EDEADLK, or a FUSE filesystem whose daemon is gone).
+fn is_left_out_quietly(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return true;
+    }
+    matches!(
+        error.kind(),
+        ErrorKind::PermissionDenied
+            | ErrorKind::NotFound
+            | ErrorKind::NotADirectory
+            | ErrorKind::Deadlock
+            | ErrorKind::NotConnected
+    )
 }
 
 /// `path` as people see it, and as Explorer takes it: without the `\\?\` prefix of the verbatim
@@ -309,14 +324,6 @@ pub struct DirJob<H> {
     path: String,
 }
 
-impl<H> DirJob<H> {
-    /// Whether this is the scan's root, which a platform must not leave out quietly: a scan without
-    /// it has nothing to show.
-    pub fn is_root(&self) -> bool {
-        self.parent_id == 0
-    }
-}
-
 /// How a scan ended, as `ScanDone` reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanOutcome {
@@ -337,8 +344,9 @@ pub enum ScanOutcome {
 /// how the scan ended.
 ///
 /// `read_dir` reads one directory: it reports every entry to the [`DirSink`] and calls
-/// [`DirSink::checkpoint`] after each read from the OS, stopping when it returns false. It returns
-/// false if the directory can't be opened, which leaves it out, like any unreadable directory.
+/// [`DirSink::checkpoint`] after each read from the OS, stopping when it returns false. What it
+/// can't open, look at or list it reports there too, which decides what is left out quietly and
+/// what makes the scan [`ScanOutcome::Incomplete`].
 ///
 /// Returns once the walk finishes, the `cancel` flag is set (within [`POLL_INTERVAL`]), or the scan
 /// stalls. `ScanDone` is sent last, and the channel is dropped on return, so the receiver's closes
@@ -347,7 +355,7 @@ pub enum ScanOutcome {
 pub fn run_scan<H, F>(scan: Started, handle: H, id: u64, cancel: Arc<AtomicBool>, threads: usize, read_dir: F)
 where
     H: Send + 'static,
-    F: Fn(&DirJob<H>, &mut [u8], &mut DirSink<'_, H>) -> bool + Send + Sync + 'static,
+    F: Fn(&DirJob<H>, &mut [u8], &mut DirSink<'_, H>) + Send + Sync + 'static,
 {
     let Started { root, tx } = scan;
     let root = DirJob {
@@ -411,13 +419,13 @@ struct Shared<H> {
     visited_dirs: DashSet<u64>,
     /// Files with several names (hardlinks), counted under the first name seen.
     visited_files: DashSet<u64>,
-    /// Whether a directory couldn't be read in full (see `DirSink::read_failed`).
+    /// Whether a directory couldn't be read in full (see `DirSink::list_failed`).
     failed: AtomicBool,
 }
 
 fn run_worker<H, F>(shared: &Shared<H>, read_dir: &F, active: &Mutex<String>)
 where
-    F: Fn(&DirJob<H>, &mut [u8], &mut DirSink<'_, H>) -> bool,
+    F: Fn(&DirJob<H>, &mut [u8], &mut DirSink<'_, H>),
 {
     let mut buffer = vec![0u8; READ_BUFFER_SIZE];
     while let Some(job) = shared.queue.take() {
@@ -426,14 +434,17 @@ where
             shared,
             dir_id: job.id,
             dir_path: &job.path,
+            root: job.parent_id == 0,
             files: DirFiles::default(),
             children: Vec::new(),
             entries: 0,
+            left_out: false,
         };
-        let opened = read_dir(&job, &mut buffer, &mut sink);
+        read_dir(&job, &mut buffer, &mut sink);
         let DirSink {
             files: DirFiles { mtime, files },
             children,
+            left_out,
             ..
         } = sink;
 
@@ -447,7 +458,7 @@ where
         drop(handle);
         // One event per directory, carrying its files: a channel send and a tree lookup per file
         // would cost more than the files themselves.
-        if opened && let Some(tx) = &*shared.tx.read().unwrap() {
+        if !left_out && let Some(tx) = &*shared.tx.read().unwrap() {
             let _ = tx.send(ScanEvent::Dir {
                 id,
                 parent: parent_id,
@@ -469,10 +480,16 @@ pub struct DirSink<'a, H> {
     shared: &'a Shared<H>,
     dir_id: u64,
     dir_path: &'a str,
+    /// Whether this is the scan's root, which is never left out: a scan without it has nothing to
+    /// show.
+    root: bool,
     files: DirFiles,
     children: Vec<DirJob<H>>,
     /// Entries reported so far, for recording progress every `ENTRIES_PER_PROGRESS`.
     entries: u32,
+    /// Whether the directory is left out, as one that couldn't be opened or listed at all: no `Dir`
+    /// is sent for it.
+    left_out: bool,
 }
 
 impl<H> DirSink<'_, H> {
@@ -512,11 +529,35 @@ impl<H> DirSink<'_, H> {
         }
     }
 
-    /// Report that the directory couldn't be read in full, or one of its subdirectories opened, for
-    /// a reason other than those a platform leaves out quietly (no permission, gone): the error goes
-    /// to stderr with the directory's path, and the scan ends [`ScanOutcome::Incomplete`].
-    pub fn read_failed(&self, what: impl std::fmt::Display) {
-        eprintln!("Can't read {}: {what}", plain_path(Path::new(self.dir_path)).display());
+    /// Report that the entry `what` describes, a subdirectory or a file of this directory, couldn't
+    /// be opened or looked at, with `error`: it is left out. Quietly when there's no permission to,
+    /// it has gone or been replaced, or nothing of it is on this machine (see
+    /// `is_left_out_quietly`); otherwise as [`list_failed`](Self::list_failed) reports an error.
+    pub fn entry_failed(&self, error: &io::Error, what: impl Display) {
+        if !is_left_out_quietly(error) {
+            self.report(error, what);
+        }
+    }
+
+    /// Report that listing the directory, by `what`, failed with `error`: the listing ends there.
+    /// One that has gone meanwhile, or a macOS cloud folder not fetched (EDEADLK), holds nothing
+    /// more on this machine. One that couldn't be listed at all for lack of permission (it opens,
+    /// but can't be searched) is left out, like one that can't be opened, unless it is the root,
+    /// which the scan shows. Any other error goes to stderr with the directory's path, and the scan
+    /// ends [`ScanOutcome::Incomplete`].
+    pub fn list_failed(&mut self, error: &io::Error, what: impl Display) {
+        match error.kind() {
+            ErrorKind::NotFound | ErrorKind::Deadlock => {}
+            ErrorKind::PermissionDenied if self.entries == 0 && !self.root => self.left_out = true,
+            _ => self.report(error, what),
+        }
+    }
+
+    fn report(&self, error: &io::Error, what: impl Display) {
+        eprintln!(
+            "Can't read {}: {what}: {error}",
+            plain_path(Path::new(self.dir_path)).display()
+        );
         self.shared.failed.store(true, Ordering::Relaxed);
     }
 
@@ -944,7 +985,7 @@ mod tests {
 
     fn fake_read_dir(
         tree: Arc<Vec<FakeDir>>,
-    ) -> impl Fn(&DirJob<usize>, &mut [u8], &mut DirSink<'_, usize>) -> bool + Send + Sync + 'static {
+    ) -> impl Fn(&DirJob<usize>, &mut [u8], &mut DirSink<'_, usize>) + Send + Sync + 'static {
         move |job, _buffer, sink| {
             let dir = &tree[job.handle];
             for &(name, size, mtime, hardlink) in &dir.files {
@@ -955,7 +996,6 @@ mod tests {
                 sink.dir(child_dir.id, child_dir.name, child);
             }
             sink.checkpoint();
-            true
         }
     }
 
@@ -1057,8 +1097,7 @@ mod tests {
             2,
             |_: &DirJob<()>, _: &mut [u8], sink: &mut DirSink<'_, ()>| {
                 sink.file("a", 10, 0, None);
-                sink.read_failed("I/O error");
-                true
+                sink.list_failed(&io::Error::other("I/O error"), "listing it");
             },
         );
         let events: Vec<_> = rx.iter().collect();
@@ -1104,7 +1143,6 @@ mod tests {
                     sink.dir(id, "d", ());
                 }
                 sink.checkpoint();
-                true
             }
         };
         let (tx, rx) = mpsc::channel();
@@ -1139,12 +1177,67 @@ mod tests {
     fn sink<'a>(shared: &'a Shared<()>, dir_path: &'a str) -> DirSink<'a, ()> {
         DirSink {
             shared,
-            dir_id: 1,
+            dir_id: 2,
             dir_path,
+            root: false,
             files: DirFiles::default(),
             children: Vec::new(),
             entries: 0,
+            left_out: false,
         }
+    }
+
+    /// No permission, or an entry gone or replaced since it was listed, leaves it out without making
+    /// the scan incomplete; anything else does.
+    #[test]
+    fn entries_that_cannot_be_opened_are_left_out_quietly_for_expected_reasons() {
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotFound,
+            ErrorKind::NotADirectory,
+            ErrorKind::Deadlock,
+            ErrorKind::NotConnected,
+        ] {
+            let shared = shared();
+            sink(&shared, "/a").entry_failed(&kind.into(), "can't open b");
+            assert!(!shared.failed.load(Ordering::Relaxed), "{kind:?}");
+        }
+        #[cfg(unix)]
+        {
+            let shared = shared();
+            sink(&shared, "/a").entry_failed(&io::Error::from_raw_os_error(libc::ELOOP), "can't open b");
+            assert!(!shared.failed.load(Ordering::Relaxed), "a symlink now");
+        }
+        let shared = shared();
+        sink(&shared, "/a").entry_failed(&io::Error::other("I/O error"), "can't open b");
+        assert!(shared.failed.load(Ordering::Relaxed));
+    }
+
+    /// A directory that can't be listed at all for lack of permission is left out quietly, unless
+    /// it is the root; one refused after some of it was listed can't be, so it's reported.
+    #[test]
+    fn a_directory_refused_at_its_first_listing_is_left_out() {
+        let denied = io::Error::from(ErrorKind::PermissionDenied);
+        let shared = shared();
+        let mut refused = sink(&shared, "/a");
+        refused.list_failed(&denied, "listing it");
+        assert!(refused.left_out && !shared.failed.load(Ordering::Relaxed));
+
+        let mut root = sink(&shared, "/");
+        root.root = true;
+        root.list_failed(&denied, "listing it");
+        assert!(!root.left_out && shared.failed.load(Ordering::Relaxed));
+
+        let shared = self::shared();
+        let mut partly = sink(&shared, "/b");
+        partly.file("f", 1, 0, None);
+        partly.list_failed(&denied, "listing it");
+        assert!(!partly.left_out && shared.failed.load(Ordering::Relaxed));
+
+        let shared = self::shared();
+        let mut gone = sink(&shared, "/c");
+        gone.list_failed(&ErrorKind::NotFound.into(), "listing it");
+        assert!(!gone.left_out && !shared.failed.load(Ordering::Relaxed));
     }
 
     #[test]

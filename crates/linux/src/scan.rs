@@ -190,25 +190,22 @@ pub fn scan(
 }
 
 /// Read one directory with raw `getdents64`, then `statx` each file for its size and mtime, and
-/// each subdirectory for its identity and mount. False if it can't be opened. `crossing` is set when
-/// the scan descends into other filesystems, with the pseudo ones it leaves out.
+/// each subdirectory for its identity and mount. `crossing` is set when the scan descends into other
+/// filesystems, with the pseudo ones it leaves out.
 fn read_dir(
     dir: &DirJob<UnixDir>,
     buffer: &mut [u8],
     sink: &mut DirSink<'_, UnixDir>,
     root_filesystem: u64,
     crossing: Option<&PseudoMounts>,
-) -> bool {
-    let Some(fd) = dir.open(sink) else { return false };
+) {
+    let Some(fd) = dir.open(sink) else { return };
     let dir_fd = fd.as_raw_fd();
-    // An entry that couldn't be stat'ed for a reason other than its being gone, reported once for
-    // the directory: one that can be listed but not searched fails them all.
-    let mut entry_failed = false;
-    let mut stat_failed = |sink: &DirSink<'_, UnixDir>, name: &CStr, error: std::io::Error| {
-        if error.raw_os_error() != Some(libc::ENOENT) && !entry_failed {
-            entry_failed = true;
-            sink.read_failed(format_args!("statx {}: {error}", name.to_string_lossy()));
-        }
+    // An entry that can't be looked at: in a directory that can be listed but not searched (`r--`),
+    // none can, for lack of permission; another user's FUSE mount refuses even root, and one whose
+    // daemon is gone isn't connected.
+    let stat_failed = |sink: &DirSink<'_, UnixDir>, name: &CStr, error: std::io::Error| {
+        sink.entry_failed(&error, format_args!("statx {}", name.to_string_lossy()));
     };
     loop {
         let nread = unsafe {
@@ -221,11 +218,7 @@ fn read_dir(
         };
 
         if nread < 0 {
-            let error = std::io::Error::last_os_error();
-            // ENOENT: the directory was removed while it was read, so it ends here.
-            if error.raw_os_error() != Some(libc::ENOENT) {
-                sink.read_failed(format_args!("getdents64: {error}"));
-            }
+            sink.list_failed(&std::io::Error::last_os_error(), "getdents64");
             break;
         }
         if nread == 0 {
@@ -286,14 +279,6 @@ fn read_dir(
                     // being opened. The directory is opened only when a worker gets to it.
                     let sx = match stat.map_or_else(|| statx_path(dir_fd, name, DIR_STATX_MASK), Ok) {
                         Ok(sx) => sx,
-                        // A folder that can't be looked at, like one that can't be opened, is left out
-                        // quietly: no permission (another user's FUSE mount refuses even root), or a
-                        // FUSE filesystem whose daemon is gone.
-                        Err(error)
-                            if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM | libc::ENOTCONN)) =>
-                        {
-                            continue;
-                        }
                         Err(error) => {
                             stat_failed(sink, name, error);
                             continue;
@@ -329,7 +314,6 @@ fn read_dir(
             break;
         }
     }
-    true
 }
 
 #[cfg(test)]

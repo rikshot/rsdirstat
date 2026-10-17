@@ -109,86 +109,80 @@ pub fn scan(
 }
 
 /// Read one directory with `getattrlistbulk`, which returns entries and their attributes in
-/// batches, so files need no further syscalls. False if it can't be opened, or searched.
+/// batches, so files need no further syscalls.
 fn read_dir(
     dir: &DirJob<UnixDir>,
     buffer: &mut [u8],
     sink: &mut DirSink<'_, UnixDir>,
     root_dev: i32,
     cross_filesystems: bool,
-) -> bool {
-    let Some(fd) = dir.open(sink) else { return false };
-    let mut first = true;
+) {
+    let Some(fd) = dir.open(sink) else { return };
     loop {
-        let count = unsafe {
-            libc::getattrlistbulk(
-                fd.as_raw_fd(),
-                &SCAN_ATTRS as *const libc::attrlist as *mut libc::c_void,
-                buffer.as_mut_ptr() as *mut libc::c_void,
-                buffer.len(),
-                libc::FSOPT_NOFOLLOW as u64,
-            )
+        let count = match read_entries(&fd, buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) => {
+                // EDEADLK for a cloud folder not fetched (see `scan`), and EACCES for one that opens
+                // but can't be searched (`r--`), as these attributes need.
+                sink.list_failed(&error, "getattrlistbulk");
+                break;
+            }
         };
-
-        if count < 0 {
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                // A cloud folder not fetched (see `scan`): it holds nothing on this disk.
-                Some(libc::EDEADLK) => {}
-                // A folder that opens but can't be searched (`r--`), as these attributes need: left
-                // out, like one that can't be opened. Not the root, which the scan shows.
-                Some(libc::EACCES | libc::EPERM) if first && !dir.is_root() => return false,
-                _ => sink.read_failed(format_args!("getattrlistbulk: {error}")),
+        for parsed in entries(buffer, count) {
+            if matches!(parsed.c_name.to_bytes(), b"." | b"..") || !(cross_filesystems || parsed.dev_id == root_dev) {
+                continue;
             }
-            break;
-        }
-        if count == 0 {
-            break;
-        }
-        first = false;
-
-        let mut offset = 0usize;
-        for _ in 0..count {
-            if offset + 4 > buffer.len() {
-                break;
-            }
-
-            let entry_length = u32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
-            if entry_length == 0 || offset + entry_length > buffer.len() {
-                break;
-            }
-
-            let entry = &buffer[offset..offset + entry_length];
-            if let Some(parsed) = parse_entry(entry)
-                && !matches!(parsed.c_name.to_bytes(), b"." | b"..")
-                && (cross_filesystems || parsed.dev_id == root_dev)
-            {
-                let id = || mac_node_id(parsed.dev_id, parsed.file_id);
-                match parsed.obj_type {
-                    VDIR => {
-                        if let Some(id) = dir_id(&fd, &parsed, root_dev, cross_filesystems) {
-                            let child = UnixDir::Child(Arc::clone(&fd), parsed.c_name.to_owned());
-                            sink.dir(id, &parsed.name, child);
-                        }
+            let id = || mac_node_id(parsed.dev_id, parsed.file_id);
+            match parsed.obj_type {
+                VDIR => {
+                    if let Some(id) = dir_id(&fd, &parsed, root_dev, cross_filesystems) {
+                        let child = UnixDir::Child(Arc::clone(&fd), parsed.c_name.to_owned());
+                        sink.dir(id, &parsed.name, child);
                     }
-                    VREG => {
-                        // Unmaterialized cloud placeholders occupy 0 bytes on disk; count them as
-                        // such rather than their "online" logical length.
-                        let size = if parsed.dataless { 0 } else { parsed.file_size };
-                        sink.file(parsed.name, size, parsed.mtime, (parsed.nlink > 1).then(id));
-                    }
-                    _ => {}
                 }
+                VREG => {
+                    // Unmaterialized cloud placeholders occupy 0 bytes on disk; count them as such
+                    // rather than their "online" logical length.
+                    let size = if parsed.dataless { 0 } else { parsed.file_size };
+                    sink.file(parsed.name, size, parsed.mtime, (parsed.nlink > 1).then(id));
+                }
+                _ => {}
             }
-
-            offset += entry_length;
         }
-
         if !sink.checkpoint() {
             break;
         }
     }
-    true
+}
+
+/// Read the next batch of the entries of the directory `fd` into `buffer`, with `getattrlistbulk`:
+/// how many it holds, 0 at the end of the directory.
+fn read_entries(fd: &OwnedFd, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let count = unsafe {
+        libc::getattrlistbulk(
+            fd.as_raw_fd(),
+            &SCAN_ATTRS as *const libc::attrlist as *mut libc::c_void,
+            buffer.as_mut_ptr() as *mut libc::c_void,
+            buffer.len(),
+            libc::FSOPT_NOFOLLOW as u64,
+        )
+    };
+    usize::try_from(count).map_err(|_| std::io::Error::last_os_error())
+}
+
+/// The `count` entries `read_entries` put in `buffer`, each prefixed with its length. One that can't
+/// be parsed is skipped, and one whose length runs past the buffer ends the batch.
+fn entries(buffer: &[u8], count: usize) -> impl Iterator<Item = ParsedEntry<'_>> {
+    let mut offset = 0;
+    (0..count)
+        .map_while(move |_| {
+            let length = u32::from_ne_bytes(buffer.get(offset..offset + 4)?.try_into().unwrap()) as usize;
+            let entry = buffer.get(offset..offset + length).filter(|_| length > 0)?;
+            offset += length;
+            Some(entry)
+        })
+        .filter_map(parse_entry)
 }
 
 /// The node id of the subdirectory `entry` in the directory `dir`, or `None` if the scan leaves it
@@ -463,32 +457,13 @@ mod tests {
         let mut buffer = vec![0u8; 64 * 1024];
         let mut ids = std::collections::HashMap::new();
         loop {
-            let count = unsafe {
-                libc::getattrlistbulk(
-                    fd.as_raw_fd(),
-                    &SCAN_ATTRS as *const libc::attrlist as *mut libc::c_void,
-                    buffer.as_mut_ptr() as *mut libc::c_void,
-                    buffer.len(),
-                    libc::FSOPT_NOFOLLOW as u64,
-                )
-            };
-            assert!(
-                count >= 0,
-                "getattrlistbulk {path}: {}",
-                std::io::Error::last_os_error()
-            );
+            let count = read_entries(&fd, &mut buffer).unwrap_or_else(|e| panic!("getattrlistbulk {path}: {e}"));
             if count == 0 {
                 return ids;
             }
-            let mut offset = 0;
-            for _ in 0..count {
-                let length = u32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
-                let parsed = parse_entry(&buffer[offset..offset + length]).expect("entry should parse");
-                if parsed.obj_type == VDIR {
-                    let id = dir_id(&fd, &parsed, dev, false);
-                    ids.insert(parsed.name.to_string(), (parsed.firmlink, id));
-                }
-                offset += length;
+            for parsed in entries(&buffer, count).filter(|parsed| parsed.obj_type == VDIR) {
+                let id = dir_id(&fd, &parsed, dev, false);
+                ids.insert(parsed.name.to_string(), (parsed.firmlink, id));
             }
         }
     }

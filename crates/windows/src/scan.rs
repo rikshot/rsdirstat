@@ -13,10 +13,7 @@ use anyhow::{Context, Result};
 use rsdirstat_core::scan::{
     DirJob, DirSink, Mft, ScanEvent, ScanOptions, Started, cpu_count, node_id, plain_path, run_scan,
 };
-use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
-    GetLastError, INVALID_HANDLE_VALUE, MAX_PATH,
-};
+use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE, MAX_PATH};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -41,15 +38,6 @@ fn open_dir(path: &[u16]) -> std::io::Result<OwnedHandle> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
-}
-
-/// Whether failing to open a directory with `error` leaves it out quietly, as the Unix scanners do:
-/// no permission, or it's gone or no longer a directory.
-fn expected_open_failure(error: &std::io::Error) -> bool {
-    matches!(
-        error.raw_os_error().map(|code| code as u32),
-        Some(ERROR_ACCESS_DENIED | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_DIRECTORY)
-    )
 }
 
 /// Whether the 64-bit file ids that directory listings carry identify the files on `handle`'s
@@ -225,18 +213,16 @@ fn open_child(
 }
 
 /// Read one directory with `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`, which returns
-/// entries with their sizes, times and attributes in batches. False if it can't be listed at all
-/// for lack of permission, which leaves it out like one that can't be opened.
+/// entries with their sizes, times and attributes in batches.
 fn read_dir(
     dir: &DirJob<WinDir>,
     buffer: &mut [u8],
     sink: &mut DirSink<'_, WinDir>,
     root_volume_serial: u32,
     cross_filesystems: bool,
-) -> bool {
+) {
     // Each entry's name as listed, reused from one entry to the next.
     let mut name_units: Vec<u16> = Vec::new();
-    let mut first = true;
     loop {
         let ok = unsafe {
             GetFileInformationByHandleEx(
@@ -248,20 +234,14 @@ fn read_dir(
         };
 
         if ok == 0 {
-            // ERROR_NO_MORE_FILES is the normal end of the directory, and ERROR_FILE_NOT_FOUND that
-            // of an empty one without `.` and `..` (a FAT root); anything else is a real failure that
-            // shouldn't pass silently for one.
+            // ERROR_NO_MORE_FILES is the normal end of the directory, and ERROR_FILE_NOT_FOUND (gone,
+            // to `list_failed`) that of an empty one without `.` and `..` (a FAT root).
             match unsafe { GetLastError() } {
-                ERROR_NO_MORE_FILES | ERROR_FILE_NOT_FOUND => {}
-                ERROR_ACCESS_DENIED if first && !dir.is_root() => return false,
-                code => sink.read_failed(format_args!(
-                    "listing it: {}",
-                    std::io::Error::from_raw_os_error(code as i32)
-                )),
+                ERROR_NO_MORE_FILES => {}
+                code => sink.list_failed(&std::io::Error::from_raw_os_error(code as i32), "listing it"),
             }
             break;
         }
-        first = false;
 
         let mut offset = 0usize;
         loop {
@@ -308,8 +288,7 @@ fn read_dir(
                         match open_child(&dir.handle, &info, &name_units, root_volume_serial, cross_filesystems) {
                             Ok(Some((id, child))) => sink.dir(id, &name, child),
                             Ok(None) => {}
-                            Err(error) if expected_open_failure(&error) => {}
-                            Err(error) => sink.read_failed(format_args!("can't open {name}: {error}")),
+                            Err(error) => sink.entry_failed(&error, format_args!("can't open {name}")),
                         }
                     }
                     EntryKind::File { size } => {
@@ -335,7 +314,6 @@ fn read_dir(
             break;
         }
     }
-    true
 }
 
 #[cfg(test)]
