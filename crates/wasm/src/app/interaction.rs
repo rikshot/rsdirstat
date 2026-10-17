@@ -97,36 +97,51 @@ impl TreemapApp {
         style.set_property("top", &format!("{tip_y}px"))
     }
 
-    /// Show the hovered rect's details in the tooltip and measure it, or hide it.
+    /// Show the hovered rect's details in the tooltip and measure it, or hide it; nothing if that's
+    /// what it shows already.
     fn fill_tooltip(&mut self) -> Result<(), JsValue> {
-        let tooltip = &self.chrome.tooltip_element;
-        let Some(rect) = self
+        let content = self
             .view
             .hover
             .as_ref()
             .and_then(|hover| self.view.rects.get(hover.hovered_index))
-        else {
-            return tooltip.style().set_property("display", "none");
-        };
-        tooltip.style().set_property("display", "block")?;
-        self.chrome.tooltip_name.set_text_content(Some(&rect.name));
-        self.chrome.tooltip_size.set_text_content(Some(&format_size(rect.size)));
-        let share = percent(rect.size, self.view.view_root_size);
-        self.chrome
-            .tooltip_percent
-            .set_text_content(Some(&format!("{share:.1}%")));
-        let mtime = if rect.mtime > 0 {
-            Date::new(&JsValue::from_f64(rect.mtime as f64 * 1000.0))
-                .to_locale_date_string("default", &JsValue::UNDEFINED)
-                .as_string()
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        self.chrome.tooltip_mtime.set_text_content(Some(&mtime));
-        // Its width is its content's, whatever its position (main.css), so it measures the same here
-        // as where it will be shown.
-        self.view.tooltip_size = (tooltip.offset_width() as f64, tooltip.offset_height() as f64);
+            .map(|rect| TooltipContent {
+                name: rect.name.clone(),
+                size: rect.size,
+                view_root_size: self.view.view_root_size,
+                mtime: rect.mtime,
+            });
+        if content == self.view.tooltip_content {
+            return Ok(());
+        }
+        let tooltip = &self.chrome.tooltip_element;
+        match &content {
+            None => tooltip.style().set_property("display", "none")?,
+            Some(content) => {
+                tooltip.style().set_property("display", "block")?;
+                self.chrome.tooltip_name.set_text_content(Some(&content.name));
+                self.chrome
+                    .tooltip_size
+                    .set_text_content(Some(&format_size(content.size)));
+                let share = percent(content.size, content.view_root_size);
+                self.chrome
+                    .tooltip_percent
+                    .set_text_content(Some(&format!("{share:.1}%")));
+                let mtime = if content.mtime > 0 {
+                    Date::new(&JsValue::from_f64(content.mtime as f64 * 1000.0))
+                        .to_locale_date_string("default", &JsValue::UNDEFINED)
+                        .as_string()
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                self.chrome.tooltip_mtime.set_text_content(Some(&mtime));
+                // Its width is its content's, whatever its position (main.css), so it measures the
+                // same here as where it will be shown.
+                self.view.tooltip_size = (tooltip.offset_width() as f64, tooltip.offset_height() as f64);
+            }
+        }
+        self.view.tooltip_content = content;
         Ok(())
     }
 

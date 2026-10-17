@@ -92,6 +92,9 @@ struct ViewState {
     buffer_dirty: bool,
     /// The rect under the pointer, with its open ancestors and its path.
     hover: Option<HoverState>,
+    /// What the tooltip shows, or `None` while it's hidden. A layout while the pointer rests mostly
+    /// leaves it as it was, and refilling it would make the page lay out again for nothing.
+    tooltip_content: Option<TooltipContent>,
     /// The tooltip's size, measured when its content last changed: measuring on every pointer move
     /// would make the page lay out on each one.
     tooltip_size: (f64, f64),
@@ -101,6 +104,15 @@ struct ViewState {
     /// Layouts received so far. Mirrored, with the last one fully drawn and whether the scan is
     /// done, into `data-*` attributes on the canvas, which the e2e tests wait on.
     layout_seq: u64,
+}
+
+/// What the tooltip shows of a rect: its name, size, share of the view and mtime.
+#[derive(PartialEq)]
+struct TooltipContent {
+    name: String,
+    size: u64,
+    view_root_size: u64,
+    mtime: i64,
 }
 
 struct SessionState {
@@ -248,6 +260,7 @@ impl TreemapApp {
                 dirty: true,
                 buffer_dirty: true,
                 hover: None,
+                tooltip_content: None,
                 tooltip_size: (0.0, 0.0),
                 last_mouse: None,
                 scan_done: false,
