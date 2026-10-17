@@ -250,8 +250,10 @@ const READ_BUFFER_SIZE: usize = 64 * 1024;
 
 /// How long the scan may go without any progress before it is treated as stuck. Every read from the
 /// OS and every few entries count as progress, so only a syscall blocked this long on every busy
-/// worker (a dead network mount, typically) trips it, not a merely slow or huge directory.
-const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// worker (a dead network mount, typically) trips it, not a merely slow or huge directory. Long
+/// enough for storage that is only waking up: a disk spinning up from standby, a NAS waking from
+/// hibernation, a network share reconnecting, which take seconds before the first read returns.
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many entries a worker reports between recordings of progress. A huge directory on slow
 /// storage takes a syscall per entry (a `statx`, or opening a subdirectory), so a read from the OS
@@ -496,6 +498,9 @@ impl<H> DirSink<'_, H> {
     pub fn file(&mut self, name: impl Into<String>, size: u64, mtime: i64, hardlink: Option<u64>) {
         self.count_entry();
         if hardlink.is_some_and(|id| !self.shared.visited_files.insert(id)) {
+            // Its bytes count under its first name, but it is still a file of this directory, as new
+            // as it is (whichever of its directories a worker happened to reach first).
+            self.files.mtime = self.files.mtime.max(mtime);
             return;
         }
         self.files.add(name, size, mtime);
@@ -656,12 +661,14 @@ impl<T> WorkQueue<T> {
             if self.cancelled.load(Ordering::Relaxed) {
                 return ScanOutcome::Cancelled;
             }
-            if state.pending == 0 {
-                return ScanOutcome::Complete;
-            }
+            // Before `pending`: a read that saw the flag stopped early, and `pending` can reach zero
+            // before any `take` turns the flag into `cancelled`.
             if self.cancel.load(Ordering::Relaxed) {
                 self.cancel_locked(&mut state);
                 return ScanOutcome::Cancelled;
+            }
+            if state.pending == 0 {
+                return ScanOutcome::Complete;
             }
             let progress = self.progress.load(Ordering::Relaxed);
             if progress != last_progress {
@@ -901,6 +908,25 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// A read cut short by the caller's flag stops before the directory is read in full, so the scan
+    /// isn't complete, however soon after the last directory finishes the waiter looks.
+    #[test]
+    fn a_read_cut_short_by_the_callers_flag_is_not_complete() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let q = Arc::new(WorkQueue::new(Arc::clone(&cancel)));
+        q.push(vec![1]);
+        let _last = q.take().unwrap();
+        let waiter = {
+            let q = Arc::clone(&q);
+            thread::spawn(move || q.wait(STALL_TIMEOUT, || panic!("no stall expected")))
+        };
+        thread::sleep(Duration::from_millis(20)); // the waiter is blocked on `idle`
+        cancel.store(true, Ordering::Relaxed);
+        assert!(q.is_cancelled(), "what checkpoint sees: the read stops early");
+        q.finish_one(); // the partial directory is done; no worker's take() has run since
+        assert_eq!(waiter.join().unwrap(), ScanOutcome::Cancelled);
+    }
+
     /// An in-memory tree for driving `run_scan`: each directory lists its files and subdirectories
     /// by index.
     struct FakeDir {
@@ -1042,6 +1068,18 @@ mod tests {
                 .any(|event| matches!(event, ScanEvent::Dir { files, .. } if files.len() == 1)),
             "what was read is still sent"
         );
+    }
+
+    /// A second name of a file already counted adds no bytes, but its directory is as new as it.
+    #[test]
+    fn a_hardlink_counted_elsewhere_still_dates_its_directory() {
+        let shared = shared();
+        let mut first = sink(&shared, "/a");
+        first.file("link1", 5, 100, Some(7));
+        let mut second = sink(&shared, "/b");
+        second.file("link2", 5, 900, Some(7));
+        assert_eq!((first.files.files.len(), first.files.mtime), (1, 100));
+        assert_eq!((second.files.files.len(), second.files.mtime), (0, 900));
     }
 
     #[test]
