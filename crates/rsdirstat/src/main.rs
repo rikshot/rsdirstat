@@ -186,9 +186,10 @@ impl AppState {
 }
 
 /// What the page holds and nothing else does: a random token, in the address rsdirstat opens, which
-/// the page trades for a cookie. The API asks for that cookie. Listening on loopback keeps other
-/// machines out, and the checks of `Host`, `Origin` and `Sec-Fetch-Site` other websites, but neither
-/// stops another user of this machine, or another program, from connecting to the port.
+/// the page trades for a cookie. Every request asks for one or the other (`require_session`).
+/// Listening on loopback keeps other machines out, and the checks of `Host`, `Origin` and
+/// `Sec-Fetch-Site` other websites, but neither stops another user of this machine, or another
+/// program, from connecting to the port.
 struct Session {
     port: u16,
     token: String,
@@ -244,8 +245,8 @@ impl Session {
             .any(|token| self.is_token(token))
     }
 
-    /// The cookie that admits the page's requests: only to this host, never sent by another site's
-    /// requests (`SameSite=Strict`), and not readable by scripts.
+    /// The cookie that admits the page's requests, the bundle's and the API's: only to this host,
+    /// never sent by another site's requests (`SameSite=Strict`), and not readable by scripts.
     fn set_cookie(&self) -> HeaderValue {
         HeaderValue::try_from(format!(
             "{}={}; Path=/; HttpOnly; SameSite=Strict",
@@ -267,9 +268,9 @@ const OPEN_TIMEOUT: Duration = rsdirstat_core::scan::STALL_TIMEOUT;
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let rt = tokio::runtime::Runtime::new()?;
     #[cfg(windows)]
     scanner::fail_critical_errors();
+    let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(run_server(args));
     // Dropping the runtime would wait for every blocking task, and one can be stuck in a syscall on
     // a dead network mount (a scan of it, or `statvfs` for /volumes) for as long as the mount takes
@@ -314,12 +315,14 @@ async fn run_server(args: Args) -> Result<()> {
         .route("/ws", get(ws_handler))
         .route("/start", get(start_handler))
         .route("/volumes", get(volumes_handler))
-        // The API only, not the frontend bundle the fallback serves.
-        .route_layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&state),
-            require_own_page,
-        ))
+        // The API only, not the page the fallback serves, which is opened from wherever the user
+        // opens it.
+        .route_layer(axum::middleware::from_fn(require_own_page))
         .fallback(static_handler)
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_session,
+        ))
         .with_state(Arc::clone(&state))
         .layer(CompressionLayer::new())
         .layer(axum::middleware::map_response(deny_framing))
@@ -638,36 +641,17 @@ fn relay_scan(
 #[allow_missing = true]
 struct Assets;
 
-/// Serve the embedded frontend. Unknown paths 404. The page itself only with the session's token, in
-/// the address (which gives it the session's cookie) or as that cookie: without it, the page's
-/// requests would all be refused. The rest of the bundle is the same in every copy of rsdirstat.
-async fn static_handler(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    uri: Uri,
-    headers: HeaderMap,
-) -> Response {
+/// Serve the embedded frontend. Unknown paths 404.
+async fn static_handler(uri: Uri) -> Response {
     let path = match uri.path().trim_start_matches('/') {
         "" => "index.html",
         p => p,
-    };
-    let session = &state.session;
-    let set_cookie = match path {
-        "index.html" if session.in_query(&uri) => Some(session.set_cookie()),
-        "index.html" if !session.admits(&headers) => {
-            return (
-                StatusCode::FORBIDDEN,
-                "Open the address rsdirstat printed when it started (with its ?token=), or start it again.",
-            )
-                .into_response();
-        }
-        _ => None,
     };
     match Assets::get(path) {
         Some(content) => {
             // Content-type is baked in at compile time by rust-embed's `mime-guess` feature.
             let mime = content.metadata.mimetype().to_owned();
-            let cookie = set_cookie.map(|cookie| [(header::SET_COOKIE, cookie)]);
-            (cookie, [(header::CONTENT_TYPE, mime)], content.data).into_response()
+            ([(header::CONTENT_TYPE, mime)], content.data).into_response()
         }
         None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
@@ -712,16 +696,36 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
-/// Refuse an API request without the session's cookie (see `Session`), or from another site's page,
-/// which could otherwise drive the server from the user's own browser: connect to ws://127.0.0.1,
-/// or start a scan. Such a page's requests don't carry the cookie (`SameSite=Strict`) either; the
-/// check of where they come from holds for a browser that would send it.
-async fn require_own_page(
+/// Refuse a request without the session (see `Session`): its cookie, or its token in the address,
+/// which starts it in a browser and so gets the cookie. No path is served without, the page's bundle
+/// neither.
+async fn require_session(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if !api_request_allowed(request.headers()) || !state.session.admits(request.headers()) {
+    let session = &state.session;
+    if session.in_query(request.uri()) {
+        let mut response = next.run(request).await;
+        response.headers_mut().insert(header::SET_COOKIE, session.set_cookie());
+        return response;
+    }
+    if !session.admits(request.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "Open the address rsdirstat printed when it started (with its ?token=), or start it again.",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Refuse an API request from another site's page, which could otherwise drive the server from the
+/// user's own browser: connect to ws://127.0.0.1, or start a scan. Such a page's requests don't
+/// carry the session's cookie (`SameSite=Strict`) either; this holds for a browser that would send
+/// it.
+async fn require_own_page(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if !api_request_allowed(request.headers()) {
         return (StatusCode::FORBIDDEN, "request refused: not from this app's own page").into_response();
     }
     next.run(request).await

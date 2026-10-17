@@ -725,14 +725,14 @@ fn server_refuses_requests_for_another_host() {
 }
 
 /// Another program, or another user of the machine, can connect to the port, but has no session:
-/// the API and the page refuse it. The address the server printed gives a browser the cookie.
+/// every path refuses it. The address the server printed gives a browser the cookie.
 #[test]
 fn server_refuses_requests_without_the_session() {
     let server = TestServer::start_picker();
     let token = server.token();
     let wrong = format!("rsdirstat-{}={}", server.port(), "0".repeat(token.len()));
     for cookie in ["", wrong.as_str()] {
-        for path in ["/volumes", "/start", "/ws", "/"] {
+        for path in ["/volumes", "/start", "/ws", "/", "/main.css", "/no-such-file"] {
             assert_eq!(
                 http_status(&server, path, None, &[("Cookie", cookie)]),
                 403,
@@ -741,8 +741,6 @@ fn server_refuses_requests_without_the_session() {
         }
     }
     assert_eq!(http_status(&server, "/?token=nope", None, &[("Cookie", "")]), 403);
-    // The bundle besides the page is the same in every copy, so it needs none.
-    assert_eq!(http_status(&server, "/main.css", None, &[("Cookie", "")]), 200);
 
     let page = http_response(&server, &format!("/?token={token}"), None, &[("Cookie", "")]);
     assert!(page.starts_with("HTTP/1.1 200"), "{page}");
@@ -755,7 +753,9 @@ fn server_refuses_requests_without_the_session() {
         set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"),
         "{set_cookie}"
     );
-    assert_eq!(http_status(&server, "/volumes", None, &[]), 200, "with the cookie");
+    for path in ["/volumes", "/main.css"] {
+        assert_eq!(http_status(&server, path, None, &[]), 200, "{path} with the cookie");
+    }
 }
 
 /// The API endpoints are only for the app's own page. A page on another site can make a browser
