@@ -139,6 +139,8 @@ struct Callbacks {
     ws_message: Closure<dyn FnMut(MessageEvent)>,
     ws_close: Closure<dyn FnMut(Event)>,
     ws_error: Closure<dyn FnMut(Event)>,
+    /// A change of `devicePixelRatio`, for a `matchMedia` listener (see `watch_pixel_ratio`).
+    pixel_ratio: Closure<dyn FnMut(Event)>,
 }
 
 impl Callbacks {
@@ -155,6 +157,7 @@ impl Callbacks {
                 app.chrome.status_element.set_text_content(Some("Connection error."));
                 Ok(())
             }),
+            pixel_ratio: app_callback(|app, _: Event| app.handle_pixel_ratio_change()),
         }
     }
 }
@@ -172,6 +175,7 @@ pub fn start_browser_app() -> Result<(), JsValue> {
     let mut app = app.borrow_mut();
     app.install_event_listeners()?;
     app.resize()?;
+    app.watch_pixel_ratio()?;
     app.connect()?;
     app.schedule_tick()
 }

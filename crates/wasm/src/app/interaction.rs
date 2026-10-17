@@ -45,16 +45,16 @@ impl TreemapApp {
         self.send_message(message)
     }
 
-    pub(super) fn recompute_hover(&mut self) {
+    pub(super) fn recompute_hover(&mut self) -> Result<(), JsValue> {
         let hovered = self
             .view
             .last_mouse
             .and_then(|(mouse_x, mouse_y)| find_rect_index(&self.view.rects, mouse_x, mouse_y));
-        self.set_hover(hovered);
+        self.set_hover(hovered)
     }
 
-    /// Hover the rect at `hovered`, or none.
-    fn set_hover(&mut self, hovered: Option<usize>) {
+    /// Hover the rect at `hovered`, or none: the path bar and the tooltip.
+    fn set_hover(&mut self, hovered: Option<usize>) -> Result<(), JsValue> {
         self.view.hover = hovered.map(|index| {
             build_hover_state(
                 &self.view.rects,
@@ -65,6 +65,7 @@ impl TreemapApp {
             )
         });
         self.show_hover_path();
+        self.fill_tooltip()
     }
 
     pub(super) fn handle_mousemove(&mut self, event: MouseEvent) -> Result<(), JsValue> {
@@ -77,12 +78,13 @@ impl TreemapApp {
         // Most moves stay on the same rect, and only the tooltip follows the pointer.
         let hovered = find_rect_index(&self.view.rects, mouse_x, mouse_y);
         if hovered != self.view.hover.as_ref().map(|hover| hover.hovered_index) {
-            self.set_hover(hovered);
+            self.set_hover(hovered)?;
             self.redraw(false)?;
-            self.fill_tooltip()?;
         }
 
-        if self.view.hover.is_some() {
+        // Even with nothing hovered, so a tooltip a new layout shows under a resting pointer is
+        // already by it.
+        {
             let (tooltip_width, tooltip_height) = self.view.tooltip_size;
             let mut tip_x = event.client_x() as f64 + 14.0;
             let mut tip_y = event.client_y() as f64 + 14.0;
@@ -127,7 +129,13 @@ impl TreemapApp {
             String::new()
         };
         self.chrome.tooltip_mtime.set_text_content(Some(&mtime));
+        // Measured at the left edge, then put back: where it last was, near the window's right edge,
+        // its width would shrink to the room left there, and the new content would measure wrapped.
+        let style = tooltip.style();
+        let left = style.get_property_value("left")?;
+        style.set_property("left", "0px")?;
         self.view.tooltip_size = (tooltip.offset_width() as f64, tooltip.offset_height() as f64);
+        style.set_property("left", &left)?;
         Ok(())
     }
 
@@ -150,6 +158,10 @@ impl TreemapApp {
     }
 
     pub(super) fn handle_context_menu(&mut self, event: MouseEvent) -> Result<(), JsValue> {
+        // As for a click: the rects are the destination's, not those drawn mid-zoom.
+        if self.view.zoom_anim.is_some() {
+            return Ok(());
+        }
         let (mouse_x, mouse_y) = Self::canvas_point(&event);
         if let Some(index) = find_rect_index(&self.view.rects, mouse_x, mouse_y) {
             let rect = &self.view.rects[index];

@@ -89,6 +89,7 @@ impl TreemapApp {
         }
         scale_to_device(&surface.ctx, surface.pixel_ratio)?;
         scale_to_device(&surface.buffer_context, surface.pixel_ratio)?;
+        self.scroll_breadcrumb_to_end();
 
         self.redraw(true)?;
         self.send_viewport()
@@ -97,6 +98,29 @@ impl TreemapApp {
     pub(super) fn handle_resize(&mut self) -> Result<(), JsValue> {
         self.surface.pixel_ratio = effective_pixel_ratio(&self.window);
         self.resize()
+    }
+
+    /// Hear of the next change of `devicePixelRatio`. Moving the window to a display of another
+    /// density changes it without a resize event, and the canvas would stay drawn at the old one,
+    /// blurry. The listener fires once, when the ratio stops matching, and is set up again for the
+    /// new one.
+    pub(super) fn watch_pixel_ratio(&self) -> Result<(), JsValue> {
+        let query = format!("(resolution: {}dppx)", self.surface.pixel_ratio);
+        if let Some(list) = self.window.match_media(&query)? {
+            let options = web_sys::AddEventListenerOptions::new();
+            options.set_once(true);
+            list.add_event_listener_with_callback_and_add_event_listener_options(
+                "change",
+                self.callbacks.pixel_ratio.as_ref().unchecked_ref(),
+                &options,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn handle_pixel_ratio_change(&mut self) -> Result<(), JsValue> {
+        self.handle_resize()?;
+        self.watch_pixel_ratio()
     }
 }
 

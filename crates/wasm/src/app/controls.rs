@@ -25,6 +25,14 @@ impl TreemapApp {
         listen(&chrome.picker_grid, "click", |app, event: Event| {
             app.handle_picker_event(event)
         })?;
+        // A card takes Enter and Space too, as a button does, so the picker works from the keyboard.
+        listen(&chrome.picker_grid, "keydown", |app, event: web_sys::KeyboardEvent| {
+            if !matches!(event.key().as_str(), "Enter" | " ") {
+                return Ok(());
+            }
+            event.prevent_default();
+            app.handle_picker_event(event.into())
+        })?;
         listen(&chrome.depth_select, "change", |app, _: Event| {
             app.handle_depth_change()
         })?;
@@ -133,7 +141,15 @@ impl TreemapApp {
             self.chrome.breadcrumb_bar.append_child(&span)?;
         }
         self.view.rendered_breadcrumb = self.view.breadcrumb.clone();
+        self.scroll_breadcrumb_to_end();
         Ok(())
+    }
+
+    /// Show the end of a breadcrumb too long for its bar, the current folder and its nearest parents,
+    /// rather than the root's end: the bar clips what doesn't fit.
+    pub(super) fn scroll_breadcrumb_to_end(&self) {
+        let bar = &self.chrome.breadcrumb_bar;
+        bar.set_scroll_left(bar.scroll_width());
     }
 
     pub(super) fn handle_breadcrumb_event(&mut self, event: Event) -> Result<(), JsValue> {
@@ -228,8 +244,11 @@ impl TreemapApp {
             self.append_div(&card, "volume-fs", &volume.fs_type)?;
         }
 
-        // The delegated picker-grid listener reads this to start the scan; no per-card closure.
+        // The delegated picker-grid listeners read this to start the scan; no per-card closure.
         card.set_attribute("data-mount", &volume.mount_point)?;
+        // Focusable and announced as a button, which the keydown listener makes it act as.
+        card.set_attribute("tabindex", "0")?;
+        card.set_attribute("role", "button")?;
 
         Ok(card)
     }

@@ -130,12 +130,15 @@ impl TreemapApp {
                 self.view.view_root_size = 0;
                 self.view.zoom_anim = None;
                 self.view.pending_old_rects = None;
-                self.view.hover = None;
+                self.clear_hover()?;
                 self.redraw(true)?;
                 self.stop_scan_timer();
                 self.start_scan_timer()?;
                 self.build_breadcrumb()?;
+                // Both until the scan is done: the server takes neither a rescan nor a new path
+                // while one runs.
                 set_hidden(&self.chrome.change_button, true)?;
+                set_hidden(&self.chrome.rescan_button, true)?;
                 self.view.scan_done = false;
                 self.surface.canvas.set_attribute("data-scan-done", "false")?;
             }
@@ -197,7 +200,7 @@ impl TreemapApp {
         self.view.breadcrumb = payload.breadcrumb;
         self.view.separator = payload.separator;
         self.build_breadcrumb()?;
-        self.recompute_hover();
+        self.recompute_hover()?;
         self.redraw(true)?;
 
         let scan_done = payload.scan_done;
