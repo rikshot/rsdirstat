@@ -162,7 +162,7 @@ impl VolumeInfo {
     }
 
     pub fn decode_list(data: &[u8]) -> Option<Vec<VolumeInfo>> {
-        decode(data)
+        decode(data, MAX_DECOMPRESSED)
     }
 }
 
@@ -185,7 +185,7 @@ impl ServerMessage {
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        decode(data)
+        decode(data, MAX_DECOMPRESSED)
     }
 }
 
@@ -231,7 +231,7 @@ impl ClientMessage {
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        let mut msg: ClientMessage = decode(data)?;
+        let mut msg: ClientMessage = decode(data, MAX_CLIENT_DECOMPRESSED)?;
         msg.normalize();
         Some(msg)
     }
@@ -273,15 +273,18 @@ impl ClientMessage {
 const COMPRESSION_LEVEL: u8 = 1;
 /// Sanity backstop against a malicious/corrupt frame inflating to an unreasonable size.
 const MAX_DECOMPRESSED: usize = 256 * 1024 * 1024;
+/// The most a client's message may unpack to. Real ones are a few KB at most (a long filter or
+/// path); the server's limit would let a ~250 KB frame make it fill 256 MiB for every message.
+const MAX_CLIENT_DECOMPRESSED: usize = 1024 * 1024;
 
 /// `value` as it goes over the wire: postcard, packed.
 fn encode(value: &(impl Serialize + ?Sized)) -> Vec<u8> {
     pack(&postcard::to_allocvec(value).expect("wire types always serialize"))
 }
 
-/// A value `encode` made, or `None` if `data` isn't one.
-fn decode<T: DeserializeOwned>(data: &[u8]) -> Option<T> {
-    postcard::from_bytes(&unpack(data)?).ok()
+/// A value `encode` made, or `None` if `data` isn't one or would unpack to more than `max` bytes.
+fn decode<T: DeserializeOwned>(data: &[u8], max: usize) -> Option<T> {
+    postcard::from_bytes(&unpack(data, max)?).ok()
 }
 
 /// Prefix a payload with a 1-byte flag: 1 = deflated, 0 = raw. Compression is only kept when it
@@ -299,11 +302,11 @@ fn pack(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-fn unpack(data: &[u8]) -> Option<Vec<u8>> {
+fn unpack(data: &[u8], max: usize) -> Option<Vec<u8>> {
     let (&flag, rest) = data.split_first()?;
     match flag {
-        0 => Some(rest.to_vec()),
-        1 => miniz_oxide::inflate::decompress_to_vec_with_limit(rest, MAX_DECOMPRESSED).ok(),
+        0 if rest.len() <= max => Some(rest.to_vec()),
+        1 => miniz_oxide::inflate::decompress_to_vec_with_limit(rest, max).ok(),
         _ => None,
     }
 }
@@ -485,6 +488,35 @@ mod tests {
         ]);
         let expected = filter(vec!["mp4".into(), "MOV".into(), "rs".into(), "tar.gz".into()]);
         assert_eq!(client_roundtrip(msg), expected);
+    }
+
+    /// A client's message is a few KB at most; one that would unpack to far more is refused rather
+    /// than filling the server's memory.
+    #[test]
+    fn client_messages_unpack_to_a_small_limit() {
+        let filter = |name_pattern: String| ClientMessage::Filter {
+            extensions: Vec::new(),
+            min_size: 0,
+            name_pattern,
+        };
+        let long = filter("a".repeat(64 * 1024));
+        assert_eq!(client_roundtrip(long.clone()), long);
+        let huge = filter("a".repeat(2 * MAX_CLIENT_DECOMPRESSED));
+        assert_eq!(ClientMessage::decode(&huge.encode()), None, "deflated");
+        let raw = [&[0u8][..], &postcard::to_allocvec(&huge).unwrap()].concat();
+        assert_eq!(ClientMessage::decode(&raw), None, "raw");
+        // A server's layout keeps its own, larger limit.
+        let big_layout = ServerMessage::Layout(LayoutPayload {
+            root_size: 0,
+            dir_count: 0,
+            scan_done: true,
+            partial: false,
+            scan_ms: 0,
+            separator: '/',
+            breadcrumb: Vec::new(),
+            rects: sample_rects(40_000),
+        });
+        assert_eq!(server_roundtrip(big_layout.clone()), big_layout);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use clap::Parser;
@@ -235,6 +235,7 @@ async fn run_server(args: Args) -> Result<()> {
         .with_state(Arc::clone(&state))
         .fallback(static_handler)
         .layer(CompressionLayer::new())
+        .layer(axum::middleware::map_response(deny_framing))
         .layer(axum::middleware::from_fn(require_loopback_host));
 
     // Bind loopback only: the UI is always pointed at localhost, and the server exposes full
@@ -514,6 +515,18 @@ async fn require_loopback_host(request: axum::extract::Request, next: axum::midd
         return (StatusCode::FORBIDDEN, "request refused: unexpected Host").into_response();
     }
     next.run(request).await
+}
+
+/// Never shown in another site's frame: there the user's clicks on what looks like that site could
+/// be on this page instead (clickjacking), starting a scan or revealing a path.
+async fn deny_framing(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    response
 }
 
 async fn ws_handler(

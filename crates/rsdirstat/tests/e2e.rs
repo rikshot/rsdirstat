@@ -678,6 +678,16 @@ fn e2e_server_exits_after_its_last_tab_closes() {
 /// Send a raw GET with the given extra headers and return the status code. `host` overrides the
 /// `Host` header.
 fn http_status(server: &TestServer, path: &str, host: Option<&str>, headers: &[(&str, &str)]) -> u16 {
+    http_response(server, path, host, headers)
+        .split(' ')
+        .nth(1)
+        .unwrap_or("0")
+        .parse()
+        .unwrap()
+}
+
+/// The response to a GET of `path`, as text (lossy, as a body needn't be).
+fn http_response(server: &TestServer, path: &str, host: Option<&str>, headers: &[(&str, &str)]) -> String {
     let authority = server.url.trim_start_matches("http://");
     let mut stream = connect(server);
     let mut request = format!(
@@ -692,12 +702,7 @@ fn http_status(server: &TestServer, path: &str, host: Option<&str>, headers: &[(
     // Bytes: a body (the volume list) needn't be text.
     let mut response = Vec::new();
     let _ = stream.read_to_end(&mut response);
-    String::from_utf8_lossy(&response)
-        .split(' ')
-        .nth(1)
-        .unwrap_or("0")
-        .parse()
-        .unwrap()
+    String::from_utf8_lossy(&response).into_owned()
 }
 
 /// A DNS-rebinding page sees this server as same-origin under the attacker's hostname; only its
@@ -705,6 +710,13 @@ fn http_status(server: &TestServer, path: &str, host: Option<&str>, headers: &[(
 #[test]
 fn e2e_requests_for_another_host_are_refused() {
     let server = TestServer::start_picker();
+    // Nor shown in another site's frame.
+    let page = http_response(&server, "/", None, &[]).to_ascii_lowercase();
+    assert!(page.contains("x-frame-options: deny"), "{page}");
+    assert!(
+        page.contains("content-security-policy: frame-ancestors 'none'"),
+        "{page}"
+    );
     assert_eq!(http_status(&server, "/volumes", None, &[]), 200);
     assert_eq!(http_status(&server, "/volumes", Some("127.0.0.1:1"), &[]), 200);
     for host in [
